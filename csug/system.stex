@@ -273,6 +273,58 @@ to the value of the following expression.
 
 %----------------------------------------------------------------------------
 \entryheader
+\formdef{with-unwind-handler}{\categoryprocedure}{(with-unwind-handler \var{handler} \var{thunk})}
+\listlibraries
+\endentryheader
+
+\var{handler} must be a procedure accepting two arguments, and
+\var{thunk} must be a procedure accepting no arguments.
+\scheme{with-unwind-handler} invokes \var{thunk} with an exception handler
+that delimits the continuation of each exception raised by \var{thunk}.
+When an exception is raised, the handler is invoked outside the protected
+dynamic extent, in the continuation and dynamic environment of the call to
+\scheme{with-unwind-handler}, with the raised object and a procedure
+representing the delimited continuation.
+
+The delimited-continuation procedure accepts any number of arguments and
+returns any number of values.  Invoking it resumes the computation at the
+raise point with its arguments as the results of the raise.  It composes the
+saved computation with the continuation of its invocation, may be invoked
+more than once, and composes the captured and invoking dynamic environments.
+In particular, it preserves the behavior of \scheme{dynamic-wind}, parameter
+bindings, and continuation marks.
+
+The results of \scheme{with-unwind-handler} are the results of \var{thunk}
+when it returns normally and the results of \var{handler} when an exception
+is handled without resuming its delimited continuation.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{empty-continuation?}{\categoryprocedure}{(empty-continuation? \var{continuation})}
+\listlibraries
+\endentryheader
+
+\var{continuation} must be a delimited-continuation procedure supplied to a
+handler established by \scheme{with-unwind-handler}.
+\scheme{empty-continuation?} returns \scheme{#t} when the exception was
+raised in tail position with respect to the protected thunk and
+\scheme{#f} otherwise.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{guard}{\categorysyntax}{(guard (\var{variable} \var{continuation-variable} \var{clause} \dots) \var{body_1} \var{body_2} \dots)}
+\listlibraries
+\endentryheader
+
+This form extends \scheme{guard} with a \var{continuation-variable} bound to
+the delimited continuation of the raised exception.  Its clauses are
+otherwise evaluated as for \scheme{guard}.  Invoking the continuation
+variable resumes the computation at the raise point.  If no clause matches,
+the exception is raised to an enclosing handler; values produced by that
+handler resume the delimited continuation.
+
+%----------------------------------------------------------------------------
+\entryheader
 \formdef{assert-unreachable}{\categoryprocedure}{(assert-unreachable)}
 \listlibraries
 \endentryheader

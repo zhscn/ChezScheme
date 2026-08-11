@@ -141,7 +141,8 @@
   (fixnum->flonum [sig [(fixnum) -> (flonum)]] [flags arith-op cp02 safeongoodargs])
 )
 
-(define-symbol-flags* ([libraries (rnrs) (rnrs base) (rnrs exceptions)] [flags keyword])
+(define-symbol-flags* ([libraries (rnrs) (rnrs base) (rnrs exceptions)
+                                   (srfi :248) (srfi :248 exceptions)] [flags keyword])
   (=> [flags ieee r5rs])
   (else [flags ieee r5rs])
 )
@@ -444,7 +445,8 @@
   (environment [sig [(import-spec ...) -> (environment)]] [flags])
 )
 
-(define-symbol-flags* ([libraries (rnrs) (rnrs exceptions)] [flags keyword])
+(define-symbol-flags* ([libraries (srfi :248) (srfi :248 exceptions)
+                                   (rnrs) (rnrs exceptions)] [flags keyword])
   (guard [flags])
 )
 
@@ -466,10 +468,16 @@
   (&undefined [flags])
 )
 
-(define-symbol-flags* ([libraries (rnrs) (rnrs exceptions)] [flags primitive proc])
+(define-symbol-flags* ([libraries (rnrs) (rnrs exceptions)
+                                   (srfi :248) (srfi :248 exceptions)] [flags primitive proc])
   (with-exception-handler [sig [(procedure procedure) -> (ptr ...)]] [flags])
   (raise [sig [(ptr) -> (bottom)]] [flags unrestricted abort-op])
   (raise-continuable [sig [(ptr) -> (ptr ...)]] [flags unrestricted])
+)
+
+(define-symbol-flags* ([libraries (srfi :248) (srfi :248 exceptions)] [flags primitive proc])
+  (with-unwind-handler [sig [(procedure procedure) -> (ptr ...)]] [flags])
+  (empty-continuation? [sig [(procedure) -> (boolean)]] [flags])
 )
 
 (define-symbol-flags* ([libraries (rnrs) (rnrs conditions)] [flags primitive proc])
@@ -2232,6 +2240,7 @@
   ($gensym->pretty-name [flags single-valued])
   ($get-timer [flags single-valued])
   ($guard [flags])
+  ($guard-unwind [flags])
   ($hand-coded [flags single-valued])
   ($hashtable-cells [sig [(hashtable) -> (vector)] [(hashtable uint) -> (vector)]] [flags alloc])
   ($hashtable-report [flags true])
@@ -2627,4 +2636,6 @@
   ($rnrs-sorting [flags library-uid])
   ($rnrs-syntax-case [flags library-uid])
   ($rnrs-unicode [flags library-uid])
+  ($srfi-:248 [flags library-uid])
+  ($srfi-:248-exceptions [flags library-uid])
 )

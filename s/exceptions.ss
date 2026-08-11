@@ -201,6 +201,145 @@ TODO:
       p)))
 
 (let ()
+  (define compose-continuation
+    (foreign-procedure "(cs)compose_continuation"
+      (scheme-object scheme-object scheme-object)
+      scheme-object))
+
+  (define-record-type unwind-handler-info
+    (nongenerative)
+    (opaque #t)
+    (sealed #t)
+    (fields (immutable empty-key)
+            (mutable boundary-target)
+            (immutable targets-box)))
+
+  (define call-with-unwind-targets
+    (lambda (info proc)
+      (let ([state
+             (unbox (unwind-handler-info-targets-box info))])
+        (if state
+            (if-feature pthreads
+              (with-mutex (car state) (proc (cdr state)))
+              (proc (cdr state)))
+            (proc #f)))))
+
+  (define ensure-unwind-targets
+    (lambda (info)
+      (let ([targets-box (unwind-handler-info-targets-box info)])
+        (let loop ()
+          (or (unbox targets-box)
+              (let ([state
+                     (cons
+                       (if-feature pthreads
+                         (make-mutex 'unwind-handler-targets)
+                         #f)
+                       (make-ephemeron-eq-hashtable))])
+                (if (box-cas! targets-box #f state)
+                    state
+                    (loop))))))))
+
+  (define-record-type raise-context
+    (nongenerative)
+    (opaque #t)
+    (sealed #t)
+    (fields (immutable continuable?)
+            (immutable attachment)
+            (immutable continuation)))
+
+  (define-record-type delimited-continuation-info
+    (nongenerative)
+    (opaque #t)
+    (sealed #t)
+    (fields (immutable empty?)))
+
+  (define empty-delimited-continuation-info
+    (make-delimited-continuation-info #t))
+
+  (define nonempty-delimited-continuation-info
+    (make-delimited-continuation-info #f))
+
+  (define current-raise-context
+    ($make-thread-parameter #f (lambda (x) x)))
+
+  (define no-continuation-attachment
+    '())
+
+  (define missing-unwind-target
+    (list 'missing-unwind-target))
+
+  (define find-unwind-limit
+    (lambda (k info)
+      ;; A call/cc body starts on a fresh stack segment whose link is the
+      ;; captured continuation.  Registered links therefore identify prompt
+      ;; boundaries without depending on optimized stack-frame layouts.
+      (call-with-unwind-targets info
+        (lambda (targets)
+          (let loop ([k k])
+            (let* ([next ($continuation-link k)]
+                   [boundary-target
+                    (unwind-handler-info-boundary-target info)])
+              (if (and boundary-target
+                       (eq? next (car boundary-target)))
+                  (values next (cdr boundary-target))
+                  (let ([target
+                         (if targets
+                             (hashtable-ref
+                               targets next missing-unwind-target)
+                             missing-unwind-target)])
+                    (if (eq? target missing-unwind-target)
+                        (loop next)
+                        (values next target))))))))))
+
+  (define register-unwind-target!
+    (lambda (info tail)
+      (let ([state (ensure-unwind-targets info)])
+        (if-feature pthreads
+          (with-mutex (car state)
+            (hashtable-set! (cdr state) tail tail))
+          (hashtable-set! (cdr state) tail tail)))))
+
+  (define make-delimited-continuation
+    (lambda (inner boundary info empty?)
+      (if empty?
+        (make-wrapper-procedure
+          (case-lambda
+            [() (values)]
+            [(a) a]
+            [(a b) (values a b)]
+            [(a b c) (values a b c)]
+            [args (#2%apply values args)])
+          -1
+          empty-delimited-continuation-info)
+        ;; Compose a nonempty reusable segment from the continuation outside
+        ;; the prompt with an empty tail. An empty segment has no computation
+        ;; or dynamic state to compose, so its wrapper above returns its
+        ;; arguments directly.
+        (let ([segment
+               (compose-continuation inner boundary $null-continuation)])
+          (make-wrapper-procedure
+            (lambda args
+              (#3%call/cc
+                (lambda (tail)
+                  (register-unwind-target! info tail)
+                  (#2%apply
+                    (compose-continuation segment $null-continuation tail)
+                    args))))
+            -1
+            nonempty-delimited-continuation-info)))))
+
+  (define unwind-handler?
+    (lambda (handler)
+      (and (wrapper-procedure? handler)
+           (unwind-handler-info? (wrapper-procedure-data handler)))))
+
+  (define invoke-handler
+    (lambda (handler obj context)
+      (if (unwind-handler? handler)
+          (parameterize ([current-raise-context context])
+            (handler obj))
+          (handler obj))))
+
   (define create-exception-stack
     (lambda (p)
       (let ([ls (list p)])
@@ -245,20 +384,115 @@ TODO:
       (parameterize ([$current-handler-stack (cons handler ($current-handler-stack))])
         (thunk))))
 
+  (set-who! with-unwind-handler
+    (lambda (handler thunk)
+      (unless (procedure? handler) ($oops who "~s is not a procedure" handler))
+      (unless (procedure? thunk) ($oops who "~s is not a procedure" thunk))
+      (#3%call/cc
+        (lambda (outer)
+          (let* ([empty-key (list 'empty-unwind-continuation)]
+                 ;; Composition targets are allocated lazily. Ephemeron keys
+                 ;; retain them only while native continuations can reenter.
+                 [info
+                   (make-unwind-handler-info
+                     empty-key #f (box #f))]
+                 [unwind-handler
+                   (make-wrapper-procedure
+                     (lambda (obj)
+                       (let* ([context (current-raise-context)]
+                              [inner (raise-context-continuation context)])
+                         (call-with-values
+                           (lambda ()
+                             (find-unwind-limit inner info))
+                           (lambda (limit target)
+                             (let ([empty?
+                                    (if (and
+                                          (raise-context-continuable? context)
+                                          (assq empty-key
+                                            (raise-context-attachment context)))
+                                        #t
+                                        #f)])
+                               ;; Build the independent segment after leaving
+                               ;; its dynamic extent, so unwinding observes the
+                               ;; original winder attachments.
+                               ($call-in-continuation target
+                                 (lambda ()
+                                   (handler obj
+                                     (make-delimited-continuation
+                                       inner limit info empty?)))))))))
+                     2
+                     info)])
+              (call-with-values
+                (lambda ()
+                  (#3%call/cc
+                    (lambda (boundary)
+                      ;; Retain outer only while boundary remains reachable.
+                      (unwind-handler-info-boundary-target-set!
+                        info (ephemeron-cons boundary outer))
+                      (dynamic-wind
+                        void
+                        (lambda ()
+                          (with-exception-handler
+                            unwind-handler
+                            (lambda ()
+                              ($call-setting-continuation-attachment
+                                (list (cons empty-key #t)) thunk))))
+                        void))))
+                (lambda results
+                  ($call-in-continuation outer
+                    (lambda () (#2%apply values results))))))))))
+
+  (set-who! empty-continuation?
+    (lambda (k)
+      (unless (wrapper-procedure? k)
+        ($oops who "~s is not a delimited continuation" k))
+      (let ([info (wrapper-procedure-data k)])
+        (unless (delimited-continuation-info? info)
+          ($oops who "~s is not a delimited continuation" k))
+        (delimited-continuation-info-empty? info))))
+
   (set-who! raise
     (lambda (obj)
       (let ([stack (or ($current-handler-stack) default-handler-stack)])
         (let ([handler (car stack)])
-          (parameterize ([$current-handler-stack (cdr stack)])
-            (handler obj)
-            (raise (make-non-continuable-violation)))))))
+          (if (unwind-handler? handler)
+              (begin
+                (#3%call/cc
+                  (lambda (inner)
+                    (parameterize ([$current-handler-stack (cdr stack)])
+                      (invoke-handler handler obj
+                        (make-raise-context
+                          #f no-continuation-attachment inner)))))
+                ;; Resumption bypasses the temporary parameterization used to
+                ;; invoke the handler, so establish its resulting stack here.
+                ($current-handler-stack (cdr stack))
+                (raise (make-non-continuable-violation)))
+              (parameterize ([$current-handler-stack (cdr stack)])
+                (handler obj)
+                (raise (make-non-continuable-violation))))))))
 
   (set-who! raise-continuable
     (lambda (obj)
       (let ([stack (or ($current-handler-stack) default-handler-stack)])
         (let ([handler (car stack)])
-          (parameterize ([$current-handler-stack (cdr stack)])
-            (handler obj))))))
+          (if (unwind-handler? handler)
+              ($call-getting-continuation-attachment
+                no-continuation-attachment
+                (lambda (attachment)
+                  (call-with-values
+                    (lambda ()
+                      (#3%call/cc
+                        (lambda (inner)
+                          (parameterize ([$current-handler-stack (cdr stack)])
+                            (invoke-handler handler obj
+                              (make-raise-context #t attachment inner))))))
+                    (lambda results
+                      ;; A continuable resumption returns to the dynamic extent
+                      ;; in which the original handler is current.
+                      ($current-handler-stack stack)
+                      (#2%apply values results)))))
+              (parameterize ([$current-handler-stack (cdr stack)])
+                (handler obj)))))))
 
   (set-who! $guard
     (lambda (supply-else? guards body)
@@ -287,10 +521,37 @@ TODO:
                 (with-exception-handler
                     (lambda (arg) (call-in-continuation k marks (lambda () (guards arg))))
                   body)))))))
+
+  (set! $guard-unwind
+    (lambda (supply-else? guards body)
+      (with-unwind-handler
+        (if supply-else?
+            (lambda (arg k)
+              (guards arg k
+                (lambda ()
+                  (call-with-values (lambda () (raise-continuable arg)) k))))
+            guards)
+        body)))
 )
 
 (define-syntax guard
   (syntax-rules (else)
+    [(_ (var kvar clause ... [else e1 e2 ...]) b1 b2 ...)
+     (and (identifier? #'var) (identifier? #'kvar))
+     ($guard-unwind #f
+       (lambda (var kvar) (cond clause ... [else e1 e2 ...]))
+       (lambda () b1 b2 ...))]
+    [(_ (var kvar clause1 clause2 ...) b1 b2 ...)
+     (and (identifier? #'var) (identifier? #'kvar))
+     ($guard-unwind #t
+       (lambda (var kvar p) (cond clause1 clause2 ... [else (p)]))
+       (lambda () b1 b2 ...))]
+    [(_ (var kvar) b1 b2 ...)
+     (and (identifier? #'var) (identifier? #'kvar))
+     (let-syntax ([missing-guard-clause
+                   (lambda (x)
+                     (syntax-violation 'guard "at least one clause is required" x))])
+       (missing-guard-clause))]
     [(_ (var clause ... [else e1 e2 ...]) b1 b2 ...)
      (identifier? #'var)
      ($guard #f (lambda (var) (cond clause ... [else e1 e2 ...]))

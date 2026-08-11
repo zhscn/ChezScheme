@@ -198,6 +198,543 @@ ptr S_single_continuation(ptr k, iptr n) {
     return Sfalse;
 }
 
+#define compose_memo_inline_size 16
+#define compose_scratch_inline_size 64
+
+typedef struct {
+    ptr key;
+    ptr value;
+} compose_memo_entry;
+
+typedef struct {
+    compose_memo_entry inline_entries[compose_memo_inline_size];
+    uptr inline_count;
+    compose_memo_entry *table;
+    uptr table_size;
+    uptr table_count;
+} compose_memo;
+
+typedef struct {
+    ptr inline_nodes[compose_scratch_inline_size];
+    ptr *nodes;
+    uptr capacity;
+} compose_scratch;
+
+typedef struct {
+    compose_memo attachments;
+    compose_memo winders;
+    compose_memo winder_lists;
+    compose_scratch attachment_scratch;
+    compose_scratch winder_scratch;
+    ptr old_winders;
+    ptr new_winders;
+    ptr old_attachments;
+    ptr new_attachments;
+    ptr winder_rtd1;
+    ptr winder_rtd2;
+} compose_context;
+
+static void compose_memo_init(compose_memo *memo) {
+    memo->inline_count = 0;
+    memo->table = NULL;
+    memo->table_size = 0;
+    memo->table_count = 0;
+}
+
+static void compose_memo_table_insert(compose_memo_entry *table,
+                                      uptr table_size,
+                                      ptr key,
+                                      ptr value) {
+    uptr i = eq_hash(key) & (table_size - 1);
+
+    while (table[i].key != (ptr)0 && table[i].key != key)
+        i = (i + 1) & (table_size - 1);
+    table[i].key = key;
+    table[i].value = value;
+}
+
+static void compose_memo_promote(compose_memo *memo) {
+    compose_memo_entry *table;
+    uptr i;
+
+    table = calloc(64, sizeof(compose_memo_entry));
+    if (table == NULL)
+        S_error_abort("compose continuation: calloc failed");
+    for (i = 0; i < memo->inline_count; i += 1)
+        compose_memo_table_insert(table,
+                                  64,
+                                  memo->inline_entries[i].key,
+                                  memo->inline_entries[i].value);
+    memo->table = table;
+    memo->table_size = 64;
+    memo->table_count = memo->inline_count;
+}
+
+static void compose_memo_grow(compose_memo *memo) {
+    compose_memo_entry *old_table, *new_table;
+    uptr old_size, new_size, i;
+
+    old_table = memo->table;
+    old_size = memo->table_size;
+    new_size = old_size << 1;
+    new_table = calloc(new_size, sizeof(compose_memo_entry));
+    if (new_table == NULL)
+        S_error_abort("compose continuation: calloc failed");
+    for (i = 0; i < old_size; i += 1) {
+        if (old_table[i].key != (ptr)0)
+            compose_memo_table_insert(new_table,
+                                      new_size,
+                                      old_table[i].key,
+                                      old_table[i].value);
+    }
+    free(old_table);
+    memo->table = new_table;
+    memo->table_size = new_size;
+}
+
+static ptr compose_memo_ref(compose_memo *memo, ptr key) {
+    uptr i;
+
+    if (memo->table == NULL) {
+        for (i = 0; i < memo->inline_count; i += 1) {
+            if (memo->inline_entries[i].key == key)
+                return memo->inline_entries[i].value;
+        }
+        return (ptr)0;
+    }
+    i = eq_hash(key) & (memo->table_size - 1);
+    while (memo->table[i].key != (ptr)0) {
+        if (memo->table[i].key == key)
+            return memo->table[i].value;
+        i = (i + 1) & (memo->table_size - 1);
+    }
+    return (ptr)0;
+}
+
+static void compose_memo_set(compose_memo *memo, ptr key, ptr value) {
+    uptr i;
+
+    if (memo->table == NULL) {
+        for (i = 0; i < memo->inline_count; i += 1) {
+            if (memo->inline_entries[i].key == key) {
+                memo->inline_entries[i].value = value;
+                return;
+            }
+        }
+        if (memo->inline_count < compose_memo_inline_size) {
+            memo->inline_entries[memo->inline_count].key = key;
+            memo->inline_entries[memo->inline_count].value = value;
+            memo->inline_count += 1;
+            return;
+        }
+        compose_memo_promote(memo);
+    }
+    if ((memo->table_count + 1) * 4 >= memo->table_size * 3)
+        compose_memo_grow(memo);
+    i = eq_hash(key) & (memo->table_size - 1);
+    while (memo->table[i].key != (ptr)0) {
+        if (memo->table[i].key == key) {
+            memo->table[i].value = value;
+            return;
+        }
+        i = (i + 1) & (memo->table_size - 1);
+    }
+    memo->table[i].key = key;
+    memo->table[i].value = value;
+    memo->table_count += 1;
+}
+
+static void compose_memo_destroy(compose_memo *memo) {
+    if (memo->table != NULL)
+        free(memo->table);
+}
+
+static void compose_scratch_init(compose_scratch *scratch) {
+    scratch->nodes = scratch->inline_nodes;
+    scratch->capacity = compose_scratch_inline_size;
+}
+
+static void compose_scratch_push(compose_scratch *scratch,
+                                 uptr count,
+                                 ptr node) {
+    ptr *nodes;
+    uptr capacity;
+
+    if (count == scratch->capacity) {
+        capacity = scratch->capacity << 1;
+        if (scratch->nodes == scratch->inline_nodes) {
+            nodes = malloc(capacity * sizeof(ptr));
+            if (nodes != NULL)
+                memcpy(nodes, scratch->inline_nodes, count * sizeof(ptr));
+        } else {
+            nodes = realloc(scratch->nodes, capacity * sizeof(ptr));
+        }
+        if (nodes == NULL)
+            S_error_abort("compose continuation: malloc failed");
+        scratch->nodes = nodes;
+        scratch->capacity = capacity;
+    }
+    scratch->nodes[count] = node;
+}
+
+static void compose_scratch_destroy(compose_scratch *scratch) {
+    if (scratch->nodes != scratch->inline_nodes)
+        free(scratch->nodes);
+}
+
+static void compose_context_init(compose_context *context,
+                                 ptr old_winders,
+                                 ptr new_winders,
+                                 ptr old_attachments,
+                                 ptr new_attachments) {
+    compose_memo_init(&context->attachments);
+    compose_memo_init(&context->winders);
+    compose_memo_init(&context->winder_lists);
+    compose_scratch_init(&context->attachment_scratch);
+    compose_scratch_init(&context->winder_scratch);
+    context->old_winders = old_winders;
+    context->new_winders = new_winders;
+    context->old_attachments = old_attachments;
+    context->new_attachments = new_attachments;
+    context->winder_rtd1 = (ptr)0;
+    context->winder_rtd2 = (ptr)0;
+}
+
+static void compose_context_destroy(compose_context *context) {
+    compose_memo_destroy(&context->attachments);
+    compose_memo_destroy(&context->winders);
+    compose_memo_destroy(&context->winder_lists);
+    compose_scratch_destroy(&context->attachment_scratch);
+    compose_scratch_destroy(&context->winder_scratch);
+}
+
+/* Replace old_tail in ls with new_tail. Preserve sharing among the dynamic
+ * state lists in a continuation chain, so each source pair is copied at most
+ * once. Source pairs can also be reachable through an independently captured
+ * native continuation and must not be modified. */
+static ptr compose_continuation_list(compose_context *context,
+                                     ptr ls,
+                                     ptr old_tail,
+                                     ptr new_tail) {
+    ptr cached, node, result, scan;
+    uptr count = 0;
+
+    if (old_tail == new_tail)
+        return ls;
+    cached = compose_memo_ref(&context->attachments, ls);
+    if (cached != (ptr)0)
+        return cached;
+    scan = ls;
+    for (;;) {
+        if (scan == old_tail) {
+            result = new_tail;
+            break;
+        }
+        cached = compose_memo_ref(&context->attachments, scan);
+        if (cached != (ptr)0) {
+            result = cached;
+            break;
+        }
+        /* Some underflow continuations do not record dynamic state. Their
+         * empty list is a placeholder, not an extension of the boundary. */
+        if (scan == Snil)
+            return ls;
+        compose_scratch_push(&context->attachment_scratch, count, scan);
+        count += 1;
+        scan = Scdr(scan);
+    }
+    while (count != 0) {
+        count -= 1;
+        node = context->attachment_scratch.nodes[count];
+        result = Scons(Scar(node), result);
+        compose_memo_set(&context->attachments, node, result);
+    }
+    return result;
+}
+
+/* A winder records the attachments that are current just outside its dynamic
+ * extent. Rebase that attachment tail by cloning the winder. Winder fields
+ * are in, out, and attachments; critical winders have the same instance
+ * fields. */
+static ptr compose_continuation_winder(compose_context *context,
+                                       ptr w,
+                                       ptr old_tail,
+                                       ptr new_tail) {
+    ptr attachments, cached, copy, rtd;
+    iptr size;
+
+    cached = compose_memo_ref(&context->winders, w);
+    if (cached != (ptr)0)
+        return cached;
+    rtd = RECORDINSTTYPE(w);
+    if (context->winder_rtd1 == (ptr)0)
+        context->winder_rtd1 = rtd;
+    else if (rtd != context->winder_rtd1
+             && context->winder_rtd2 == (ptr)0)
+        context->winder_rtd2 = rtd;
+    attachments = compose_continuation_list(context,
+                                            RECORDINSTIT(w, 2),
+                                            old_tail,
+                                            new_tail);
+    if (attachments == RECORDINSTIT(w, 2)) {
+        compose_memo_set(&context->winders, w, w);
+        return w;
+    }
+    size = UNFIX(RECORDDESCSIZE(rtd));
+    copy = S_record(size_record_inst(size));
+    RECORDINSTTYPE(copy) = rtd;
+    memcpy(&RECORDINSTIT(copy, 0), &RECORDINSTIT(w, 0), size - ptr_bytes);
+    RECORDINSTIT(copy, 2) = attachments;
+    compose_memo_set(&context->winders, w, copy);
+    return copy;
+}
+
+static ptr compose_continuation_winders(compose_context *context,
+                                        ptr ls,
+                                        ptr old_tail,
+                                        ptr new_tail,
+                                        ptr old_attachments,
+                                        ptr new_attachments) {
+    ptr cached, node, result, scan, w;
+    uptr count = 0;
+
+    if (old_tail == new_tail && old_attachments == new_attachments)
+        return ls;
+    cached = compose_memo_ref(&context->winder_lists, ls);
+    if (cached != (ptr)0)
+        return cached;
+    scan = ls;
+    for (;;) {
+        if (scan == old_tail) {
+            result = new_tail;
+            break;
+        }
+        cached = compose_memo_ref(&context->winder_lists, scan);
+        if (cached != (ptr)0) {
+            result = cached;
+            break;
+        }
+        if (scan == Snil)
+            return ls;
+        compose_scratch_push(&context->winder_scratch, count, scan);
+        count += 1;
+        scan = Scdr(scan);
+    }
+    while (count != 0) {
+        count -= 1;
+        node = context->winder_scratch.nodes[count];
+        w = compose_continuation_winder(context,
+                                        Scar(node),
+                                        old_attachments,
+                                        new_attachments);
+        result = Scons(w, result);
+        compose_memo_set(&context->winder_lists, node, result);
+    }
+    return result;
+}
+
+static ptr compose_continuation_stack_value(compose_context *context, ptr value) {
+    ptr mapped, scan, slow;
+    uptr steps;
+
+    if (value == context->old_winders)
+        return context->new_winders;
+    if (value == context->old_attachments)
+        return context->new_attachments;
+    mapped = compose_memo_ref(&context->winder_lists, value);
+    if (mapped != (ptr)0)
+        return mapped;
+    mapped = compose_memo_ref(&context->winders, value);
+    if (mapped != (ptr)0)
+        return mapped;
+    mapped = compose_memo_ref(&context->attachments, value);
+    if (mapped != (ptr)0)
+        return mapped;
+
+    /* Critical dynamic-wind frames also keep temporary winder lists, such as
+     * a disable-interrupts prefix, that are not installed on a continuation
+     * object. Recognize them when they reach the boundary or a mapped suffix. */
+    if (!Spairp(value)
+        || !Srecordp(Scar(value))
+        || (RECORDINSTTYPE(Scar(value)) != context->winder_rtd1
+            && RECORDINSTTYPE(Scar(value)) != context->winder_rtd2))
+        return value;
+    scan = value;
+    slow = value;
+    steps = 0;
+    for (;;) {
+        if (scan == context->old_winders
+            || compose_memo_ref(&context->winder_lists, scan) != (ptr)0)
+            break;
+        if (!Spairp(scan))
+            return value;
+        scan = Scdr(scan);
+        steps += 1;
+        if ((steps & 1) == 0) {
+            if (!Spairp(slow))
+                return value;
+            slow = Scdr(slow);
+            if (scan == slow)
+                return value;
+        }
+    }
+    return compose_continuation_winders(context,
+                                        value,
+                                        context->old_winders,
+                                        context->new_winders,
+                                        context->old_attachments,
+                                        context->new_attachments);
+}
+
+/* Rewrite only live Scheme pointers in a copied stack. Compiler-generated
+ * dynamic-wind frames keep winder and attachment lists in live slots, in
+ * addition to the copies recorded on continuation objects. */
+static void compose_continuation_stack(compose_context *context,
+                                       ptr stack,
+                                       iptr length,
+                                       ptr return_address) {
+    ptr live_mask;
+    ptr *base, *frame, *slot;
+    uptr mask;
+    iptr index;
+    INT bits;
+    bigit big_mask;
+
+    base = TO_VOIDP(stack);
+    frame = TO_VOIDP((uptr)stack + length);
+    while (frame != base) {
+        if (frame < base)
+            S_error_abort("compose continuation: malformed stack");
+        frame = TO_VOIDP((uptr)TO_PTR(frame)
+                         - ENTRYFRAMESIZE(return_address));
+        live_mask = ENTRYLIVEMASK(return_address);
+        slot = frame;
+        return_address = *slot;
+        if (Sfixnump(live_mask)) {
+            mask = UNFIX(live_mask);
+            while (mask != 0) {
+                slot += 1;
+                if (mask & 1)
+                    *slot = compose_continuation_stack_value(context, *slot);
+                mask >>= 1;
+            }
+        } else {
+            index = BIGLEN(live_mask);
+            while (index != 0) {
+                index -= 1;
+                bits = bigit_bits;
+                big_mask = BIGIT(live_mask, index);
+                while (bits > 0) {
+                    bits -= 1;
+                    slot += 1;
+                    if (big_mask & 1)
+                        *slot = compose_continuation_stack_value(context,
+                                                                 *slot);
+                    big_mask >>= 1;
+                }
+            }
+        }
+    }
+}
+
+/* Copy the segment from k up to but not including boundary, then splice the
+ * copy onto tail. The copied dynamic context has the same captured prefix
+ * followed by tail's winders and attachments.
+ * Each copied continuation owns its stack storage, since both the captured
+ * segment and every composition of it can be entered independently.
+ * GC safety: find_room may queue but never run a collection, and collection
+ * only happens at Scheme event checks, which cannot occur while this thread
+ * is inside a non-collect-safe foreign procedure. */
+static ptr compose_continuation(ptr k,
+                                ptr boundary,
+                                ptr tail) {
+    ptr head, last, next, source, stack, winders, attachments;
+    ptr old_winders, new_winders, old_attachments, new_attachments;
+    ptr tc = get_thread_context();
+    compose_context context;
+    iptr length;
+
+    S_promote_to_multishot(k);
+    old_winders = CONTWINDERS(boundary);
+    new_winders = CONTWINDERS(tail);
+    old_attachments = CONTATTACHMENTS(boundary);
+    new_attachments = CONTATTACHMENTS(tail);
+    compose_context_init(&context,
+                         old_winders,
+                         new_winders,
+                         old_attachments,
+                         new_attachments);
+
+    /* Populate all dynamic-state mappings before rewriting any copied stack,
+     * since a frame can refer to state recorded on another continuation in
+     * the segment. */
+    source = k;
+    while (source != boundary) {
+        if (CONTATTACHMENTS(source) != Sfalse) {
+            (void)compose_continuation_winders(&context,
+                                               CONTWINDERS(source),
+                                               old_winders,
+                                               new_winders,
+                                               old_attachments,
+                                               new_attachments);
+            (void)compose_continuation_list(&context,
+                                            CONTATTACHMENTS(source),
+                                            old_attachments,
+                                            new_attachments);
+        }
+        source = CONTLINK(source);
+    }
+
+    head = last = Snil;
+    source = k;
+    while (source != boundary) {
+        length = CONTCLENGTH(source);
+        find_room(tc, space_new, 0, type_untyped, length, stack);
+        memcpy(TO_VOIDP(stack), TO_VOIDP(CONTSTACK(source)), length);
+        if (CONTATTACHMENTS(source) == Sfalse) {
+            winders = CONTWINDERS(source);
+            attachments = Sfalse;
+        } else {
+            winders = compose_continuation_winders(&context,
+                                                   CONTWINDERS(source),
+                                                   old_winders,
+                                                   new_winders,
+                                                   old_attachments,
+                                                   new_attachments);
+            attachments = compose_continuation_list(&context,
+                                                    CONTATTACHMENTS(source),
+                                                    old_attachments,
+                                                    new_attachments);
+        }
+        compose_continuation_stack(&context,
+                                   stack,
+                                   length,
+                                   CONTRET(source));
+        next = S_mkcontinuation(space_new,
+                                0,
+                                CLOSENTRY(source),
+                                stack,
+                                length,
+                                length,
+                                tail,
+                                CONTRET(source),
+                                winders,
+                                attachments);
+        if (head == Snil)
+            head = next;
+        else
+            CONTLINK(last) = next;
+        last = next;
+        source = CONTLINK(source);
+    }
+    compose_context_destroy(&context);
+    return head;
+}
+
+ptr S_compose_continuation(ptr k, ptr boundary, ptr tail) {
+    return compose_continuation(k, boundary, tail);
+}
+
 void S_handle_overflow() {
     ptr tc = get_thread_context();
 

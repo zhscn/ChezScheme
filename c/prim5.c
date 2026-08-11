@@ -1760,6 +1760,7 @@ void S_prim5_init(void) {
     Sforeign_symbol("(cs)s_bytevector_reference_star_ref", (void *)s_bytevector_reference_star_ref);
     Sforeign_symbol("(cs)continuation_depth", (void *)S_continuation_depth);
     Sforeign_symbol("(cs)single_continuation", (void *)S_single_continuation);
+    Sforeign_symbol("(cs)compose_continuation", (void *)S_compose_continuation);
     Sforeign_symbol("(cs)c_exit", (void *)c_exit);
     Sforeign_symbol("(cs)s_set_collect_trip_bytes", (void *)s_set_collect_trip_bytes);
     Sforeign_symbol("(cs)s_oblist", (void *)s_oblist);
