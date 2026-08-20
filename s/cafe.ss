@@ -122,7 +122,7 @@
         (lambda (k)
           ($current-stack-link $null-continuation) ; toss what's below
           (call-with-values
-            (lambda () (eval x))
+            (lambda () ($control-root (lambda () (eval x))))
             (lambda args (for-each (waiter-write) args)))
           (k))))))
 

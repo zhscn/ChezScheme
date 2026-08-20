@@ -1140,6 +1140,176 @@
       (k (lambda () (error 'srfi-248 "composition")))))
 )
 
+(mat racket-control
+  (begin
+    (define $control-environment
+      (apply environment
+        (append
+          (list
+            '(rnrs)
+            '(only (chezscheme)
+               create-exception-state
+               current-exception-state
+               with-unwind-handler))
+          (if (threaded?)
+              (list '(only (chezscheme) fork-thread thread-join))
+              '())
+          (list '(chezscheme control)))))
+    (define ($control-eval expression)
+      (eval expression $control-environment))
+    #t)
+  (eqv? 42
+    ($control-eval
+      '(reset (+ 1 (shift k (k 41))))))
+  (eqv? 13
+    ($control-eval
+      '(reset (+ 1 (shift k (+ (k 5) (k 6)))))))
+  (eqv? 5
+    ($control-eval
+      '(reset (+ 1 (shift k (k (shift k2 5)))))))
+  (eqv? 5
+    ($control-eval
+      '(reset
+         (guard (condition [else 'caught])
+           (shift k 5)))))
+  (eqv? 5
+    ($control-eval
+      '(reset
+         (with-unwind-handler
+           (lambda (condition continuation) 'caught)
+           (lambda () (shift k 5))))))
+  (eqv? 105
+    ($control-eval
+      '(reset
+         (+ 100
+           (reset
+             (+ 1 (shift k (shift k2 5))))))))
+  (eqv? 5
+    ($control-eval
+      '(reset0
+         (+ 100
+           (reset0
+             (+ 1 (shift0 k (shift0 k2 5))))))))
+  (eqv? 105
+    ($control-eval
+      '(reset
+         (+ 100
+           (reset
+             (+ 1 (shift0 k (shift0 k2 5))))))))
+  (eqv? 105
+    ($control-eval
+      '(reset0
+         (+ 100
+           (reset0
+             (+ 1 (shift k (shift k2 5))))))))
+  (eqv? 17
+    ($control-eval
+      '(let ([tag (make-continuation-prompt-tag 'tag)])
+         (reset-at tag
+           (+ 10 (shift-at tag k (k 7)))))))
+  (eqv? 11
+    ($control-eval
+      '(let ([outer (make-continuation-prompt-tag 'outer)]
+             [inner (make-continuation-prompt-tag 'inner)])
+         (reset-at outer
+           (+ 100
+             (reset-at inner
+               (+ 10
+                 (shift-at outer k 11))))))))
+  (equal? '(1 2)
+    ($control-eval
+      '(reset
+         (call-with-values
+           (lambda () (shift k (k 1 2)))
+           list))))
+  (equal? '(0 11 12)
+    ($control-eval
+      '(let ([saved #f])
+         (let ([first
+                (reset
+                  (+ 10
+                    (shift k
+                      (set! saved k)
+                      0)))])
+           (list first (saved 1) (saved 2))))))
+  (equal?
+    '(enter exit body enter exit)
+    ($control-eval
+      '(let ([events '()])
+         (define (record! event)
+           (set! events (cons event events)))
+         (reset
+           (dynamic-wind
+             (lambda () (record! 'enter))
+             (lambda ()
+               (shift k
+                 (k (begin (record! 'body) 0))))
+             (lambda () (record! 'exit))))
+         (reverse events))))
+  ($control-eval
+    '(let ([tag (make-continuation-prompt-tag)])
+       (and
+         (continuation-prompt-tag? tag)
+         (continuation-prompt-tag?
+           (default-continuation-prompt-tag))
+         (eq? (default-continuation-prompt-tag)
+              (default-continuation-prompt-tag))
+         (not (eq? tag (make-continuation-prompt-tag))))))
+  (equal? "#<continuation-prompt-tag:tag>"
+    ($control-eval
+      '(call-with-values
+         open-string-output-port
+         (lambda (port get-output-string)
+           (write (make-continuation-prompt-tag 'tag) port)
+           (get-output-string)))))
+  (eqv? 5
+    ($control-eval
+      '(let ([original (current-exception-state)]
+             [replacement (create-exception-state)])
+         (dynamic-wind
+           (lambda () #f)
+           (lambda ()
+             (reset
+               (current-exception-state replacement)
+               (shift k 5)))
+           (lambda ()
+             (current-exception-state original))))))
+  (eq? 'caught
+    ($control-eval
+      '(let ([original (current-exception-state)]
+             [saved #f]
+             [tag (make-continuation-prompt-tag 'saved)])
+         (dynamic-wind
+           (lambda () #f)
+           (lambda ()
+             (reset-at tag
+               (set! saved (current-exception-state)))
+             (current-exception-state saved)
+             (guard (condition [else 'caught])
+               (shift-at tag k 'unexpected)))
+           (lambda ()
+             (current-exception-state original))))))
+  (or (not (threaded?))
+      (eqv? 101
+        ($control-eval
+          '(let ([result #f])
+             (thread-join
+               (fork-thread
+                 (lambda ()
+                   (set! result
+                     (+ 100 (shift k (k 1)))))))
+             result))))
+  (error?
+    ($control-eval '(make-continuation-prompt-tag "tag")))
+  (error?
+    ($control-eval '(reset-at 'not-a-tag 1)))
+  (error?
+    ($control-eval
+      '(shift-at (make-continuation-prompt-tag 'missing) k 1)))
+  (procedure?
+    (eval 'reset (environment '(chezscheme))))
+)
+
 (mat conditions-r6rs ; r6rs examples
   (begin
     (define-record-type ($co-&cond1 $co-make-cond1 $co-real-cond1?)

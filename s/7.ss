@@ -1011,7 +1011,8 @@
                          [exit-handler
                           (case-lambda [() (k (void))] [(x . args) (k x)])]
                          [reset-handler (lambda () (k -1))])
-            (apply (scheme-start) fns)))))
+            ($control-root
+              (lambda () (apply (scheme-start) fns)))))))
     (unless (suppress-greeting)
       (display ($scheme-greeting) (console-output-port))
       (newline (console-output-port))
@@ -1030,7 +1031,11 @@
                          [exit-handler
                           (case-lambda [() (k (void))] [(x . args) (k x)])]
                          [reset-handler (lambda () (k -1))])
-            (apply (if program? (scheme-program) (scheme-script)) fn fns)))))
+            ($control-root
+              (lambda ()
+                (apply
+                  (if program? (scheme-program) (scheme-script))
+                  fn fns)))))))
     (if-feature expeditor
       (if ($enable-expeditor) ($expeditor go) (go))
       (go))))

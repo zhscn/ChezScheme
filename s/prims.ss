@@ -2054,7 +2054,7 @@
                              [exit-handler
                               (case-lambda [() (k (void))] [(x . args) (k x)])]
                              [reset-handler (lambda () (k (void)))])
-                (t)
+                ($control-root t)
                 (void))))))))
 
 (set-who! thread-join

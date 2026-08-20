@@ -357,6 +357,87 @@ as \scheme{(#3%car x)} makes both branches of the \scheme{if} the
 same, and then \scheme{pair?} test can be eliminated (since it has no side
 effects).
 
+\section{Delimited Control\label{SECTSYSTEMDELIMITEDCONTROL}}
+
+The \scheme{(chezscheme control)} library provides Racket-style
+\scheme{shift} and \scheme{reset} forms for composable delimited
+continuations.  Its bindings are separate from the \scheme{(chezscheme)}
+library, whose \scheme{reset} binding retains its interactive reset behavior.
+Programs that also import \scheme{(chezscheme)} can prefix the control
+bindings, as in the following example.
+
+\schemedisplay
+(import (chezscheme)
+        (prefix (chezscheme control) control:))
+
+(control:reset
+  (+ 1 (control:shift k (k 41)))) ;=> 42
+\endschemedisplay
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-continuation-prompt-tag}{\categoryprocedure}{(make-continuation-prompt-tag)}
+\formdef{make-continuation-prompt-tag}{\categoryprocedure}{(make-continuation-prompt-tag \var{name})}
+\formdef{continuation-prompt-tag?}{\categoryprocedure}{(continuation-prompt-tag? \var{object})}
+\formdef{default-continuation-prompt-tag}{\categoryprocedure}{(default-continuation-prompt-tag)}
+\listlibraries
+\endentryheader
+
+\scheme{make-continuation-prompt-tag} returns a fresh continuation-prompt
+tag.  If supplied, \var{name} must be a symbol and appears in the tag's
+printed representation.  Prompt tags select which enclosing prompt delimits
+a control operation.
+
+\scheme{continuation-prompt-tag?} returns \scheme{#t} if \var{object} is a
+continuation-prompt tag and \scheme{#f} otherwise.
+
+\scheme{default-continuation-prompt-tag} returns the prompt tag used by the
+untagged control forms.  It returns the same tag on every call.  A prompt
+with this tag is installed at the root of each thread's continuation.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{reset}{\categorysyntax}{(reset \var{body_1} \var{body_2} \dots)}
+\formdef{reset-at}{\categorysyntax}{(reset-at \var{tag} \var{body_1} \var{body_2} \dots)}
+\formdef{reset0}{\categorysyntax}{(reset0 \var{body_1} \var{body_2} \dots)}
+\formdef{reset0-at}{\categorysyntax}{(reset0-at \var{tag} \var{body_1} \var{body_2} \dots)}
+\libraries \scheme{(chezscheme control)}
+\nolistlibraries
+\endentryheader
+
+Each form evaluates its body in sequence within a continuation prompt and
+returns the values of the last expression.  The \scheme{-at} forms use
+\var{tag}, which must be a continuation-prompt tag.  The untagged forms use
+the default continuation-prompt tag.
+
+\scheme{reset} and \scheme{reset-at} retain the matching prompt while
+evaluating a shift body.  \scheme{reset0} and \scheme{reset0-at} omit that
+prompt when handling a matching \scheme{shift0} or \scheme{shift0-at}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{shift}{\categorysyntax}{(shift \var{k} \var{body_1} \var{body_2} \dots)}
+\formdef{shift-at}{\categorysyntax}{(shift-at \var{tag} \var{k} \var{body_1} \var{body_2} \dots)}
+\formdef{shift0}{\categorysyntax}{(shift0 \var{k} \var{body_1} \var{body_2} \dots)}
+\formdef{shift0-at}{\categorysyntax}{(shift0-at \var{tag} \var{k} \var{body_1} \var{body_2} \dots)}
+\listlibraries
+\endentryheader
+
+\var{k} must be an identifier.  Each form captures the continuation through
+the nearest enclosing prompt with the selected tag, binds \var{k} to a
+procedure representing the captured continuation, and evaluates its body in
+sequence.  The \scheme{-at} forms select \var{tag}; the untagged forms select
+the default continuation-prompt tag.  A tagged shift with no matching prompt
+raises an exception.
+
+The continuation procedure accepts any number of arguments and may be
+invoked any number of times.  Its arguments become the values of the shift
+expression.  Invoking a continuation captured by \scheme{shift} or
+\scheme{shift-at} installs a matching prompt around the resumed computation;
+invoking one captured by \scheme{shift0} or \scheme{shift0-at} does not.
+Captured and invoking dynamic environments compose according to
+\scheme{dynamic-wind}, parameter bindings, and continuation marks.
+
 \section{Interrupts\label{SECTSYSTEMINTERRUPTS}}
 
 \index{interrupts}{\ChezScheme} allows programs to control
@@ -4089,7 +4170,8 @@ The following example installs a procedure equivalent to the default
 \entryheader
 \formdef{reset}{\categoryprocedure}{(reset)}
 \returns does not return
-\listlibraries
+\libraries \scheme{(chezscheme)}
+\nolistlibraries
 \endentryheader
 
 \noindent

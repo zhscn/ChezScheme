@@ -28,9 +28,17 @@
 
   (define put-priminfo!
     (lambda (prim lib*)
-      (when (eq-hashtable-contains? prim-db prim)
-        (warning 'define-symbol-type "extra entry for ~s" prim))
-      (eq-hashtable-set! prim-db prim lib*)))
+      (let ([old-lib* (eq-hashtable-ref prim-db prim #f)])
+        (if old-lib*
+            (let ([new-lib*
+                   (filter
+                     (lambda (lib) (not (member lib old-lib*)))
+                     lib*)])
+              (when (< (length new-lib*) (length lib*))
+                (warning 'define-symbol-type "extra entry for ~s" prim))
+              (eq-hashtable-set! prim-db prim
+                (append old-lib* new-lib*)))
+            (eq-hashtable-set! prim-db prim lib*)))))
 
   (define-syntax define-symbol-flags*
     (lambda (x)

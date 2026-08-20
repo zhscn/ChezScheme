@@ -212,7 +212,8 @@ TODO:
     (sealed #t)
     (fields (immutable empty-key)
             (mutable boundary-target)
-            (immutable targets-box)))
+            (immutable targets-box)
+            (immutable marker)))
 
   (define call-with-unwind-targets
     (lambda (info proc)
@@ -253,6 +254,35 @@ TODO:
     (sealed #t)
     (fields (immutable empty?)))
 
+  (define-record-type
+    (control-prompt-tag $make-control-prompt-tag control-prompt-tag?)
+    (nongenerative)
+    (opaque #t)
+    (sealed #t)
+    (fields (immutable name)))
+
+  (define-record-type control-prompt-frame
+    (nongenerative)
+    (opaque #t)
+    (sealed #t)
+    (fields (immutable tag)))
+
+  (define-record-type control-prompt-activation
+    (nongenerative)
+    (opaque #t)
+    (sealed #t)
+    (fields (immutable frame)
+            (immutable handler)))
+
+  (define-record-type control-shift-request
+    (nongenerative)
+    (opaque #t)
+    (sealed #t)
+    (parent &condition)
+    (fields (immutable tag)
+            (immutable zero?)
+            (immutable proc)))
+
   (define empty-delimited-continuation-info
     (make-delimited-continuation-info #t))
 
@@ -262,11 +292,32 @@ TODO:
   (define current-raise-context
     ($make-thread-parameter #f (lambda (x) x)))
 
+  (define disabled-control-prompt-frames
+    ($make-thread-parameter '() (lambda (x) x)))
+
+  (define control-prompt-mark-key
+    (gensym "control-prompt"))
+
   (define no-continuation-attachment
     '())
 
   (define missing-unwind-target
     (list 'missing-unwind-target))
+
+  (define control-prompt-frame-disabled?
+    (lambda (frame)
+      (and (memq frame (disabled-control-prompt-frames)) #t)))
+
+  (define find-control-prompt-activation
+    (lambda (tag)
+      (find
+        (lambda (activation)
+          (let ([frame (control-prompt-activation-frame activation)])
+            (and (eq? tag (control-prompt-frame-tag frame))
+                 (not (control-prompt-frame-disabled? frame)))))
+        (continuation-marks->list
+          (current-continuation-marks)
+          control-prompt-mark-key))))
 
   (define find-unwind-limit
     (lambda (k info)
@@ -333,6 +384,27 @@ TODO:
       (and (wrapper-procedure? handler)
            (unwind-handler-info? (wrapper-procedure-data handler)))))
 
+  (define control-unwind-handler?
+    (lambda (handler)
+      (and (unwind-handler? handler)
+           (control-prompt-frame?
+             (unwind-handler-info-marker
+               (wrapper-procedure-data handler))))))
+
+  (define strip-control-prompt-handlers
+    (lambda (stack)
+      (let loop ([stack stack])
+        (cond
+          [(not (pair? stack)) stack]
+          [(eq? (cdr stack) stack) stack]
+          [else
+           (let ([rest (loop (cdr stack))])
+             (if (control-unwind-handler? (car stack))
+                 rest
+                 (if (eq? rest (cdr stack))
+                     stack
+                     (cons (car stack) rest))))]))))
+
   (define invoke-handler
     (lambda (handler obj context)
       (if (unwind-handler? handler)
@@ -355,39 +427,8 @@ TODO:
   (define default-handler-stack
     (create-exception-stack default-handler))
 
-  (let ()
-    (define-record-type exception-state
-      (nongenerative)
-      (opaque #t)
-      (sealed #t)
-      (fields (immutable stack)))
-
-    (set-who! create-exception-state
-      (case-lambda
-        [() (make-exception-state (create-exception-stack default-handler))]
-        [(p)
-         (unless (procedure? p) ($oops who "~s is not a procedure" p))
-         (make-exception-state (create-exception-stack p))]))
-
-    (set-who! current-exception-state
-      (case-lambda
-        [() (make-exception-state ($current-handler-stack))]
-        [(x)
-         (unless (exception-state? x)
-           ($oops who "~s is not an exception state" x))
-         ($current-handler-stack (exception-state-stack x))])))
-
-  (set-who! with-exception-handler
-    (lambda (handler thunk)
-      (unless (procedure? handler) ($oops who "~s is not a procedure" handler))
-      (unless (procedure? thunk) ($oops who "~s is not a procedure" thunk))
-      (parameterize ([$current-handler-stack (cons handler ($current-handler-stack))])
-        (thunk))))
-
-  (set-who! with-unwind-handler
-    (lambda (handler thunk)
-      (unless (procedure? handler) ($oops who "~s is not a procedure" handler))
-      (unless (procedure? thunk) ($oops who "~s is not a procedure" thunk))
+  (define call-with-unwind-handler
+    (lambda (handler thunk marker)
       (#3%call/cc
         (lambda (outer)
           (let* ([empty-key (list 'empty-unwind-continuation)]
@@ -395,7 +436,7 @@ TODO:
                  ;; retain them only while native continuations can reenter.
                  [info
                    (make-unwind-handler-info
-                     empty-key #f (box #f))]
+                     empty-key #f (box #f) marker)]
                  [unwind-handler
                    (make-wrapper-procedure
                      (lambda (obj)
@@ -421,7 +462,18 @@ TODO:
                                      (make-delimited-continuation
                                        inner limit info empty?)))))))))
                      2
-                     info)])
+                     info)]
+                 [protected-thunk
+                  (if marker
+                      (let ([activation
+                             (make-control-prompt-activation
+                               marker unwind-handler)])
+                        (lambda ()
+                          (with-continuation-mark
+                            control-prompt-mark-key
+                            activation
+                            (thunk))))
+                      thunk)])
               (call-with-values
                 (lambda ()
                   (#3%call/cc
@@ -436,11 +488,49 @@ TODO:
                             unwind-handler
                             (lambda ()
                               ($call-setting-continuation-attachment
-                                (list (cons empty-key #t)) thunk))))
+                                (list (cons empty-key #t))
+                                protected-thunk))))
                         void))))
                 (lambda results
                   ($call-in-continuation outer
                     (lambda () (#2%apply values results))))))))))
+
+  (let ()
+    (define-record-type exception-state
+      (nongenerative)
+      (opaque #t)
+      (sealed #t)
+      (fields (immutable stack)))
+
+    (set-who! create-exception-state
+      (case-lambda
+        [() (make-exception-state (create-exception-stack default-handler))]
+        [(p)
+         (unless (procedure? p) ($oops who "~s is not a procedure" p))
+         (make-exception-state (create-exception-stack p))]))
+
+    (set-who! current-exception-state
+      (case-lambda
+        [()
+         (make-exception-state
+           (strip-control-prompt-handlers ($current-handler-stack)))]
+        [(x)
+         (unless (exception-state? x)
+           ($oops who "~s is not an exception state" x))
+         ($current-handler-stack (exception-state-stack x))])))
+
+  (set-who! with-exception-handler
+    (lambda (handler thunk)
+      (unless (procedure? handler) ($oops who "~s is not a procedure" handler))
+      (unless (procedure? thunk) ($oops who "~s is not a procedure" thunk))
+      (parameterize ([$current-handler-stack (cons handler ($current-handler-stack))])
+        (thunk))))
+
+  (set-who! with-unwind-handler
+    (lambda (handler thunk)
+      (unless (procedure? handler) ($oops who "~s is not a procedure" handler))
+      (unless (procedure? thunk) ($oops who "~s is not a procedure" thunk))
+      (call-with-unwind-handler handler thunk #f)))
 
   (set-who! empty-continuation?
     (lambda (k)
@@ -450,6 +540,97 @@ TODO:
         (unless (delimited-continuation-info? info)
           ($oops who "~s is not a delimited continuation" k))
         (delimited-continuation-info-empty? info))))
+
+  (set-who! control:make-continuation-prompt-tag
+    (case-lambda
+      [() ($make-control-prompt-tag #f)]
+      [(name)
+       (unless (symbol? name)
+         ($oops who "~s is not a symbol" name))
+       ($make-control-prompt-tag name)]))
+
+  (record-writer (type-descriptor control-prompt-tag)
+    (lambda (tag port write?)
+      (let ([name (control-prompt-tag-name tag)])
+        (if name
+            (fprintf port "#<continuation-prompt-tag:~a>" name)
+            (display "#<continuation-prompt-tag>" port)))))
+
+  (set! control:continuation-prompt-tag? control-prompt-tag?)
+
+  (set! control:default-continuation-prompt-tag
+    (let ([tag ($make-control-prompt-tag 'default)])
+      (lambda () tag)))
+
+  (set-who! $control-reset-at
+    (lambda (tag zero? thunk)
+      (unless (control-prompt-tag? tag)
+        ($oops who "~s is not a continuation prompt tag" tag))
+      (unless (procedure? thunk)
+        ($oops who "~s is not a procedure" thunk))
+      (let ([frame (make-control-prompt-frame tag)])
+        (call-with-unwind-handler
+          (lambda (obj k)
+            (if (and (control-shift-request? obj)
+                     (eq? tag (control-shift-request-tag obj))
+                     (not (control-prompt-frame-disabled? frame)))
+                (let* ([shift-zero?
+                        (control-shift-request-zero? obj)]
+                       [resume
+                        (lambda results
+                          ;; Resuming k reinstates this frame's unwind
+                          ;; handler.  Disable that captured instance while
+                          ;; k runs so that a later shift reaches the prompt
+                          ;; installed for the resumed continuation.
+                          ($control-reset-at tag shift-zero?
+                            (lambda ()
+                              (parameterize
+                                ([disabled-control-prompt-frames
+                                  (cons
+                                    frame
+                                    (disabled-control-prompt-frames))])
+                                (apply k results)))))]
+                       [body
+                        (lambda ()
+                          ((control-shift-request-proc obj) resume))])
+                  (if (and zero? shift-zero?)
+                      (body)
+                      ($control-reset-at tag zero? body)))
+                (call-with-values
+                  (lambda () (raise-continuable obj))
+                  k)))
+          thunk
+          frame))))
+
+  (set-who! $control-root
+    (lambda (thunk)
+      (unless (procedure? thunk)
+        ($oops who "~s is not a procedure" thunk))
+      ($control-reset-at
+        (control:default-continuation-prompt-tag)
+        #f
+        thunk)))
+
+  (set-who! $control-shift-at
+    (lambda (tag zero? proc)
+      (unless (control-prompt-tag? tag)
+        ($oops who "~s is not a continuation prompt tag" tag))
+      (unless (procedure? proc)
+        ($oops who "~s is not a procedure" proc))
+      (let ([activation (find-control-prompt-activation tag)])
+        (unless activation
+          ($oops who "no matching continuation prompt for ~s" tag))
+        ;; Invoke the prompt's unwind handler directly so that intervening
+        ;; exception handlers cannot observe the internal control request.
+        ($call-getting-continuation-attachment
+          no-continuation-attachment
+          (lambda (attachment)
+            (#3%call/cc
+              (lambda (inner)
+                (invoke-handler
+                  (control-prompt-activation-handler activation)
+                  (make-control-shift-request tag zero? proc)
+                  (make-raise-context #t attachment inner)))))))))
 
   (set-who! raise
     (lambda (obj)
@@ -560,6 +741,72 @@ TODO:
      (identifier? #'var)
      ($guard #t (lambda (var p) (cond clause1 clause2 ... [else (p)]))
                 (lambda () b1 b2 ...))]))
+
+(define-syntax control:reset
+  (syntax-rules ()
+    [(_ body1 body2 ...)
+     ($control-reset-at
+       (control:default-continuation-prompt-tag)
+       #f
+       (lambda () body1 body2 ...))]))
+
+(define-syntax control:reset-at
+  (syntax-rules ()
+    [(_ tag body1 body2 ...)
+     ($control-reset-at tag #f (lambda () body1 body2 ...))]))
+
+(define-syntax control:reset0
+  (syntax-rules ()
+    [(_ body1 body2 ...)
+     ($control-reset-at
+       (control:default-continuation-prompt-tag)
+       #t
+       (lambda () body1 body2 ...))]))
+
+(define-syntax control:reset0-at
+  (syntax-rules ()
+    [(_ tag body1 body2 ...)
+     ($control-reset-at tag #t (lambda () body1 body2 ...))]))
+
+(define-syntax control:shift
+  (lambda (x)
+    (syntax-case x ()
+      [(_ continuation body1 body2 ...)
+       (identifier? #'continuation)
+       #'($control-shift-at
+           (control:default-continuation-prompt-tag)
+           #f
+           (lambda (continuation) body1 body2 ...))])))
+
+(define-syntax control:shift-at
+  (lambda (x)
+    (syntax-case x ()
+      [(_ tag continuation body1 body2 ...)
+       (identifier? #'continuation)
+       #'($control-shift-at
+           tag
+           #f
+           (lambda (continuation) body1 body2 ...))])))
+
+(define-syntax control:shift0
+  (lambda (x)
+    (syntax-case x ()
+      [(_ continuation body1 body2 ...)
+       (identifier? #'continuation)
+       #'($control-shift-at
+           (control:default-continuation-prompt-tag)
+           #t
+           (lambda (continuation) body1 body2 ...))])))
+
+(define-syntax control:shift0-at
+  (lambda (x)
+    (syntax-case x ()
+      [(_ tag continuation body1 body2 ...)
+       (identifier? #'continuation)
+       #'($control-shift-at
+           tag
+           #t
+           (lambda (continuation) body1 body2 ...))])))
 
 (let ()
  ; redefine here to get local predicate
