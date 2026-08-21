@@ -7,7 +7,16 @@
 (provide-targets targets-at)
 
 (define (targets-at at-dir [vars (hash)])
-  (define config (win-config (config-file->hash (at-dir "../Mf-config") vars) at-dir))
+  (define base-config (win-config (config-file->hash (at-dir "../Mf-config") vars) at-dir))
+  (define config
+    (if (for-windows? base-config)
+        (config-merge
+         base-config
+         'LIBS
+         (if (is-msvc? base-config)
+             "psapi.lib user32.lib advapi32.lib iphlpapi.lib userenv.lib ws2_32.lib dbghelp.lib ole32.lib shell32.lib"
+             "-lpsapi -luser32 -ladvapi32 -liphlpapi -luserenv -lws2_32 -ldbghelp -lole32 -lshell32"))
+        base-config))
   (define lookup (make-lookup config))
 
   (define m (hash-ref config 'm))
@@ -85,7 +94,7 @@
            "number.c" "schsig.c" "io.c" "new-io.c" "print.c" "fasl.c" "vfasl.c"
            "stats.c" "foreign.c" "prim.c" "prim5.c" "flushcache.c"
            "schlib.c" "thread.c" "expeditor.c" "scheme.c" "compress-io.c"
-           "random.c" "ffi.c" "self-exe.c"
+           "random.c" "ffi.c" "self-exe.c" "asyncio.c"
            arch.c)))
   (define kernel-srcs
     ((add-extra-c-sources at-dir mboot)
@@ -157,9 +166,13 @@
 
   (define zlib-dir (at-dir (~a "../zlib" (lib-build-suffix config))))
   (define lz4-dir (at-dir (~a "../lz4" (lib-build-suffix config))))
+  (define libuv-dir (at-dir (~a "../libuv" (lib-build-suffix config))))
 
   (define zlib-lib (build-path zlib-dir (.a (~a (if msvc? "zlib" "z")))))
   (define lz4-lib (build-path lz4-dir (.a (~a "lib/" (if msvc? "liblz4" "lz4")))))
+  (define libuv-lib (if msvc?
+                        (build-path libuv-dir "Release" "libuv.lib")
+                        (build-path libuv-dir "libuv.a")))
 
   (define lz4-files (map at-source
                          ;; LZ4 is simple enough that we can list all
@@ -174,7 +187,8 @@
                            (and (not (equal? lib "")) lib)))
 
   (define lib-deps (append (if zlib-system-lib '() (list zlib-lib))
-                           (if lz4-system-lib '() (list lz4-lib))))
+                           (if lz4-system-lib '() (list lz4-lib))
+                           (list libuv-lib)))
   (define res-deps (if msvc? (list res-file) '()))
 
   (define preload-files (get-preload-files config at-dir mboot))
@@ -187,7 +201,8 @@
                       [config (config-include config
                                               (at-dir (build-path "../boot" m))
                                               (at-dir ".")
-                                              (at-source "."))]
+                                              (at-source ".")
+                                              (at-source "../libuv/include"))]
                       [config (if zlib-system-lib
                                   config
                                   (config-include config
@@ -235,7 +250,7 @@
               ,void
               :recur]
 
-     [:target ,exe (,kernel-dep ,@main-objs ,@res-deps ,@preload-files ,(at-source "mingw.zuo"))
+     [:target ,exe (,kernel-dep ,libuv-lib ,@main-objs ,@res-deps ,@preload-files ,(at-source "mingw.zuo"))
               ,(lambda (path token)
                  (mkdir-p (path-only path))
                  (c-link path
@@ -244,7 +259,8 @@
                                  (append
                                   (list kernel-dep)
                                   (if zlib-system-lib '() (list zlib-lib))
-                                  (if lz4-system-lib '() (list lz4-lib)))
+                                  (if lz4-system-lib '() (list lz4-lib))
+                                  (list libuv-lib))
                                  (if (and (not msvc?)
                                           (for-windows? config))
                                      (make-mingw-to-ms-link-libraries m (at-dir) config)
@@ -318,7 +334,25 @@
                              "-o" (string->shell path)
                              (apply build-shell (map string->shell kernel-objs))
                              (string->shell (or zlib-system-lib zlib-lib))
-                             (string->shell (or lz4-system-lib lz4-lib))))]
+                             (string->shell (or lz4-system-lib lz4-lib))
+                             (string->shell libuv-lib)))]
+
+     [:target ,libuv-lib ,(source-tree (at-source "../libuv"))
+              ,(lambda (path token)
+                 (shell/wait "cmake"
+                             "-S" (string->shell (at-source "../libuv"))
+                             "-B" (string->shell libuv-dir)
+                             "-DLIBUV_BUILD_SHARED=OFF"
+                             "-DBUILD_TESTING=OFF"
+                             "-DLIBUV_BUILD_TESTS=OFF"
+                             "-DCMAKE_BUILD_TYPE=Release"
+                             (if (and (for-windows? config) (not msvc?))
+                                 "-DCMAKE_SYSTEM_NAME=Windows"
+                                 "")
+                             (string->shell (~a "-DCMAKE_C_COMPILER=" (lookup 'CC)))
+                             (string->shell (~a "-DCMAKE_C_FLAGS=" (or (lookup 'CFLAGS) ""))))
+                 (shell/wait "cmake" "--build" (string->shell libuv-dir)
+                             "--config" "Release" "--target" "uv_a"))]
 
      [:target ,zlib-lib ,(source-tree (at-source "../zlib"))
               ,(lambda (path token)

@@ -13,3 +13,6 @@
 [submodule "zuo"]
 	path = zuo
 	url = https://github.com/racket/zuo
+[submodule "libuv"]
+	path = libuv
+	url = https://github.com/libuv/libuv.git

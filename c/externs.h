@@ -350,6 +350,9 @@ extern void S_prim5_init(void);
 extern void S_dump_tc(ptr tc);
 extern ptr S_uninterned(ptr x);
 
+/* asyncio.c */
+extern void S_asyncio_init(void);
+
 /* print.c */
 extern void S_print_init(void);
 extern void S_prin1(ptr x);

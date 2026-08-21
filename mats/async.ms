@@ -258,12 +258,12 @@
               (let ([ch1 (make-channel)] [ch2 (make-channel)])
                 (spawn-task (lambda () (channel-put ch1 'one)))
                 (spawn-task (lambda () (channel-put ch2 'two)))
-                (let ([first (perform-operation
-                               (choice-operation (channel-get-operation ch1)
-                                                 (channel-get-operation ch2)))]
-                      [second (perform-operation
+                (let* ([first (perform-operation
                                 (choice-operation (channel-get-operation ch1)
-                                                  (channel-get-operation ch2)))])
+                                                  (channel-get-operation ch2)))]
+                       [second (perform-operation
+                                 (choice-operation (channel-get-operation ch1)
+                                                   (channel-get-operation ch2)))])
                   (list first second)))))
     '(one two))
 
