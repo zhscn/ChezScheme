@@ -231,7 +231,7 @@
     (immutable ready-queue)         ; ready migratable tasks
     (immutable tasks)               ; stable id -> task registry for the group
     (mutable task-count)
-    (mutable parameter-config)      ; (version . newest-first updates)
+    (immutable parameter-config)    ; atomic box of versioned updates
     (mutable schedulers)
     (mutable root-task)
     (mutable next-task-id)
@@ -335,19 +335,22 @@
   (lambda (version)
     (make-async-dynamic-state
       (if-feature pthreads
-        (vector-copy ($tc-field 'parameters ($tc)))
+        (with-tc-mutex
+          (vector-copy ($tc-field 'parameters ($tc))))
         #f)
       version)))
 
-(define async-install-dynamic-state!
+(define async-install-dynamic-state/raw!
   (lambda (state)
     (if-feature pthreads
       (let ([snap (async-dynamic-state-parameters state)])
         (when snap
-        (let ([cur ($tc-field 'parameters ($tc))])
-          (let ([n (fxmin (vector-length cur) (vector-length snap))])
-            (do ([i 0 (fx+ i 1)]) ((fx= i n))
-                (vector-set! cur i (vector-ref snap i)))))))
+          (let ([cur ($tc-field 'parameters ($tc))])
+            (if (fx< (vector-length cur) (vector-length snap))
+                ($tc-field 'parameters ($tc) (vector-copy snap))
+                (do ([i 0 (fx+ i 1)])
+                    ((fx= i (vector-length snap)))
+                  (vector-set! cur i (vector-ref snap i)))))))
       (void))))
 
 (define async-extend-parameter-vector
@@ -359,30 +362,60 @@
             (vector-set! new i (vector-ref parameters i)))
           new))))
 
+(define async-parameter-config-ref
+  (lambda (group)
+    (let ([config-box (async-scheduler-group-parameter-config group)])
+      (let loop ()
+        (let ([config (unbox config-box)])
+          (if (box-cas! config-box config config)
+              config
+              (loop)))))))
+
+(define async-apply-parameter-config
+  (lambda (state config)
+    (let ([version (car config)]
+          [old-version (async-dynamic-state-version state)])
+      (let collect ([updates (cdr config)] [pending '()])
+        (if (or (null? updates)
+                (fx<= (car (car updates)) old-version))
+            (let apply ([updates pending]
+                        [parameters (async-dynamic-state-parameters state)])
+              (if (null? updates)
+                  (make-async-dynamic-state parameters version)
+                  (let* ([update (car updates)]
+                         [index (cadr update)]
+                         [initval (caddr update)]
+                         [size (cadddr update)]
+                         [parameters
+                          (async-extend-parameter-vector parameters size)])
+                    (when parameters
+                      (vector-set! parameters index initval))
+                    (apply (cdr updates) parameters))))
+            (collect (cdr updates) (cons (car updates) pending)))))))
+
 (define async-normalize-dynamic-state
   (lambda (group state)
-    (let* ([config (async-scheduler-group-parameter-config group)]
-           [version (car config)]
-           [old-version (async-dynamic-state-version state)])
-      (if (fx= version old-version)
+    (let ([config (async-parameter-config-ref group)])
+      (if (fx= (car config) (async-dynamic-state-version state))
           state
-          (let collect ([updates (cdr config)] [pending '()])
-            (if (or (null? updates)
-                    (fx<= (car (car updates)) old-version))
-                (let apply ([updates pending]
-                            [parameters (async-dynamic-state-parameters state)])
-                  (if (null? updates)
-                      (make-async-dynamic-state parameters version)
-                      (let* ([update (car updates)]
-                             [index (cadr update)]
-                             [initval (caddr update)]
-                             [size (cadddr update)]
-                             [parameters
-                              (async-extend-parameter-vector parameters size)])
-                        (when parameters
-                          (vector-set! parameters index initval))
-                        (apply (cdr updates) parameters))))
-                (collect (cdr updates) (cons (car updates) pending))))))))
+          ;; Allocation publishes while holding this mutex inside the runtime's
+          ;; thread-context mutex.  Taking it for a missed version makes the
+          ;; parameter-vector initialization visible on this worker.
+          (with-async-mutex (async-scheduler-group-mutex group)
+            (async-apply-parameter-config state
+              (async-parameter-config-ref group)))))))
+
+(define async-normalize-and-install-dynamic-state!
+  (lambda (group state)
+    (if-feature pthreads
+      ;; Parameter allocation takes the thread-context mutex before publishing
+      ;; the group configuration.  Use the same lock order so normalization
+      ;; and installation cannot straddle an allocation.
+      (with-tc-mutex
+        (let ([state (async-normalize-dynamic-state group state)])
+          (async-install-dynamic-state/raw! state)
+          state))
+      state)))
 
 ;;; Parameter updates are published as immutable versioned entries.  A saved
 ;;; fiber applies missed entries when it is next installed, including entries
@@ -392,21 +425,31 @@
     (let ([sched ($async-scheduler)])
       (when ($async-scheduler? sched)
         (let ([group ($async-scheduler-group sched)])
-          (let ([state
-                 (async-normalize-dynamic-state group
-                   (async-snapshot-dynamic-state
-                     (async-scheduler-active-dynamic-version sched)))])
-            (async-install-dynamic-state! state)
-            (async-scheduler-active-dynamic-version-set! sched
-              (async-dynamic-state-version state)))
+          ;; This hook runs inside the runtime's thread-context mutex, after
+          ;; the new slot has been initialized in every live thread context.
           (let ([version
                  (with-async-mutex (async-scheduler-group-mutex group)
-                   (let* ([config (async-scheduler-group-parameter-config group)]
+                   (let* ([config-box
+                           (async-scheduler-group-parameter-config group)]
+                          [config (async-parameter-config-ref group)]
                           [version (fx+ 1 (car config))])
-                     (async-scheduler-group-parameter-config-set! group
-                       (cons version
-                         (cons (list version index initval size) (cdr config))))
-                     version))])
+                     (let ([next
+                            (cons version
+                              (cons (list version index initval size)
+                                (cdr config)))])
+                       (let publish ()
+                         (unless (box-cas! config-box config next)
+                           (publish)))
+                       ;; The allocating task is already running with the new
+                       ;; slot initialized by the runtime.  Record the version
+                       ;; on that task; other snapshots advance lazily when
+                       ;; their task is installed.
+                       (let ([task (async-scheduler-current-task sched)])
+                         (when task
+                           (async-task-dynamic-state-set! task
+                             (async-apply-parameter-config
+                               (async-task-dynamic-state task) next))))
+                       version)))])
             ;; The allocating thread has already installed this slot.
             (async-scheduler-active-dynamic-version-set! sched version)))))))
 
@@ -506,12 +549,11 @@
            [ambient
             (async-snapshot-dynamic-state
               (async-scheduler-active-dynamic-version sched))]
-           [state (async-normalize-dynamic-state group
+           [state (async-normalize-and-install-dynamic-state! group
                     (async-task-dynamic-state task))])
       (async-scheduler-saved-dynamic-state-set! sched ambient)
       (async-scheduler-saved-exception-state-set! sched (current-exception-state))
       (async-task-dynamic-state-set! task state)
-      (async-install-dynamic-state! state)
       (async-scheduler-active-dynamic-version-set! sched
         (async-dynamic-state-version state))
       (unless engine-was-active? ($engine-reset-thread-state!))
@@ -523,17 +565,17 @@
   (lambda (sched task)
     (async-task-dynamic-state-set! task
       (async-snapshot-dynamic-state
-        (async-scheduler-active-dynamic-version sched)))
+        (async-dynamic-state-version
+          (async-task-dynamic-state task))))
     (async-task-exception-state-set! task (current-exception-state))))
 
 (define restore-scheduler-dynamic-state!
   (lambda (sched)
-    (let ([state
-           (async-normalize-dynamic-state
-             ($async-scheduler-group sched)
-             (async-scheduler-saved-dynamic-state sched))])
+      (let ([state
+             (async-normalize-and-install-dynamic-state!
+               ($async-scheduler-group sched)
+               (async-scheduler-saved-dynamic-state sched))])
       (async-scheduler-saved-dynamic-state-set! sched state)
-      (async-install-dynamic-state! state)
       (async-scheduler-active-dynamic-version-set! sched
         (async-dynamic-state-version state))
       (current-exception-state (async-scheduler-saved-exception-state sched)))
@@ -2086,7 +2128,7 @@
                       (make-async-mutex)
                       (if-feature pthreads (make-condition) #f)
                       (make-async-queue) (make-eq-hashtable) 0
-                      (cons 0 '()) '#() #f 0 0 0 #f #f '())]
+                      (box (cons 0 '())) '#() #f 0 0 0 #f #f '())]
              [schedulers (make-vector parallelism)])
         (do ([i 0 (fx+ i 1)]) ((fx= i parallelism))
           (vector-set! schedulers i

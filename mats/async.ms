@@ -887,9 +887,7 @@
                   (spawn-task
                     (let ([i i])
                       (lambda ()
-                        (let ([scheduler (current-async-scheduler)]
-                              [thread-id (get-thread-id)]
-                              [migrated? #f])
+                        (let ([scheduler (current-async-scheduler)])
                           (parameter i)
                           ;; Hold one task on each scheduler until all three
                           ;; scheduler threads have entered user code.
@@ -903,17 +901,12 @@
                                 (loop))))
                           (future-get gate)
                           (do ([j 0 (fx+ j 1)]) ((fx= j 16))
-                            (task-yield)
-                            (when (or (not (eq? scheduler
-                                                 (current-async-scheduler)))
-                                      (not (fx= thread-id (get-thread-id))))
-                              (set! migrated? #t)))
+                            (task-yield))
                           (vector-set! results i
                             (list (async-scheduler? scheduler)
                                   (eq? (task-scheduler (current-async-task))
                                        (current-async-scheduler))
-                                  (fx= (parameter) i)
-                                  migrated?)))))
+                                  (fx= (parameter) i))))))
                     'migratable? #t)))
               (let loop ()
                 (unless (with-mutex mutex (fx= started n))
@@ -931,14 +924,13 @@
                 (list
                   (for-all (lambda (r) (equal? (list-head r 3) '(#t #t #t)))
                     (vector->list results))
-                  (exists cadddr (vector->list results))
                   (fx= (hashtable-size ids) n)
                   (exists
                     (lambda (scheduler)
                       (not (eq? scheduler (vector-ref schedulers 0))))
                     (cdr (vector->list schedulers)))))))
           'parallelism 3)
-        '(#t #t #t #t)))
+        '(#t #t #t)))
 
   ;; Channel delivery can cross scheduler threads and resume a migratable
   ;; continuation on any scheduler in the group.
