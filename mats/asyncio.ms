@@ -48,6 +48,12 @@
   (error? (run-async (lambda () (file-open "x" '(bogus)))))
   (error? (run-async (lambda () (file-open "x" '(read) -1))))
   (error? (run-async (lambda () (file-read 'not-a-file 1))))
+  (error? (async-stream->binary-input-port 'not-a-stream))
+  (error? (async-stream->binary-output-port 'not-a-stream))
+  (error? (async-stream->binary-input/output-port 'not-a-stream))
+  (error? (async-file->binary-input-port 'not-a-file))
+  (error? (async-file->binary-output-port 'not-a-file))
+  (error? (async-file->binary-input/output-port 'not-a-file))
 
   ;; filesystem requests preserve contents, offsets, and stat metadata
 
@@ -70,6 +76,37 @@
              'preemption-ticks 20)))
       (asyncio-delete-if-present path)
       (equal? result '(11 "hello async" #t 11))))
+
+  ;; File adapters preserve port buffering, position, EOF, and ownership.
+
+  (let ([path (asyncio-temp-path "file-port")]
+        [payload (string->utf8 "port-backed async file")])
+    (asyncio-delete-if-present path)
+    (let ([result
+           (run-async
+             (lambda ()
+               (let* ([file (file-open path '(read write create truncate))]
+                      [port (async-file->binary-input/output-port file)]
+                      [owned?
+                       (guard (c [else #t])
+                         (async-file->binary-input-port file)
+                         #f)])
+                 (put-bytevector port payload)
+                 (flush-output-port port)
+                 (let ([end (port-position port)])
+                   (set-port-position! port 0)
+                   (let* ([contents (get-bytevector-n port
+                                      (bytevector-length payload))]
+                          [eof (get-u8 port)])
+                     (close-port port)
+                     (list owned? end contents (eof-object? eof)
+                       (port-closed? port)
+                       (guard (c [(async-io-condition? c)
+                                  (async-io-condition-code c)])
+                         (file-read file 1))))))))])
+      (asyncio-delete-if-present path)
+      (equal? result
+        (list #t (bytevector-length payload) payload #t #t 'closed))))
 
   ;; filesystem failures retain operation and path information
 
@@ -155,6 +192,108 @@
                    (list (task-join server) reply)))))))
       (asyncio-delete-if-present path)
       (equal? result '("ping" "pong"))))
+
+  ;; Duplex stream ports avoid read-ahead, flush before close, and translate
+  ;; stream EOF into port EOF.
+
+  (let ([path (asyncio-temp-path "duplex-port")])
+    (asyncio-delete-if-present path)
+    (let ([result
+           (run-async
+             (lambda ()
+               (let* ([listener (pipe-listen path)]
+                      [server-task
+                       (spawn-task
+                         (lambda ()
+                           (let* ([stream (tcp-accept listener)]
+                                  [port
+                                   (async-stream->binary-input/output-port
+                                     stream)]
+                                  [request (get-bytevector-n port 4)])
+                             (put-bytevector port (string->utf8 "reply"))
+                             (close-port port)
+                             (list (utf8->string request)
+                                   (port-closed? port)
+                                   (stream-closed? stream)))))]
+                      [client (pipe-connect path)]
+                      [port
+                       (async-stream->binary-input/output-port client)]
+                      [owned?
+                       (guard (c [else #t])
+                         (async-stream->binary-input-port client)
+                         #f)])
+                 (put-bytevector port (string->utf8 "ping"))
+                 (flush-output-port port)
+                 (let ([reply (get-bytevector-all port)])
+                   (close-port port)
+                   (tcp-listener-close listener)
+                   (list owned? (task-join server-task)
+                         (utf8->string reply)
+                         (port-closed? port))))))])
+      (asyncio-delete-if-present path)
+      (equal? result '(#t ("ping" #t #t) "reply" #t))))
+
+  ;; A stream input port retains a libuv read chunk that is larger than the
+  ;; destination supplied by a particular port read.
+
+  (let ([path (asyncio-temp-path "input-port")]
+        [payload (make-bytevector 8192 37)])
+    (asyncio-delete-if-present path)
+    (let ([result
+           (run-async
+             (lambda ()
+               (let* ([listener (pipe-listen path)]
+                      [writer
+                       (spawn-task
+                         (lambda ()
+                           (let* ([stream (tcp-accept listener)]
+                                  [port
+                                   (async-stream->binary-output-port stream)])
+                             (put-bytevector port payload)
+                             (close-port port))))]
+                      [client (pipe-connect path)]
+                      [port (async-stream->binary-input-port client)]
+                      [prefix (get-bytevector-n port 3)]
+                      [suffix (get-bytevector-all port)])
+                 (close-port port)
+                 (task-join writer)
+                 (tcp-listener-close listener)
+                 (list prefix suffix))))])
+      (asyncio-delete-if-present path)
+      (equal? result
+        (list (make-bytevector 3 37) (make-bytevector 8189 37)))))
+
+  ;; Cancellation propagates through a port read and leaves the next byte for
+  ;; a later read from the same port.
+
+  (let ([path (asyncio-temp-path "port-cancel")])
+    (asyncio-delete-if-present path)
+    (let ([result
+           (run-async
+             (lambda ()
+               (let* ([listener (pipe-listen path)]
+                      [connector
+                       (spawn-task (lambda () (pipe-connect path)))]
+                      [server (tcp-accept listener)]
+                      [client (task-join connector)]
+                      [port (async-stream->binary-input-port server)]
+                      [reader
+                       (spawn-task
+                         (lambda ()
+                           (guard (c [(async-cancellation-condition? c)
+                                      'canceled])
+                             (get-u8 port))))])
+                 (task-yield)
+                 (task-cancel! reader)
+                 (let ([canceled (task-join reader)])
+                   (stream-write client (bytevector 91))
+                   (let ([next (get-u8 port)])
+                     (close-port port)
+                     (stream-close client)
+                     (tcp-listener-close listener)
+                     (list canceled next))))))])
+      (asyncio-delete-if-present path)
+      (equal? result '(canceled 91))))
 
   ;; closing a stream wakes a blocked reader exactly once
 

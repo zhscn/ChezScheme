@@ -212,6 +212,7 @@
     (immutable kind)              ; 'tcp-stream 'pipe-stream 'tcp-listener 'pipe-listener
     (immutable state)             ; owning aio-state
     (immutable path)              ; descriptive string or #f
+    (mutable port-owned?)
     (immutable mutex)
     (mutable closing?)
     (mutable closed?)             ; close callback has run
@@ -226,6 +227,7 @@
   (fields
     (immutable fd)
     (immutable path)
+    (mutable port-owned?)
     (mutable offset)
     (mutable closed?)))
 
@@ -425,7 +427,7 @@
                           (if (eq? (aio-handle-kind h) 'pipe-listener)
                               'pipe-stream
                               'tcp-stream)
-                          st #f (make-mutex) #f #f '() #f #f '())])
+                          st #f #f (make-mutex) #f #f '() #f #f '())])
                  (aio-register-handle! st w)
                  (cons 'values (list w)))]
               [(fx= r (aio-eagain-code))
@@ -669,6 +671,22 @@
     (unless (async-stream? s)
       ($oops who "~s is not an async stream" s))))
 
+(define aio-check-stream-unowned
+  (lambda (who s)
+    (aio-check-stream who s)
+    (when (aio-handle-port-owned? s)
+      ($oops who "async stream ownership has been transferred to a port"))))
+
+(define aio-claim-stream-for-port!
+  (lambda (who s)
+    (aio-check-stream who s)
+    (with-mutex (aio-handle-mutex s)
+      (when (aio-handle-port-owned? s)
+        ($oops who "async stream ownership has already been transferred to a port"))
+      (when (aio-handle-closing? s)
+        (raise (aio-closed-condition who s)))
+      (aio-handle-port-owned?-set! s #t))))
+
 (define %stream-read-operation
   (lambda (s)
     (aio-check-stream 'stream-read-operation s)
@@ -816,7 +834,7 @@
        (when (= h 0)
          ($oops 'tcp-listen "cannot allocate a tcp handle"))
        (let ([w (make-aio-handle id h 'tcp-listener st
-                  (format "~a:~a" host port) (make-mutex)
+                  (format "~a:~a" host port) #f (make-mutex)
                   #f #f '() #f #f '())])
          (define (fail r)
            (aio-handle-close h)
@@ -890,7 +908,7 @@
                       (aio-io-condition 'connect #f (format "~a:~a" host port) -12)))
                   #f)
                 (let ([w (make-aio-handle id h 'tcp-stream st
-                           (format "~a:~a" host port) (make-mutex)
+                           (format "~a:~a" host port) #f (make-mutex)
                            #f #f '() #f #f '())])
                   (aio-register-handle! st w)
                   (let ([r (aio-tcp-connect h host port id)])
@@ -940,7 +958,7 @@
             [h (aio-pipe-init (aio-state-loop st) id)])
        (when (= h 0)
          ($oops 'pipe-listen "cannot allocate a pipe handle"))
-       (let ([w (make-aio-handle id h 'pipe-listener st path (make-mutex)
+       (let ([w (make-aio-handle id h 'pipe-listener st path #f (make-mutex)
                   #f #f '() #f #f '())])
          (define (fail r)
            (aio-handle-close h)
@@ -970,7 +988,7 @@
                   (deliver
                     (cons 'raise (aio-io-condition 'connect #f path -12)))
                   #f)
-                (let ([w (make-aio-handle id h 'pipe-stream st path (make-mutex)
+                (let ([w (make-aio-handle id h 'pipe-stream st path #f (make-mutex)
                            #f #f '() #f #f '())])
                   (aio-register-handle! st w)
                   (aio-register-request! st id
@@ -1103,6 +1121,7 @@
            (if (>= status 0)
                (cons 'values
                  (list (make-async-file% status path
+                         #f
                          (if (fxlogtest bits 16) -1 0) ; append: track end lazily
                          #f)))
                (cons 'raise (aio-io-condition 'open #f path status))))))]))
@@ -1113,6 +1132,19 @@
       ($oops who "~s is not an async file" f))
     (when (async-file-closed? f)
       (raise (aio-io-condition who f (async-file-path f) 'closed)))))
+
+(define aio-check-file-unowned
+  (lambda (who f)
+    (aio-check-file who f)
+    (when (async-file-port-owned? f)
+      ($oops who "async file ownership has been transferred to a port"))))
+
+(define aio-claim-file-for-port!
+  (lambda (who f)
+    (aio-check-file who f)
+    (when (async-file-port-owned? f)
+      ($oops who "async file ownership has already been transferred to a port"))
+    (async-file-port-owned?-set! f #t)))
 
 (define aio-file-offset!
   (lambda (f n)
@@ -1177,6 +1209,116 @@
       (cons 'atime (cons (field 12) (field 13)))
       (cons 'mtime (cons (field 14) (field 15)))
       (cons 'ctime (cons (field 16) (field 17))))))
+
+;;; ------------------------------------------------------- port adapters
+
+(define aio-port-read-procedure
+  (lambda (read-chunk)
+    (let ([pending #f] [pending-start 0])
+      (lambda (target start count)
+        (if (fx= count 0)
+            0
+            (let loop ()
+              (if pending
+                  (let* ([available
+                          (fx- (bytevector-length pending) pending-start)]
+                         [n (fxmin available count)])
+                    (bytevector-copy! pending pending-start target start n)
+                    (if (fx= n available)
+                        (begin
+                          (set! pending #f)
+                          (set! pending-start 0))
+                        (set! pending-start (fx+ pending-start n)))
+                    n)
+                  (let ([chunk (read-chunk count)])
+                    (cond
+                      [(eof-object? chunk) 0]
+                      [(fx= (bytevector-length chunk) 0) (loop)]
+                      [else
+                       (set! pending chunk)
+                       (set! pending-start 0)
+                       (loop)])))))))))
+
+(define aio-port-write-procedure
+  (lambda (write-chunk)
+    (lambda (source start count)
+      (if (fx= count 0)
+          0
+          (let* ([chunk
+                  (if (and (fx= start 0)
+                           (fx= count (bytevector-length source)))
+                      source
+                      (let ([copy (make-bytevector count)])
+                        (bytevector-copy! source start copy 0 count)
+                        copy))]
+                 [n (write-chunk chunk)])
+            (when (fx= n 0)
+              ($oops 'async-handle-port "write made no progress"))
+            n)))))
+
+(define aio-stream-port-read-procedure
+  (lambda (s)
+    (aio-port-read-procedure
+      (lambda (count)
+        (perform-operation (%stream-read-operation s))))))
+
+(define aio-stream-port-write-procedure
+  (lambda (s)
+    (aio-port-write-procedure
+      (lambda (bv)
+        (let ([n (bytevector-length bv)])
+          (perform-operation (%stream-write-operation s bv))
+          n)))))
+
+(define aio-file-port-read-procedure
+  (lambda (f)
+    (aio-port-read-procedure
+      (lambda (count)
+        (perform-operation (%file-read-operation f count))))))
+
+(define aio-file-port-write-procedure
+  (lambda (f)
+    (aio-port-write-procedure
+      (lambda (bv)
+        (perform-operation (%file-write-operation f bv))))))
+
+(define aio-file-port-position-procedures
+  (lambda (f)
+    (if (fx>= (async-file-offset f) 0)
+        (values
+          (lambda ()
+            (aio-check-file 'port-position f)
+            (async-file-offset f))
+          (lambda (position)
+            (aio-check-file 'set-port-position! f)
+            (async-file-offset-set! f position)))
+        (values #f #f))))
+
+(define aio-close-file-from-port
+  (lambda (f)
+    (aio-check-file 'close-port f)
+    (perform-operation
+      (aio-fs-request-operation 'close f (async-file-path f)
+        (lambda (st id)
+          (aio-fs-close-fd (aio-state-loop st) (async-file-fd f) id))
+        (lambda (status aux)
+          (if (fx= status 0)
+              (begin
+                (async-file-closed?-set! f #t)
+                (cons 'values '()))
+              (cons 'raise
+                (aio-io-condition 'close f (async-file-path f) status))))))))
+
+(define aio-file-port-id
+  (lambda (f)
+    (format "async file ~a" (async-file-path f))))
+
+(define aio-stream-port-id
+  (lambda (s)
+    (let ([path (aio-handle-path s)])
+      (if path
+          (format "async stream ~a" path)
+          "async stream"))))
 
 (define %file-stat-operation
   (lambda (target)
@@ -1262,7 +1404,7 @@
     (and (aio-handle? x) (eq? (aio-handle-kind x) 'pipe-stream))))
 (set-who! stream-close
   (lambda (s)
-    (aio-check-stream who s)
+    (aio-check-stream-unowned who s)
     (aio-close-handle s 'close)))
 (set! stream-closed?
   (lambda (s)
@@ -1270,15 +1412,44 @@
          (or (aio-handle-closing? s) (aio-handle-closed? s)))))
 (set-who! stream-read
   (lambda (s)
+    (aio-check-stream-unowned who s)
     (perform-operation (%stream-read-operation s))))
 (set-who! stream-write
   (lambda (s bv)
+    (aio-check-stream-unowned who s)
     (perform-operation (%stream-write-operation s bv))
     (void)))
 (set-who! stream-shutdown
   (lambda (s)
+    (aio-check-stream-unowned who s)
     (perform-operation (stream-shutdown-operation s))
     (void)))
+(set-who! async-stream->binary-input-port
+  (lambda (s)
+    (aio-claim-stream-for-port! who s)
+    (make-custom-binary-input-port (aio-stream-port-id s)
+      (aio-stream-port-read-procedure s)
+      #f #f
+      (lambda () (aio-close-handle s 'close)))))
+(set-who! async-stream->binary-output-port
+  (lambda (s)
+    (aio-claim-stream-for-port! who s)
+    (make-custom-binary-output-port (aio-stream-port-id s)
+      (aio-stream-port-write-procedure s)
+      #f #f
+      (lambda () (aio-close-handle s 'close)))))
+(set-who! async-stream->binary-input/output-port
+  (lambda (s)
+    (aio-claim-stream-for-port! who s)
+    (let ([p
+           (make-custom-binary-input/output-port (aio-stream-port-id s)
+             (aio-stream-port-read-procedure s)
+             (aio-stream-port-write-procedure s)
+             #f #f
+             (lambda () (aio-close-handle s 'close)))])
+      ;; A stream cannot seek backward over input prefetched by a duplex port.
+      ($reset-port-flags! p (constant port-flag-block-buffered))
+      p)))
 
 (set! dns-lookup
   (case-lambda
@@ -1292,13 +1463,15 @@
     [(path flags mode) (perform-operation (%file-open-operation path flags mode))]))
 (set-who! file-read
   (lambda (f len)
+    (aio-check-file-unowned who f)
     (perform-operation (%file-read-operation f len))))
 (set-who! file-write
   (lambda (f bv)
+    (aio-check-file-unowned who f)
     (perform-operation (%file-write-operation f bv))))
 (set-who! file-close
   (lambda (f)
-    (aio-check-file who f)
+    (aio-check-file-unowned who f)
     (perform-operation
       (aio-fs-request-operation 'close f (async-file-path f)
         (lambda (st id)
@@ -1311,8 +1484,38 @@
               (cons 'raise
                 (aio-io-condition 'close f (async-file-path f) status))))))
     (void)))
+(set-who! async-file->binary-input-port
+  (lambda (f)
+    (aio-claim-file-for-port! who f)
+    (let-values ([(get-position set-position!)
+                  (aio-file-port-position-procedures f)])
+      (make-custom-binary-input-port (aio-file-port-id f)
+        (aio-file-port-read-procedure f)
+        get-position set-position!
+        (lambda () (aio-close-file-from-port f))))))
+(set-who! async-file->binary-output-port
+  (lambda (f)
+    (aio-claim-file-for-port! who f)
+    (let-values ([(get-position set-position!)
+                  (aio-file-port-position-procedures f)])
+      (make-custom-binary-output-port (aio-file-port-id f)
+        (aio-file-port-write-procedure f)
+        get-position set-position!
+        (lambda () (aio-close-file-from-port f))))))
+(set-who! async-file->binary-input/output-port
+  (lambda (f)
+    (aio-claim-file-for-port! who f)
+    (let-values ([(get-position set-position!)
+                  (aio-file-port-position-procedures f)])
+      (make-custom-binary-input/output-port (aio-file-port-id f)
+        (aio-file-port-read-procedure f)
+        (aio-file-port-write-procedure f)
+        get-position set-position!
+        (lambda () (aio-close-file-from-port f))))))
 (set-who! file-stat
   (lambda (target)
+    (when (%async-file? target)
+      (aio-check-file-unowned who target))
     (perform-operation (%file-stat-operation target))))
 (set-who! file-delete
   (lambda (path)
@@ -1356,13 +1559,29 @@
 (set! tcp-connect-operation %tcp-connect-operation)
 (set! pipe-listen %pipe-listen)
 (set! pipe-connect-operation %pipe-connect-operation)
-(set! stream-read-operation %stream-read-operation)
-(set! stream-write-operation %stream-write-operation)
+(set-who! stream-read-operation
+  (lambda (s)
+    (aio-check-stream-unowned who s)
+    (%stream-read-operation s)))
+(set-who! stream-write-operation
+  (lambda (s bv)
+    (aio-check-stream-unowned who s)
+    (%stream-write-operation s bv)))
 (set! dns-lookup-operation %dns-lookup-operation)
 (set! file-open-operation %file-open-operation)
-(set! file-read-operation %file-read-operation)
-(set! file-write-operation %file-write-operation)
-(set! file-stat-operation %file-stat-operation)
+(set-who! file-read-operation
+  (lambda (f len)
+    (aio-check-file-unowned who f)
+    (%file-read-operation f len)))
+(set-who! file-write-operation
+  (lambda (f bv)
+    (aio-check-file-unowned who f)
+    (%file-write-operation f bv)))
+(set-who! file-stat-operation
+  (lambda (target)
+    (when (%async-file? target)
+      (aio-check-file-unowned who target))
+    (%file-stat-operation target)))
 
 ;;; the scheduler calls this when run-async exits
 (set! $async-io-shutdown aio-io-shutdown)
