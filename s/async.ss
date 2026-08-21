@@ -229,6 +229,7 @@
     (mutable schedulers)
     (mutable root-task)
     (mutable next-task-id)
+    (mutable next-wake-index)
     (mutable shutdown?)
     (mutable failure)
     (mutable workers)))
@@ -523,22 +524,26 @@
     (vector-for-each
       (lambda (sched)
         (let ([wake (async-scheduler-wake-proc sched)])
-          (when wake (wake))))
+          (when wake (wake)))
+        (if-feature pthreads
+          (with-mutex (async-scheduler-remote-mutex sched)
+            (condition-broadcast (async-scheduler-remote-cond sched)))
+          (void)))
       (async-scheduler-group-schedulers group))))
 
 (define async-group-submit!
   (lambda (task)
     (let ([group (async-task-scheduler-group task)])
-      (with-async-mutex (async-scheduler-group-mutex group)
-        (async-queue-push! (async-scheduler-group-ready-queue group) task)
-        (if-feature pthreads
-          (condition-broadcast (async-scheduler-group-condition group))
-          (void)))
-      (vector-for-each
-        (lambda (sched)
-          (let ([wake (async-scheduler-wake-proc sched)])
-            (when wake (wake))))
-        (async-scheduler-group-schedulers group)))))
+      (let ([target
+             (with-async-mutex (async-scheduler-group-mutex group)
+               (async-queue-push! (async-scheduler-group-ready-queue group) task)
+               (let* ([schedulers (async-scheduler-group-schedulers group)]
+                      [n (vector-length schedulers)]
+                      [i (async-scheduler-group-next-wake-index group)])
+                 (async-scheduler-group-next-wake-index-set! group
+                   (fxmod (fx+ i 1) n))
+                 (vector-ref schedulers i)))])
+        (async-wake-scheduler target)))))
 
 (define async-group-take-ready!
   (lambda (sched)
@@ -650,16 +655,12 @@
 
 (define async-wake-scheduler
   (lambda (sched)
-    (let ([group ($async-scheduler-group sched)])
-      (if (async-group-parallel? group)
-          (async-group-wake! group)
-          (begin
-            (let ([wake (async-scheduler-wake-proc sched)])
-              (when wake (wake)))
-            (if-feature pthreads
-              (with-mutex (async-scheduler-remote-mutex sched)
-                (condition-broadcast (async-scheduler-remote-cond sched)))
-              (void)))))))
+    (let ([wake (async-scheduler-wake-proc sched)])
+      (when wake (wake)))
+    (if-feature pthreads
+      (with-mutex (async-scheduler-remote-mutex sched)
+        (condition-signal (async-scheduler-remote-cond sched)))
+      (void))))
 
 ;;; The single claim point for completing a suspended task.  Returns #t when
 ;;; the claim succeeded.
@@ -1120,22 +1121,24 @@
       [(async-group-parallel? ($async-scheduler-group sched))
        (let ([group ($async-scheduler-group sched)]
              [ts (async-scheduler-timers sched)])
-         (with-mutex (async-scheduler-group-mutex group)
-           (when (and (async-queue-empty? (async-scheduler-group-ready-queue group))
-                      (with-mutex (async-scheduler-remote-mutex sched)
-                        (async-queue-empty? (async-scheduler-remote-queue sched)))
-                      (not (async-scheduler-group-shutdown? group)))
+         (with-mutex (async-scheduler-remote-mutex sched)
+           (when (and (async-queue-empty? (async-scheduler-remote-queue sched))
+                      (with-mutex (async-scheduler-group-mutex group)
+                        (and
+                          (async-queue-empty?
+                            (async-scheduler-group-ready-queue group))
+                          (not (async-scheduler-group-shutdown? group)))))
              (if (null? ts)
-                 (condition-wait (async-scheduler-group-condition group)
-                                 (async-scheduler-group-mutex group))
+                 (condition-wait (async-scheduler-remote-cond sched)
+                                 (async-scheduler-remote-mutex sched))
                  (let* ([deadline (async-timer-deadline (car ts))]
                         [delta (max 0 (- deadline (async-monotonic-us)))]
                         [timeout (add-duration (current-time)
                                    (make-time 'time-duration
                                      (* (remainder delta 1000000) 1000)
                                      (quotient delta 1000000)))])
-                   (condition-wait (async-scheduler-group-condition group)
-                                   (async-scheduler-group-mutex group)
+                   (condition-wait (async-scheduler-remote-cond sched)
+                                   (async-scheduler-remote-mutex sched)
                                    timeout))))))]
       [else
        (if-feature pthreads
@@ -1929,7 +1932,7 @@
                       (control:make-continuation-prompt-tag 'async-scheduler-group)
                       (make-async-mutex)
                       (if-feature pthreads (make-condition) #f)
-                      (make-async-queue) '#() #f 0 #f #f '())]
+                      (make-async-queue) '#() #f 0 0 #f #f '())]
              [schedulers (make-vector parallelism)])
         (do ([i 0 (fx+ i 1)]) ((fx= i parallelism))
           (vector-set! schedulers i
