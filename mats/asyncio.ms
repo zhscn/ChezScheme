@@ -304,6 +304,29 @@
         (and (for-all car results)
              (exists cadr results))))
 
+  ;; A request canceled from another scheduler is withdrawn by its loop owner.
+  (or (not (threaded?))
+      (run-async
+        (lambda ()
+          (let* ([root-scheduler (current-async-scheduler)]
+                 [started (make-future)]
+                 [task
+                  (spawn-task
+                    (lambda ()
+                      (let wait-for-worker ()
+                        (if (eq? root-scheduler (current-async-scheduler))
+                            (begin (task-yield) (wait-for-worker))
+                            (begin
+                              (future-fulfil! started)
+                              (dns-lookup "localhost" "80")))))
+                    'migratable? #t)])
+            (future-get started)
+            (task-cancel! task)
+            (guard (c [(async-cancellation-condition? c) #t])
+              (task-join task)
+              #f)))
+        'parallelism 2))
+
   ;; A handle can only be operated by the scheduler that owns its libuv loop.
   (or (not (threaded?))
       (let ([path (asyncio-temp-path "foreign-owner")])

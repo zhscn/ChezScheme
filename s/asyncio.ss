@@ -186,6 +186,8 @@
     (immutable requests-mutex)
     (immutable handles)           ; id -> weak-cons wrapper #t
     (mutable completions)         ; list of (id kind status aux)
+    (mutable commands)            ; owner-thread thunks, newest first
+    (immutable command-mutex)     ; also guards closing and wakeup lifetime
     (mutable stop-set)            ; streams that may need uv_read_stop
     (immutable stop-mutex)
     (mutable closing?)
@@ -352,6 +354,32 @@
     (with-mutex (aio-state-requests-mutex st)
       (hashtable-set! (aio-state-requests st) id req))))
 
+;;; Native libuv objects are touched only by their loop owner.  Foreign
+;;; threads enqueue identities or Scheme data and use uv_async_send solely as
+;;; the wakeup mechanism.
+(define aio-submit-command!
+  (lambda (st command)
+    (let ([accepted?
+           (with-mutex (aio-state-command-mutex st)
+             (if (aio-state-closing? st)
+                 #f
+                 (begin
+                   (aio-state-commands-set! st
+                     (cons command (aio-state-commands st)))
+                   #t)))])
+      (when accepted?
+        (aio-wakeup-send (aio-state-loop st)))
+      accepted?)))
+
+(define aio-drain-commands!
+  (lambda (st)
+    (let ([commands
+           (with-mutex (aio-state-command-mutex st)
+             (let ([commands (reverse (aio-state-commands st))])
+               (aio-state-commands-set! st '())
+               commands))])
+      (for-each (lambda (command) (command)) commands))))
+
 ;;; finish proc for requests whose native context is a uv_fs_t wrapper
 (define aio-fs-finish
   (lambda (gen canceled-gen)
@@ -386,18 +414,26 @@
 ;;; uv_cancel is used only for the request types that support it
 (define aio-cancel-request!
   (lambda (st id)
-    (let ([req
+    (let ([found?
            (with-mutex (aio-state-requests-mutex st)
              (let ([req (hashtable-ref (aio-state-requests st) id #f)])
                (when req (aio-req-canceled?-set! req #t))
-               req))])
-      (when req
-        (let ([cd (aio-req-cancel-data req)])
-          (when cd
-            (case (aio-req-kind req)
-              [(fs) (aio-fs-cancel cd)]
-              [(dns) (aio-dns-cancel cd)]
-              [else (void)])))))))
+               (and req #t)))])
+      (when found?
+        (aio-submit-command! st
+          (lambda ()
+            ;; Completion and this command are both dispatched by the loop
+            ;; owner, so cancel-data cannot be freed between lookup and use.
+            (let ([req
+                   (with-mutex (aio-state-requests-mutex st)
+                     (hashtable-ref (aio-state-requests st) id #f))])
+              (when req
+                (let ([cd (aio-req-cancel-data req)])
+                  (when cd
+                    (case (aio-req-kind req)
+                      [(fs) (aio-fs-cancel cd)]
+                      [(dns) (aio-dns-cancel cd)]
+                      [else (void)])))))))))))
 
 ;;; ------------------------------------------------------------- dispatch
 
@@ -590,6 +626,7 @@
     (let ([st ($async-scheduler-io-state sched)])
       (when (and st (not (aio-state-closing? st)))
         (aio-drain-guardian! st)
+        (aio-drain-commands! st)
         (aio-drain-stop-set! st)
         (when block? (aio-arm-bridge st sched))
         (aio-loop-run (aio-state-loop st) (if block? 1 0))
@@ -607,7 +644,9 @@
   (lambda (sched)
     (let ([st ($async-scheduler-io-state sched)])
       (when (and st (not (aio-state-closing? st)))
-        (aio-state-closing?-set! st #t)
+        (with-mutex (aio-state-command-mutex st)
+          (aio-state-closing?-set! st #t))
+        (aio-drain-commands! st)
         (let-values ([(ks vs) (hashtable-entries (aio-state-handles st))])
           (vector-for-each
             (lambda (p)
@@ -682,7 +721,8 @@
                   ($oops who "cannot initialize the libuv timer handle"))
                 (let ([st (make-aio-state loop wakeup bridge
                         1 (make-eq-hashtable) (make-mutex)
-                        (make-eq-hashtable) '() '() (make-mutex) #f
+                        (make-eq-hashtable) '() '() (make-mutex)
+                        '() (make-mutex) #f
                         (make-guardian))])
                   (with-mutex aio-loop-registry-mutex
                     (hashtable-set! aio-loop-registry loop st))
@@ -691,8 +731,9 @@
                   ($async-scheduler-poll-proc-set! sched aio-poll)
                   ($async-scheduler-wake-proc-set! sched
                     (lambda ()
-                      (unless (aio-state-closing? st)
-                        (aio-wakeup-send loop))))
+                      (with-mutex (aio-state-command-mutex st)
+                        (unless (aio-state-closing? st)
+                          (aio-wakeup-send loop)))))
                   st))))))))
 
 ;;; ------------------------------------------------------------ handles
