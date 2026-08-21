@@ -104,17 +104,83 @@
 
 ;;; -------------------------------------------------------- sync states
 ;;;
-;;; A sync state is a box holding one of:
+;;; A sync state owns an atomic state box holding one of:
 ;;;   'waiting                 no claim yet
 ;;;   'claimed                 transient: a completer owns it
 ;;;   (done . payload)         final; payload = (values . vals) | (raise . c)
 ;;;
 ;;; Completion, cancellation, and failure compete with box-cas!.
 
-(define make-async-sync-state (lambda () (box 'waiting)))
+(define-record-type (async-sync-state make-async-sync-state% async-sync-state?)
+  (nongenerative async-sync-state-layer6)
+  (sealed #t)
+  (fields
+    (immutable state)               ; atomic box: waiting | claimed | (done . payload)
+    (immutable mutex)               ; protects registration metadata and slots
+    (mutable registration-phase)    ; new | registering | registered
+    (mutable cancel-pending?)
+    (mutable nack)
+    (immutable slots)))             ; operation token -> per-perform state
+
+(define make-async-sync-state
+  (lambda ()
+    (make-async-sync-state% (box 'waiting) (make-async-mutex)
+      'new #f #f (make-eq-hashtable))))
 
 (define async-sync-state-live?
-  (lambda (ss) (eq? (unbox ss) 'waiting)))
+  (lambda (ss) (eq? (unbox (async-sync-state-state ss)) 'waiting)))
+
+(define async-sync-state-claim!
+  (lambda (ss)
+    (box-cas! (async-sync-state-state ss) 'waiting 'claimed)))
+
+(define async-sync-state-complete!
+  (lambda (ss payload)
+    (set-box! (async-sync-state-state ss) (cons 'done payload))))
+
+;;; Registration is a handshake with cancellation.  A cancellation arriving
+;;; before or during block publication is deferred until block has returned,
+;;; so a waiter cannot be published after its nack has already run.
+(define async-sync-begin-registration!
+  (lambda (ss nack)
+    (with-async-mutex (async-sync-state-mutex ss)
+      (async-sync-state-nack-set! ss nack)
+      (async-sync-state-registration-phase-set! ss 'registering))))
+
+(define async-sync-end-registration!
+  (lambda (ss)
+    (with-async-mutex (async-sync-state-mutex ss)
+      (async-sync-state-registration-phase-set! ss 'registered)
+      (async-sync-state-cancel-pending? ss))))
+
+(define async-sync-request-cancel!
+  (lambda (ss)
+    (with-async-mutex (async-sync-state-mutex ss)
+      (case (async-sync-state-registration-phase ss)
+        [(new registering)
+         (async-sync-state-cancel-pending?-set! ss #t)
+         (values #f #f)]
+        [else
+         (if (async-sync-state-claim! ss)
+             (values #t (async-sync-state-nack ss))
+             (values #f #f))]))))
+
+;;; Per-operation slots make an immutable operation safe to perform more than
+;;; once concurrently.  The synchronization state identifies one perform.
+(define async-sync-slot-set!
+  (lambda (ss token value)
+    (with-async-mutex (async-sync-state-mutex ss)
+      (hashtable-set! (async-sync-state-slots ss) token value))))
+
+(define async-sync-slot-ref
+  (lambda (ss token default)
+    (with-async-mutex (async-sync-state-mutex ss)
+      (hashtable-ref (async-sync-state-slots ss) token default))))
+
+(define async-sync-slot-delete!
+  (lambda (ss token)
+    (with-async-mutex (async-sync-state-mutex ss)
+      (hashtable-delete! (async-sync-state-slots ss) token))))
 
 ;;; ------------------------------------------------------------ records
 
@@ -600,9 +666,9 @@
 (define $async-make-deliver
   (lambda (ss task)
     (lambda (payload)
-      (if (box-cas! ss 'waiting 'claimed)
+      (if (async-sync-state-claim! ss)
           (begin
-            (set-box! ss (cons 'done payload))
+            (async-sync-state-complete! ss payload)
             ($async-deliver-task task payload)
             #t)
           #f))))
@@ -611,12 +677,13 @@
 (define $async-cancel-waiting-task
   (lambda (task)
     (let ([ss (async-task-sync-state task)])
-      (when (and ss (box-cas! ss 'waiting 'claimed))
-        (let ([nack (async-task-nack-thunk task)])
-          (when nack (nack)))
-        (let ([payload (cons 'raise (task-cancellation-condition task))])
-          (set-box! ss (cons 'done payload))
-          ($async-deliver-task task payload))))))
+      (when ss
+        (let-values ([(claimed? nack) (async-sync-request-cancel! ss)])
+          (when claimed?
+            (when nack (nack))
+            (let ([payload (cons 'raise (task-cancellation-condition task))])
+              (async-sync-state-complete! ss payload)
+              ($async-deliver-task task payload))))))))
 
 ;;; ------------------------------------------------------------- task groups
 
@@ -789,7 +856,7 @@
 
 
 (define async-waiter-dead?
-  (lambda (ss) (not (eq? (unbox ss) 'waiting))))
+  (lambda (ss) (not (async-sync-state-live? ss))))
 
 (define async-channel-prune!
   (lambda (ch)
@@ -1438,13 +1505,19 @@
         (unless (operation? op) ($oops who "~s is not an operation" op)))
       ops)
     (let ([ops (list->vector ops)] [start (box 0)])
+      (define next-start!
+        (lambda (n)
+          (let loop ()
+            (let ([s (unbox start)])
+              (if (box-cas! start s (fxmod (fx+ s 1) n))
+                  s
+                  (loop))))))
       (make-async-operation
         (lambda (ss)
           (let ([n (vector-length ops)])
             (if (fx= n 0)
                 #f
-                (let ([s (unbox start)])
-                  (set-box! start (fxmod (fx+ s 1) n))
+                (let ([s (next-start! n)])
                   (let loop ([i 0])
                     (if (fx= i n)
                         #f
@@ -1516,16 +1589,20 @@
                 (async-deliver-operation-payload op
                   ($async-suspend sched task ss
                     (lambda (ss*)
-                      (async-task-nack-thunk-set! task
-                        (lambda () ((operation-nack op) ss)))
-                      ((operation-block op) ss
-                        ($async-make-deliver ss task))))))))))))
+                      (let ([nack (lambda () ((operation-nack op) ss))])
+                        (async-task-nack-thunk-set! task nack)
+                        (async-sync-begin-registration! ss nack)
+                        (let ([desc ((operation-block op) ss
+                                      ($async-make-deliver ss task))])
+                          (when (async-sync-end-registration! ss)
+                            ($async-cancel-waiting-task task))
+                          desc))))))))))))
 
 (set-who! sleep-operation
   (lambda (seconds)
     (unless (async-valid-seconds? seconds)
       ($oops who "~s is not a nonnegative real number" seconds))
-    (let ([timer-box (box #f)])
+    (let ([token (list 'sleep-operation)])
       (make-async-operation
         (lambda (ss)
           (and (<= seconds 0) (cons 'values '())))
@@ -1533,12 +1610,13 @@
           (let* ([sched ($async-scheduler)]
                  [deadline (+ (sched-now sched) (async-seconds->us seconds))]
                  [timer (async-schedule-timer! sched deadline deliver)])
-            (set-box! timer-box timer)
+            (async-sync-slot-set! ss token timer)
             (list 'sleep deadline)))
         (lambda (vals) vals)
         (lambda (ss)
-          (let ([timer (unbox timer-box)])
+          (let ([timer (async-sync-slot-ref ss token #f)])
             (when timer
+              (async-sync-slot-delete! ss token)
               (let* ([deliver-box (async-timer-deliver-box timer)]
                      [deliver (unbox deliver-box)])
                 (when deliver (box-cas! deliver-box deliver #f))))))))))
@@ -1945,6 +2023,10 @@
 ;;; layer's real shutdown procedure when that file is loaded.
 (set! $async-new-thread-parameter async-new-thread-parameter)
 (set! $async-pin-current-task! async-pin-current-task!)
+(set! $async-sync-state-live? async-sync-state-live?)
+(set! $async-sync-slot-set! async-sync-slot-set!)
+(set! $async-sync-slot-ref async-sync-slot-ref)
+(set! $async-sync-slot-delete! async-sync-slot-delete!)
 
 (set! $async-io-shutdown (lambda (sched) (void)))
 

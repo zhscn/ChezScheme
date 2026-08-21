@@ -272,7 +272,7 @@
       id)))
 
 (define aio-waiter-dead?
-  (lambda (ss) (not (eq? (unbox ss) 'waiting))))
+  (lambda (ss) (not ($async-sync-state-live? ss))))
 
 (define aio-io-condition
   (lambda (operation handle path code)
@@ -841,7 +841,7 @@
     (aio-check-stream 'stream-write-operation s)
     (unless (bytevector? bv)
       ($oops 'stream-write-operation "~s is not a bytevector" bv))
-    (let ([st-box (box #f)] [id-box (box #f)]
+    (let ([token (list 'stream-write-operation)]
           [allow-owned? (and (pair? allow-owned-option)
                              (car allow-owned-option))])
       (make-operation
@@ -859,8 +859,7 @@
                      [id (aio-next-id st)]
                      [len (bytevector-length bv)]
                      [r (aio-write (aio-handle-handle s) bv len id)])
-                (set-box! st-box st)
-                (set-box! id-box id)
+                ($async-sync-slot-set! ss token (cons st id))
                 (if (< r 0)
                     (begin
                       (deliver
@@ -879,12 +878,12 @@
                           #f))
                       (list 'write id))))))
         (lambda (vals) vals)
-        (aio-request-nack st-box id-box)))))
+        (aio-request-nack token)))))
 
 (define stream-shutdown-operation
   (lambda (s)
     (aio-check-stream 'stream-shutdown s)
-    (let ([st-box (box #f)] [id-box (box #f)])
+    (let ([token (list 'stream-shutdown-operation)])
       (make-operation
         (lambda (ss)
           (aio-check-stream-access! 'stream-shutdown s #f)
@@ -899,8 +898,7 @@
               (let* ([st (aio-handle-state s)]
                      [id (aio-next-id st)]
                      [r (aio-shutdown (aio-handle-handle s) id)])
-                (set-box! st-box st)
-                (set-box! id-box id)
+                ($async-sync-slot-set! ss token (cons st id))
                 (if (< r 0)
                     (begin
                       (deliver
@@ -919,14 +917,16 @@
                           #f))
                       (list 'shutdown id))))))
         (lambda (vals) vals)
-        (aio-request-nack st-box id-box)))))
+        (aio-request-nack token)))))
 
-;;; nack needs the request id, which the block phase allocates; box it
+;;; The request identity belongs to one perform, not to the reusable operation.
 (define aio-request-nack
-  (lambda (st-box id-box)
+  (lambda (token)
     (lambda (ss)
-      (let ([st (unbox st-box)] [id (unbox id-box)])
-        (when (and st id) (aio-cancel-request! st id))))))
+      (let ([attempt ($async-sync-slot-ref ss token #f)])
+        (when attempt
+          ($async-sync-slot-delete! ss token)
+          (aio-cancel-request! (car attempt) (cdr attempt)))))))
 
 ;;; ------------------------------------------------------------- tcp
 
@@ -1012,15 +1012,14 @@
 (define %tcp-connect-operation
   (lambda (host port)
     (aio-check-host-port 'tcp-connect-operation host port)
-    (let ([st-box (box #f)] [id-box (box #f)])
+    (let ([token (list 'tcp-connect-operation)])
       (make-operation
         (lambda (ss) #f)
         (lambda (ss deliver)
           (let* ([st (aio-ensure-state! 'tcp-connect-operation)]
                  [id (aio-next-id st)]
                  [h (aio-tcp-init (aio-state-loop st) id)])
-            (set-box! st-box st)
-            (set-box! id-box id)
+            ($async-sync-slot-set! ss token (cons st id))
             (if (= h 0)
                 (begin
                   (deliver
@@ -1060,7 +1059,7 @@
         (lambda (vals) vals)
         ;; a connect cannot be canceled in libuv; the completion closes the
         ;; handle and is dropped because the request is marked canceled
-        (aio-request-nack st-box id-box)))))
+        (aio-request-nack token)))))
 
 ;;; ------------------------------------------------------ local-domain
 
@@ -1093,15 +1092,14 @@
   (lambda (path)
     (unless (string? path)
       ($oops 'pipe-connect-operation "~s is not a string" path))
-    (let ([st-box (box #f)] [id-box (box #f)])
+    (let ([token (list 'pipe-connect-operation)])
       (make-operation
         (lambda (ss) #f)
         (lambda (ss deliver)
           (let* ([st (aio-ensure-state! 'pipe-connect-operation)]
                  [id (aio-next-id st)]
                  [h (aio-pipe-init (aio-state-loop st) id)])
-            (set-box! st-box st)
-            (set-box! id-box id)
+            ($async-sync-slot-set! ss token (cons st id))
             (if (= h 0)
                 (begin
                   (deliver
@@ -1128,7 +1126,7 @@
                   (aio-pipe-connect h path id)
                   (list 'connect id)))))
         (lambda (vals) vals)
-        (aio-request-nack st-box id-box)))))
+        (aio-request-nack token)))))
 
 ;;; ---------------------------------------------------------------- dns
 
@@ -1140,7 +1138,7 @@
        ($oops 'dns-lookup-operation "~s is not a string" node))
      (unless (or (not service) (string? service))
        ($oops 'dns-lookup-operation "~s is not a string or #f" service))
-     (let ([st-box (box #f)] [id-box (box #f)])
+     (let ([token (list 'dns-lookup-operation)])
        (make-operation
          (lambda (ss) #f)
          (lambda (ss deliver)
@@ -1148,8 +1146,7 @@
                   [id (aio-next-id st)]
                   [r (aio-dns-lookup (aio-state-loop st) node
                        (or service "") id)])
-             (set-box! st-box st)
-             (set-box! id-box id)
+             ($async-sync-slot-set! ss token (cons st id))
              (if (< r 0)
                  (begin
                    (deliver
@@ -1178,7 +1175,7 @@
                        #f))
                    (list 'dns id)))))
          (lambda (vals) vals)
-         (aio-request-nack st-box id-box)))]))
+         (aio-request-nack token)))]))
 
 ;;; ---------------------------------------------------------------- files
 
@@ -1201,47 +1198,49 @@
   (case-lambda
     [(who handle path start gen)
      (aio-fs-request-operation who handle path start gen
-       (lambda (status aux) (void)) #f)]
+       (lambda (ss status aux) (void)) #f)]
     [(who handle path start gen canceled-gen)
      (aio-fs-request-operation who handle path start gen canceled-gen #f)]
     [(who handle path start gen canceled-gen serial-file)
-     ;; start: st id -> ctx pointer or negative error
-     ;; gen: status aux -> payload
-     (let ([st-box (box #f)] [id-box (box #f)]
-           [started? (box #f)] [entry-box (box #f)])
-       (define release!
-         (lambda ()
-           (when serial-file
-             (let ([next
-                    (with-mutex (async-file-mutex serial-file)
-                      (let ([q (async-file-queue serial-file)])
-                        (if (null? q)
-                            (begin
-                              (async-file-busy?-set! serial-file #f)
-                              #f)
-                            (let ([entry (car q)])
-                              (async-file-queue-set! serial-file (cdr q))
-                              (set-box! (cadr entry) #t)
-                              (caddr entry)))))])
-               (when next (next))))))
-       (define finish-normal
-         (lambda (status aux)
-           (dynamic-wind
-             (lambda () (void))
-             (lambda () (gen status aux))
-             release!)))
-       (define finish-canceled
-         (lambda (status aux)
-           (dynamic-wind
-             (lambda () (void))
-             (lambda () (canceled-gen status aux))
-             release!)))
+     ;; Callbacks receive ss so all mutable state belongs to this perform.
+     (let ([token (list 'fs-request-operation)])
        (make-operation
          (lambda (ss) #f)
          (lambda (ss deliver)
            (when serial-file
              (aio-check-file-owner! who serial-file))
-           (letrec ([submit
+           (let ([st-box (box #f)] [id-box (box #f)]
+                 [started? (box #f)] [entry-box (box #f)])
+             ($async-sync-slot-set! ss token
+               (vector st-box id-box started? entry-box))
+             (letrec ([release!
+                       (lambda ()
+                         (when serial-file
+                           (let ([next
+                                  (with-mutex (async-file-mutex serial-file)
+                                    (let ([q (async-file-queue serial-file)])
+                                      (if (null? q)
+                                          (begin
+                                            (async-file-busy?-set! serial-file #f)
+                                            #f)
+                                          (let ([entry (car q)])
+                                            (async-file-queue-set! serial-file (cdr q))
+                                            (set-box! (cadr entry) #t)
+                                            (caddr entry)))))])
+                             (when next (next)))))]
+                      [finish-normal
+                       (lambda (status aux)
+                         (dynamic-wind
+                           (lambda () (void))
+                           (lambda () (gen ss status aux))
+                           release!))]
+                      [finish-canceled
+                       (lambda (status aux)
+                         (dynamic-wind
+                           (lambda () (void))
+                           (lambda () (canceled-gen ss status aux))
+                           release!))]
+                      [submit
                      (lambda ()
                        (define submit-native
                          (lambda ()
@@ -1252,7 +1251,7 @@
                                ($oops who
                                  "async file belongs to another scheduler"))
                              (let* ([id (aio-next-id st)]
-                                    [r (start st id)])
+                                    [r (start ss st id)])
                                (set-box! st-box st)
                                (set-box! id-box id)
                                (if (< r 0)
@@ -1302,19 +1301,26 @@
                            (set! start-now? #t))))
                    (when start-now? (submit))
                    (list 'file who))
-                 (submit))))
+                 (submit)))))
          (lambda (vals) vals)
          (lambda (ss)
-           (let ([nack-started? (not serial-file)])
-             (when serial-file
-               (with-mutex (async-file-mutex serial-file)
-                 (if (unbox started?)
-                     (set! nack-started? #t)
-                     (async-file-queue-set! serial-file
-                       (remq (unbox entry-box)
-                         (async-file-queue serial-file))))))
-             (when nack-started?
-               ((aio-request-nack st-box id-box) ss))))))]))
+           (let ([attempt ($async-sync-slot-ref ss token #f)])
+             (when attempt
+               (let ([st-box (vector-ref attempt 0)]
+                     [id-box (vector-ref attempt 1)]
+                     [started? (vector-ref attempt 2)]
+                     [entry-box (vector-ref attempt 3)]
+                     [nack-started? (not serial-file)])
+                 (when serial-file
+                   (with-mutex (async-file-mutex serial-file)
+                     (if (unbox started?)
+                         (set! nack-started? #t)
+                         (async-file-queue-set! serial-file
+                           (remq (unbox entry-box)
+                             (async-file-queue serial-file))))))
+                 (when nack-started?
+                   (let ([st (unbox st-box)] [id (unbox id-box)])
+                     (when (and st id) (aio-cancel-request! st id))))))))))]))
 
 (define %file-open-operation
   (case-lambda
@@ -1327,41 +1333,47 @@
      (unless (and (fixnum? mode) (fx>= mode 0) (fx<= mode #o7777))
        ($oops 'file-open-operation "~s is not a valid file mode" mode))
      (let ([bits (aio-open-flag-bits flags)]
-           [st-box (box #f)]
-           [owner-box (box #f)]
-           [release-box (box #f)])
+           [token (list 'file-open-operation)])
        (define release-open-affinity!
-         (lambda ()
-           (let ([release (unbox release-box)])
-             (when release
-               (set-box! release-box #f)
-               (release)))))
+         (lambda (ss)
+           (let ([attempt ($async-sync-slot-ref ss token #f)])
+             (when attempt
+               (let* ([release-box (vector-ref attempt 2)]
+                      [release (unbox release-box)])
+                 (when release
+                   (set-box! release-box #f)
+                   (release)))))))
        (aio-fs-request-operation 'open #f path
-         (lambda (st id)
-           (set-box! st-box st)
-           (set-box! owner-box (current-async-task))
-           (set-box! release-box ($async-pin-current-task!))
+         (lambda (ss st id)
+           (let ([attempt
+                  (vector st (current-async-task)
+                    (box ($async-pin-current-task!)))])
+             ($async-sync-slot-set! ss token attempt))
            (let ([r (aio-fs-open (aio-state-loop st) path bits mode id)])
-             (when (< r 0) (release-open-affinity!))
+             (when (< r 0) (release-open-affinity! ss))
              r))
-         (lambda (status aux)
+         (lambda (ss status aux)
            (if (>= status 0)
-               (let ([release (unbox release-box)])
+               (let* ([attempt ($async-sync-slot-ref ss token #f)]
+                      [st (vector-ref attempt 0)]
+                      [owner (vector-ref attempt 1)]
+                      [release-box (vector-ref attempt 2)]
+                      [release (unbox release-box)])
                  (set-box! release-box #f)
                  (cons 'values
-                   (list (make-async-file% status path (unbox st-box) #f
+                   (list (make-async-file% status path st #f
                            (if (fxlogtest bits 16) -1 0) ; append: track end lazily
                            #f (make-mutex) #f '()
                            (if release
-                               (list (cons (unbox owner-box) release))
+                               (list (cons owner release))
                                '())))))
                (begin
-                 (release-open-affinity!)
+                 (release-open-affinity! ss)
                  (cons 'raise (aio-io-condition 'open #f path status)))))
-         (lambda (status aux)
+         (lambda (ss status aux)
            (when (>= status 0)
              (aio-fs-close-now status))
-           (release-open-affinity!))))]))
+           (release-open-affinity! ss))))]))
 
 (define aio-check-file
   (lambda (who f)
@@ -1410,13 +1422,13 @@
     (let ([allow-owned? (and (pair? allow-owned-option)
                              (car allow-owned-option))])
       (aio-fs-request-operation 'read f (async-file-path f)
-      (lambda (st id)
+      (lambda (ss st id)
         (if allow-owned?
             (aio-check-file 'file-read-operation f)
             (aio-check-file-unowned 'file-read-operation f))
         (aio-fs-read (aio-state-loop st) (async-file-fd f) len
           (aio-file-offset! f 0) id))
-      (lambda (status aux)
+      (lambda (ss status aux)
         (cond
           [(fx> status 0)
            (aio-file-offset! f status)
@@ -1427,7 +1439,7 @@
           [else
            (cons 'raise
              (aio-io-condition 'read f (async-file-path f) status))]))
-      (lambda (status aux)
+      (lambda (ss status aux)
         (when (fx>= status 0) (aio-file-offset! f status)))
       f))))
 
@@ -1439,29 +1451,29 @@
     (let ([allow-owned? (and (pair? allow-owned-option)
                              (car allow-owned-option))])
       (aio-fs-request-operation 'write f (async-file-path f)
-      (lambda (st id)
+      (lambda (ss st id)
         (if allow-owned?
             (aio-check-file 'file-write-operation f)
             (aio-check-file-unowned 'file-write-operation f))
         (aio-fs-write (aio-state-loop st) (async-file-fd f) bv
           (bytevector-length bv) (aio-file-offset! f 0) id))
-      (lambda (status aux)
+      (lambda (ss status aux)
         (if (>= status 0)
             (begin
               (aio-file-offset! f status)
               (cons 'values (list status)))
             (cons 'raise
               (aio-io-condition 'write f (async-file-path f) status))))
-      (lambda (status aux)
+      (lambda (ss status aux)
         (when (fx>= status 0) (aio-file-offset! f status)))
       f))))
 
 (define %file-close-operation
   (lambda (f)
     (aio-fs-request-operation 'close f (async-file-path f)
-      (lambda (st id)
+      (lambda (ss st id)
         (aio-fs-close-fd (aio-state-loop st) (async-file-fd f) id))
-      (lambda (status aux)
+      (lambda (ss status aux)
         (if (fx= status 0)
             (begin
               (async-file-closed?-set! f #t)
@@ -1469,7 +1481,7 @@
               (cons 'values '()))
             (cons 'raise
               (aio-io-condition 'close f (async-file-path f) status))))
-      (lambda (status aux)
+      (lambda (ss status aux)
         (when (fx= status 0)
           (async-file-closed?-set! f #t)
           (aio-release-file-affinities! f)))
@@ -1598,19 +1610,19 @@
     (cond
       [(string? target)
        (aio-fs-request-operation 'stat #f target
-         (lambda (st id) (aio-fs-stat (aio-state-loop st) target id))
-         (lambda (status aux)
+         (lambda (ss st id) (aio-fs-stat (aio-state-loop st) target id))
+         (lambda (ss status aux)
            (if (fx= status 0)
                (cons 'values (list (aio-stat-alist aux)))
                (cons 'raise (aio-io-condition 'stat #f target status)))))]
       [(%async-file? target)
        (aio-check-file 'file-stat-operation target)
        (aio-fs-request-operation 'stat target (async-file-path target)
-         (lambda (st id)
+         (lambda (ss st id)
            (aio-check-file-owner! 'file-stat-operation target)
            (aio-check-file-unowned 'file-stat-operation target)
            (aio-fs-fstat (aio-state-loop st) (async-file-fd target) id))
-         (lambda (status aux)
+         (lambda (ss status aux)
            (if (fx= status 0)
                (cons 'values (list (aio-stat-alist aux)))
                (cons 'raise
@@ -1787,8 +1799,8 @@
     (unless (string? path) ($oops who "~s is not a string" path))
     (perform-operation
       (aio-fs-request-operation 'delete #f path
-        (lambda (st id) (aio-fs-unlink (aio-state-loop st) path id))
-        (lambda (status aux)
+        (lambda (ss st id) (aio-fs-unlink (aio-state-loop st) path id))
+        (lambda (ss status aux)
           (if (fx= status 0)
               (cons 'values '())
               (cons 'raise (aio-io-condition 'delete #f path status))))))
@@ -1799,8 +1811,8 @@
     (unless (string? new) ($oops who "~s is not a string" new))
     (perform-operation
       (aio-fs-request-operation 'rename #f old
-        (lambda (st id) (aio-fs-rename (aio-state-loop st) old new id))
-        (lambda (status aux)
+        (lambda (ss st id) (aio-fs-rename (aio-state-loop st) old new id))
+        (lambda (ss status aux)
           (if (fx= status 0)
               (cons 'values '())
               (cons 'raise (aio-io-condition 'rename #f old status))))))
@@ -1812,8 +1824,8 @@
      (unless (string? path) ($oops who "~s is not a string" path))
      (perform-operation
        (aio-fs-request-operation 'mkdir #f path
-         (lambda (st id) (aio-fs-mkdir (aio-state-loop st) path mode id))
-         (lambda (status aux)
+         (lambda (ss st id) (aio-fs-mkdir (aio-state-loop st) path mode id))
+         (lambda (ss status aux)
            (if (fx= status 0)
                (cons 'values '())
                (cons 'raise (aio-io-condition 'mkdir #f path status))))))

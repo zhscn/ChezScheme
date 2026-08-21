@@ -296,6 +296,22 @@
                     (list first second (task-join task) runs))))))
     '(#t #f first 1))
 
+  ;; one operation can be performed concurrently without sharing its
+  ;; cancellation registration between attempts
+  (equal?
+    (run-async
+      (lambda ()
+        (let* ([op (sleep-operation 1)]
+               [t1 (spawn-task (lambda () (perform-operation op) 'first))]
+               [t2 (spawn-task (lambda () (perform-operation op) 'second))])
+          (task-yield)
+          (task-cancel! t1)
+          (guard (c [(async-cancellation-condition? c) (void)])
+            (task-join t1))
+          (task-join t2)))
+      'clock 'virtual)
+    'second)
+
   ;; a choice nacks every registered loser, but not the winner
   (equal? (run-async
             (lambda ()
