@@ -191,6 +191,11 @@
   (sealed #t)
   (fields (immutable try) (immutable block) (immutable wrap) (immutable nack)))
 
+(define-record-type (async-choice-result make-async-choice-result async-choice-result?)
+  (nongenerative)
+  (sealed #t)
+  (fields (immutable operation) (immutable values)))
+
 (define-record-type (async-future make-async-future% $async-future?)
   (nongenerative)
   (sealed #t)
@@ -367,13 +372,10 @@
 ;;; The single claim point for completing a suspended task.  Returns #t when
 ;;; the claim succeeded.
 (define $async-make-deliver
-  (lambda (ss task wrap)
+  (lambda (ss task)
     (lambda (payload)
       (if (box-cas! ss 'waiting 'claimed)
-          (let ([payload
-                 (if (eq? (car payload) 'values)
-                     (cons 'values (wrap (cdr payload)))
-                     payload)])
+          (begin
             (set-box! ss (cons 'done payload))
             ($async-deliver-task task payload)
             #t)
@@ -467,12 +469,12 @@
                     (async-task-current-wait-set! task desc)))
                 async-suspend-token))])
       (set-sched-switch! sched #f)
-      (async-deliver-payload payload))))
+      payload)))
 
-(define async-deliver-payload
-  (lambda (payload)
+(define async-deliver-operation-payload
+  (lambda (op payload)
     (if (eq? (car payload) 'values)
-        (apply values (cdr payload))
+        (apply values ((operation-wrap op) (cdr payload)))
         (raise (cdr payload)))))
 
 ;;; --------------------------------------------------------------- operations
@@ -489,7 +491,7 @@
   (lambda (sched deadline deliver)
     (let ([timer (make-async-timer deadline deliver)])
       (let loop ([ts (async-scheduler-timers sched)] [acc '()])
-        (if (and (pair? ts) (< (async-timer-deadline (car ts)) deadline))
+        (if (and (pair? ts) (<= (async-timer-deadline (car ts)) deadline))
             (loop (cdr ts) (cons (car ts) acc))
             (async-scheduler-timers-set! sched
               (append-reverse acc (cons timer ts))))))
@@ -972,8 +974,9 @@
       (operation-try op)
       (operation-block op)
       (lambda (vals)
-        ((operation-wrap op)
-         (call-with-values (lambda () (apply f vals)) list)))
+        (call-with-values
+          (lambda () (apply f ((operation-wrap op) vals)))
+          list))
       (operation-nack op))))
 
 (set-who! choice-operation
@@ -1013,13 +1016,32 @@
                                      (and (async-sync-state-live? ss)
                                           ((operation-block op) ss
                                             (lambda (payload)
-                                              (deliver
-                                                (if (eq? (car payload) 'values)
-                                                    (cons 'values ((operation-wrap op) (cdr payload)))
-                                                    payload)))))])
+                                              (let ([won?
+                                                     (deliver
+                                                       (if (eq? (car payload) 'values)
+                                                           (cons 'values
+                                                             (list
+                                                               (make-async-choice-result
+                                                                 op (cdr payload))))
+                                                           payload))])
+                                                (when won?
+                                                  (do ([j 0 (fx+ j 1)])
+                                                      ((fx= j n))
+                                                    (unless (fx= i j)
+                                                      ((operation-nack
+                                                         (vector-ref ops j))
+                                                       ss))))
+                                                won?))))])
                                (cons desc (f (fx+ i 1))))))])
                   (list 'choice (filter (lambda (d) d) descs))))))
-        (lambda (vals) vals)
+        (lambda (vals)
+          (if (and (pair? vals)
+                   (null? (cdr vals))
+                   (async-choice-result? (car vals)))
+              (let ([r (car vals)])
+                ((operation-wrap (async-choice-result-operation r))
+                 (async-choice-result-values r)))
+              vals))
         (lambda (ss)
           (vector-for-each
             (lambda (op) ((operation-nack op) ss))
@@ -1038,15 +1060,14 @@
         (let ([ss (make-async-sync-state)])
           (let ([r ((operation-try op) ss)])
             (if r
-                (if (eq? (car r) 'values)
-                    (apply values ((operation-wrap op) (cdr r)))
-                    (raise (cdr r)))
-                ($async-suspend sched task ss
-                  (lambda (ss*)
-                    (async-task-nack-thunk-set! task
-                      (lambda () ((operation-nack op) ss)))
-                    ((operation-block op) ss
-                      ($async-make-deliver ss task (operation-wrap op))))))))))))
+                (async-deliver-operation-payload op r)
+                (async-deliver-operation-payload op
+                  ($async-suspend sched task ss
+                    (lambda (ss*)
+                      (async-task-nack-thunk-set! task
+                        (lambda () ((operation-nack op) ss)))
+                      ((operation-block op) ss
+                        ($async-make-deliver ss task))))))))))))
 
 (set-who! sleep-operation
   (lambda (seconds)

@@ -117,6 +117,18 @@
     '(early late))
   (equal? (run-async (lambda () (async-sleep 0) 'done)) 'done)
 
+  ;; timers with the same deadline fire in registration order
+  (equal? (run-async
+            (lambda ()
+              (let ([log '()])
+                (spawn-task (lambda () (async-sleep 1) (set! log (cons 1 log))))
+                (spawn-task (lambda () (async-sleep 1) (set! log (cons 2 log))))
+                (spawn-task (lambda () (async-sleep 1) (set! log (cons 3 log))))
+                (async-sleep 2)
+                (reverse log)))
+            'clock 'virtual)
+    '(1 2 3))
+
   ;; ---- operations
 
   (equal? (run-async (lambda () (perform-operation (always-operation 'x)))) 'x)
@@ -127,6 +139,13 @@
     '(1 2))
   (equal? (run-async (lambda () (perform-operation (wrap-operation (always-operation 21) (lambda (x) (* x 2))))))
     42)
+  (equal? (run-async
+            (lambda ()
+              (perform-operation
+                (wrap-operation
+                  (wrap-operation (always-operation 10) (lambda (x) (+ x 1)))
+                  (lambda (x) (* x 2))))))
+    22)
   (equal? (run-async (lambda ()
                        (perform-operation
                          (choice-operation (never-operation)
@@ -154,6 +173,55 @@
                   (perform-operation (always-operation 'x))
                   (= n (async-scheduler-suspension-count s))))))
     #t)
+
+  ;; a blocked operation can claim its resumption only once
+  (equal? (run-async
+            (lambda ()
+              (let ([deliver-box (box #f)] [runs 0])
+                (let* ([op
+                        (make-operation
+                          (lambda (ss) #f)
+                          (lambda (ss deliver)
+                            (set-box! deliver-box deliver)
+                            '(test-operation)))]
+                       [task
+                        (spawn-task
+                          (lambda ()
+                            (let ([v (perform-operation op)])
+                              (set! runs (+ runs 1))
+                              v)))])
+                  (task-yield)
+                  (let* ([first ((unbox deliver-box) (cons 'values '(first)))]
+                         [second ((unbox deliver-box) (cons 'values '(second)))])
+                    (list first second (task-join task) runs))))))
+    '(#t #f first 1))
+
+  ;; a choice nacks every registered loser, but not the winner
+  (equal? (run-async
+            (lambda ()
+              (let ([deliver1 (box #f)] [deliver2 (box #f)]
+                    [nack1 0] [nack2 0])
+                (define (test-operation deliver-box nack!)
+                  (make-operation
+                    (lambda (ss) #f)
+                    (lambda (ss deliver)
+                      (set-box! deliver-box deliver)
+                      '(test-choice))
+                    (lambda (vals) vals)
+                    (lambda (ss) (nack!))))
+                (let* ([op1 (test-operation deliver1
+                              (lambda () (set! nack1 (+ nack1 1))))]
+                       [op2 (test-operation deliver2
+                              (lambda () (set! nack2 (+ nack2 1))))]
+                       [task (spawn-task
+                               (lambda ()
+                                 (perform-operation
+                                   (choice-operation op1 op2))))])
+                  (task-yield)
+                  ((unbox deliver1) (cons 'values '(winner)))
+                  (let ([late ((unbox deliver2) (cons 'values '(loser)))])
+                    (list (task-join task) late nack1 nack2))))))
+    '(winner #f 0 1))
 
   ;; ---- channels
 
@@ -249,6 +317,46 @@
   (error? (run-async (lambda () (let ([f (make-future)])
                                   (future-fulfil! f 1)
                                   (future-fulfil! f 2)))))
+
+  ;; a blocked operation applies its wrapper in the resumed fiber, not in the
+  ;; thread that completes the operation
+  (equal? (let ([p (make-thread-parameter 'outside)])
+            (run-async
+              (lambda ()
+                (p 'fiber)
+                (let ([f (make-future)])
+                  (fork-thread
+                    (lambda ()
+                      (p 'foreign-thread)
+                      (sleep (make-time 'time-duration 1000000 0))
+                      (future-fulfil! f 'value)))
+                  (perform-operation
+                    (wrap-operation (future-operation f)
+                      (lambda (v) (list v (p)))))))))
+    '(value fiber))
+
+  ;; completion and cancellation race through the same one-shot claim
+  (equal? (run-async
+            (lambda ()
+              (let ([f (make-future)])
+                (let ([completed-first
+                       (spawn-task (lambda () (future-get f)))])
+                  (task-yield)
+                  (future-fulfil! f 'completed)
+                  (task-cancel! completed-first)
+                  (let ([first-result (task-join completed-first)]
+                        [f2 (make-future)])
+                    (let ([canceled-first
+                           (spawn-task (lambda () (future-get f2)))])
+                      (task-yield)
+                      (task-cancel! canceled-first)
+                      (future-fulfil! f2 'too-late)
+                      (list first-result
+                            (guard (c
+                                     [(async-cancellation-condition? c)
+                                      'canceled])
+                              (task-join canceled-first)))))))))
+    '(completed canceled))
 
   ;; ---- joining and exception propagation
 
