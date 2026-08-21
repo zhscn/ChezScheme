@@ -259,7 +259,9 @@ TODO:
     (nongenerative)
     (opaque #t)
     (sealed #t)
-    (fields (immutable name)))
+    (fields (immutable name)
+            ;; present so that fresh tags are not constant-folded into one
+            (mutable cookie)))
 
   (define-record-type control-prompt-frame
     (nongenerative)
@@ -543,11 +545,11 @@ TODO:
 
   (set-who! control:make-continuation-prompt-tag
     (case-lambda
-      [() ($make-control-prompt-tag #f)]
+      [() ($make-control-prompt-tag #f #f)]
       [(name)
        (unless (symbol? name)
          ($oops who "~s is not a symbol" name))
-       ($make-control-prompt-tag name)]))
+       ($make-control-prompt-tag name #f)]))
 
   (record-writer (type-descriptor control-prompt-tag)
     (lambda (tag port write?)
@@ -559,7 +561,7 @@ TODO:
   (set! control:continuation-prompt-tag? control-prompt-tag?)
 
   (set! control:default-continuation-prompt-tag
-    (let ([tag ($make-control-prompt-tag 'default)])
+    (let ([tag ($make-control-prompt-tag 'default #f)])
       (lambda () tag)))
 
   (set-who! $control-reset-at

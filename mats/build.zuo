@@ -240,7 +240,7 @@
       "5_6" "5_7" "5_8" "6" "io" "format" "7"
       "record" "hash" "enum" "8" "fx" "fl" "cfl"
       "foreign" "ftype" "unix" "windows" "examples"
-      "ieee" "date" "exceptions" "oop"))
+      "ieee" "date" "exceptions" "oop" "async"))
 
   (define (conf-name opt)
     (~a (opt 'eval 'symbol) "-" (opt 'o 'integer) "-" (tf (opt 'spi)) "-" (tf (opt 'cp0)) "-" (tf (opt 'cis))))
@@ -959,4 +959,3 @@
        (end-make-targets))))
 
   the-targets)
-
