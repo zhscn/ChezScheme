@@ -185,13 +185,15 @@
     (immutable requests)          ; id -> aio-req
     (immutable requests-mutex)
     (immutable handles)           ; id -> weak-cons wrapper #t
+    (immutable files)             ; fd -> weak-cons async-file #t
     (mutable completions)         ; list of (id kind status aux)
     (mutable commands)            ; owner-thread thunks, newest first
     (immutable command-mutex)     ; also guards closing and wakeup lifetime
     (mutable stop-set)            ; streams that may need uv_read_stop
     (immutable stop-mutex)
     (mutable closing?)
-    (immutable guardian)))
+    (immutable guardian)
+    (immutable file-guardian)))
 
 (define-record-type (aio-req make-aio-req aio-req?)
   (nongenerative)
@@ -299,6 +301,17 @@
   (lambda (st w)
     (hashtable-set! (aio-state-handles st) (aio-handle-id w) (weak-cons w #t))
     ((aio-state-guardian st) w)))
+
+(define aio-register-file!
+  (lambda (st f)
+    (hashtable-set! (aio-state-files st) (async-file-fd f) (weak-cons f #t))
+    ((aio-state-file-guardian st) f)
+    f))
+
+(define aio-unregister-file!
+  (lambda (f)
+    (hashtable-delete! (aio-state-files (async-file-state f))
+      (async-file-fd f))))
 
 (define aio-lookup-handle
   (lambda (st id)
@@ -610,6 +623,29 @@
             (aio-close-handle w 'finalized)
             (loop)))))))
 
+(define aio-finalize-file!
+  (lambda (f)
+    (let ([close?
+           (with-mutex (async-file-mutex f)
+             (if (async-file-closed? f)
+                 #f
+                 (begin
+                   (async-file-closed?-set! f #t)
+                   #t)))])
+      (when close?
+        (aio-fs-close-now (async-file-fd f))
+        (aio-release-file-affinities! f))
+      (aio-unregister-file! f))))
+
+(define aio-drain-file-guardian!
+  (lambda (st)
+    (let ([g (aio-state-file-guardian st)])
+      (let loop ()
+        (let ([f (g)])
+          (when f
+            (aio-finalize-file! f)
+            (loop)))))))
+
 ;;; ------------------------------------------------------- poll and wake
 
 (define aio-arm-bridge
@@ -626,6 +662,7 @@
     (let ([st ($async-scheduler-io-state sched)])
       (when (and st (not (aio-state-closing? st)))
         (aio-drain-guardian! st)
+        (aio-drain-file-guardian! st)
         (aio-drain-commands! st)
         (aio-drain-stop-set! st)
         (when block? (aio-arm-bridge st sched))
@@ -688,6 +725,15 @@
           (when (pair? (aio-state-completions st))
             (aio-drain-completions! st)
             (drain)))
+        ;; No native request remains at this point, so synchronous close cannot
+        ;; race an in-flight read, write, or async close request.
+        (let-values ([(fds files) (hashtable-entries (aio-state-files st))])
+          (vector-for-each
+            (lambda (p)
+              (let ([f (car p)])
+                (unless (bwp-object? f)
+                  (aio-finalize-file! f))))
+            files))
         (aio-loop-destroy (aio-state-loop st))
         (with-mutex aio-loop-registry-mutex
           (hashtable-delete! aio-loop-registry (aio-state-loop st)))))))
@@ -721,9 +767,10 @@
                   ($oops who "cannot initialize the libuv timer handle"))
                 (let ([st (make-aio-state loop wakeup bridge
                         1 (make-eq-hashtable) (make-mutex)
-                        (make-eq-hashtable) '() '() (make-mutex)
+                        (make-eq-hashtable) (make-eq-hashtable)
+                        '() '() (make-mutex)
                         '() (make-mutex) #f
-                        (make-guardian))])
+                        (make-guardian) (make-guardian))])
                   (with-mutex aio-loop-registry-mutex
                     (hashtable-set! aio-loop-registry loop st))
                   (aio-set-notify loop (foreign-callable-entry-point aio-notify-trampoline))
@@ -1401,13 +1448,14 @@
                       [release-box (vector-ref attempt 2)]
                       [release (unbox release-box)])
                  (set-box! release-box #f)
-                 (cons 'values
-                   (list (make-async-file% status path st #f
-                           (if (fxlogtest bits 16) -1 0) ; append: track end lazily
-                           #f (make-mutex) #f '()
-                           (if release
-                               (list (cons owner release))
-                               '())))))
+                 (let ([f
+                        (make-async-file% status path st #f
+                          (if (fxlogtest bits 16) -1 0) ; append: track end lazily
+                          #f (make-mutex) #f '()
+                          (if release
+                              (list (cons owner release))
+                              '()))])
+                   (cons 'values (list (aio-register-file! st f)))))
                (begin
                  (release-open-affinity! ss)
                  (cons 'raise (aio-io-condition 'open #f path status)))))
@@ -1518,6 +1566,7 @@
         (if (fx= status 0)
             (begin
               (async-file-closed?-set! f #t)
+              (aio-unregister-file! f)
               (aio-release-file-affinities! f)
               (cons 'values '()))
             (cons 'raise
@@ -1525,6 +1574,7 @@
       (lambda (ss status aux)
         (when (fx= status 0)
           (async-file-closed?-set! f #t)
+          (aio-unregister-file! f)
           (aio-release-file-affinities! f)))
       f)))
 

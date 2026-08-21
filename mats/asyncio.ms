@@ -148,6 +148,17 @@
           (let ([after (asyncio-open-fd-count)])
             (and after (<= after (+ before 1)))))))
 
+  ;; Scheduler shutdown closes files that were not explicitly closed.
+  (let ([before (asyncio-open-fd-count)])
+    (or (not before)
+        (begin
+          (run-async
+            (lambda ()
+              (file-open "/dev/null" '(read))
+              (void)))
+          (let ([after (asyncio-open-fd-count)])
+            (and after (<= after (+ before 1)))))))
+
   ;; File adapters preserve port buffering, position, EOF, and ownership.
 
   (let ([path (asyncio-temp-path "file-port")]
