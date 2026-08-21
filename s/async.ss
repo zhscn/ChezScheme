@@ -185,7 +185,7 @@
 ;;; ------------------------------------------------------------ records
 
 (define-record-type (async-scheduler make-async-scheduler% $async-scheduler?)
-  (nongenerative async-scheduler-layer6)
+  (nongenerative async-scheduler-layer7)
   (sealed #t)
   (fields
     (immutable prompt-tag)          ; private continuation-prompt tag
@@ -208,7 +208,8 @@
     (mutable timers)                ; sorted list of async-timer
     (mutable current-task)          ; running task or #f
     (mutable in-switch?)            ; #t while unwinding/rewinding a switch
-    (mutable saved-dynamic-state)   ; ambient parameter vector
+    (mutable saved-dynamic-state)   ; ambient async-dynamic-state
+    (mutable active-dynamic-version); version installed on the owner thread
     (mutable saved-exception-state) ; ambient exception state
     (mutable turn-count $async-scheduler-turn-count $async-scheduler-turn-count-set!)
     (mutable exec-count)
@@ -230,6 +231,7 @@
     (immutable ready-queue)         ; ready migratable tasks
     (immutable tasks)               ; stable id -> task registry for the group
     (mutable task-count)
+    (mutable parameter-config)      ; (version . newest-first updates)
     (mutable schedulers)
     (mutable root-task)
     (mutable next-task-id)
@@ -260,7 +262,7 @@
     (immutable migratable?)
     (mutable affinity-reasons)      ; scheduler-local resources held by the task
     (mutable suspension-state)      ; #f | unwinding | parking | parked | delivered
-    (mutable dynamic-state)         ; saved parameter vector
+    (mutable dynamic-state)         ; saved async-dynamic-state
     (mutable exception-state)       ; exception-state record
     (mutable parent-group)          ; group this task belongs to
     (mutable child-group)           ; group owned by this task, or #f
@@ -324,62 +326,89 @@
 
 ;;; ------------------------------------------------- dynamic state (fiber-local)
 
+(define-record-type (async-dynamic-state make-async-dynamic-state async-dynamic-state?)
+  (nongenerative)
+  (sealed #t)
+  (fields (immutable parameters) (immutable version)))
+
 (define async-snapshot-dynamic-state
-  (lambda ()
-    (if-feature pthreads
-      (vector-copy ($tc-field 'parameters ($tc)))
-      #f)))
+  (lambda (version)
+    (make-async-dynamic-state
+      (if-feature pthreads
+        (vector-copy ($tc-field 'parameters ($tc)))
+        #f)
+      version)))
 
 (define async-install-dynamic-state!
-  (lambda (snap)
+  (lambda (state)
     (if-feature pthreads
-      (when snap
+      (let ([snap (async-dynamic-state-parameters state)])
+        (when snap
         (let ([cur ($tc-field 'parameters ($tc))])
           (let ([n (fxmin (vector-length cur) (vector-length snap))])
             (do ([i 0 (fx+ i 1)]) ((fx= i n))
-              (vector-set! cur i (vector-ref snap i))))))
+                (vector-set! cur i (vector-ref snap i)))))))
       (void))))
 
-(define async-set-dynamic-state-slot
-  (lambda (snap index initval size)
-    (and snap
-         (let ([snap
-                (if (fx< (vector-length snap) size)
-                    (let ([new (make-vector size)])
-                      (do ([i 0 (fx+ i 1)])
-                          ((fx= i (vector-length snap)))
-                        (vector-set! new i (vector-ref snap i)))
-                      new)
-                    snap)])
-           (vector-set! snap index initval)
-           snap))))
+(define async-extend-parameter-vector
+  (lambda (parameters size)
+    (if (or (not parameters) (fx>= (vector-length parameters) size))
+        parameters
+        (let ([new (make-vector size #f)])
+          (do ([i 0 (fx+ i 1)]) ((fx= i (vector-length parameters)))
+            (vector-set! new i (vector-ref parameters i)))
+          new))))
 
-;;; A thread parameter allocated while fibers are active introduces a new or
-;;; reused vector slot.  Give every saved fiber the parameter's initial value;
-;;; the allocating fiber's subsequent mutations are captured normally.
+(define async-normalize-dynamic-state
+  (lambda (group state)
+    (let* ([config (async-scheduler-group-parameter-config group)]
+           [version (car config)]
+           [old-version (async-dynamic-state-version state)])
+      (if (fx= version old-version)
+          state
+          (let collect ([updates (cdr config)] [pending '()])
+            (if (or (null? updates)
+                    (fx<= (car (car updates)) old-version))
+                (let apply ([updates pending]
+                            [parameters (async-dynamic-state-parameters state)])
+                  (if (null? updates)
+                      (make-async-dynamic-state parameters version)
+                      (let* ([update (car updates)]
+                             [index (cadr update)]
+                             [initval (caddr update)]
+                             [size (cadddr update)]
+                             [parameters
+                              (async-extend-parameter-vector parameters size)])
+                        (when parameters
+                          (vector-set! parameters index initval))
+                        (apply (cdr updates) parameters))))
+                (collect (cdr updates) (cons (car updates) pending))))))))
+
+;;; Parameter updates are published as immutable versioned entries.  A saved
+;;; fiber applies missed entries when it is next installed, including entries
+;;; for reused slots.
 (define async-new-thread-parameter
   (lambda (index initval size)
     (let ([sched ($async-scheduler)])
       (when ($async-scheduler? sched)
         (let ([group ($async-scheduler-group sched)])
-          (with-async-mutex (async-scheduler-group-mutex group)
-            (vector-for-each
-              (lambda (s)
-                (async-scheduler-saved-dynamic-state-set! s
-                  (async-set-dynamic-state-slot
-                    (async-scheduler-saved-dynamic-state s)
-                    index initval size)))
-              (async-scheduler-group-schedulers group))
-            (let-values ([(ids tasks)
-                          (hashtable-entries
-                            (async-scheduler-group-tasks group))])
-              (vector-for-each
-                (lambda (task)
-                  (async-task-dynamic-state-set! task
-                    (async-set-dynamic-state-slot
-                      (async-task-dynamic-state task)
-                      index initval size)))
-                tasks))))))))
+          (let ([state
+                 (async-normalize-dynamic-state group
+                   (async-snapshot-dynamic-state
+                     (async-scheduler-active-dynamic-version sched)))])
+            (async-install-dynamic-state! state)
+            (async-scheduler-active-dynamic-version-set! sched
+              (async-dynamic-state-version state)))
+          (let ([version
+                 (with-async-mutex (async-scheduler-group-mutex group)
+                   (let* ([config (async-scheduler-group-parameter-config group)]
+                          [version (fx+ 1 (car config))])
+                     (async-scheduler-group-parameter-config-set! group
+                       (cons version
+                         (cons (list version index initval size) (cdr config))))
+                     version))])
+            ;; The allocating thread has already installed this slot.
+            (async-scheduler-active-dynamic-version-set! sched version)))))))
 
 ;;; ------------------------------------------- scheduler/task internal helpers
 
@@ -472,26 +501,41 @@
 
 (define install-task-dynamic-state!
   (lambda (sched task)
-    (let ([engine-was-active? ($engine-active?)])
-      (with-async-mutex (async-scheduler-group-mutex ($async-scheduler-group sched))
-        (async-scheduler-saved-dynamic-state-set! sched (async-snapshot-dynamic-state))
-        (async-scheduler-saved-exception-state-set! sched (current-exception-state))
-        (async-install-dynamic-state! (async-task-dynamic-state task))
-        (unless engine-was-active? ($engine-reset-thread-state!))
-        (current-exception-state (async-task-exception-state task))))
+    (let* ([engine-was-active? ($engine-active?)]
+           [group ($async-scheduler-group sched)]
+           [ambient
+            (async-snapshot-dynamic-state
+              (async-scheduler-active-dynamic-version sched))]
+           [state (async-normalize-dynamic-state group
+                    (async-task-dynamic-state task))])
+      (async-scheduler-saved-dynamic-state-set! sched ambient)
+      (async-scheduler-saved-exception-state-set! sched (current-exception-state))
+      (async-task-dynamic-state-set! task state)
+      (async-install-dynamic-state! state)
+      (async-scheduler-active-dynamic-version-set! sched
+        (async-dynamic-state-version state))
+      (unless engine-was-active? ($engine-reset-thread-state!))
+      (current-exception-state (async-task-exception-state task)))
     ($async-engine-active #f)
     ($async-scheduler sched)))
 
 (define snapshot-task-dynamic-state!
   (lambda (sched task)
-    (with-async-mutex (async-scheduler-group-mutex ($async-scheduler-group sched))
-      (async-task-dynamic-state-set! task (async-snapshot-dynamic-state))
-      (async-task-exception-state-set! task (current-exception-state)))))
+    (async-task-dynamic-state-set! task
+      (async-snapshot-dynamic-state
+        (async-scheduler-active-dynamic-version sched)))
+    (async-task-exception-state-set! task (current-exception-state))))
 
 (define restore-scheduler-dynamic-state!
   (lambda (sched)
-    (with-async-mutex (async-scheduler-group-mutex ($async-scheduler-group sched))
-      (async-install-dynamic-state! (async-scheduler-saved-dynamic-state sched))
+    (let ([state
+           (async-normalize-dynamic-state
+             ($async-scheduler-group sched)
+             (async-scheduler-saved-dynamic-state sched))])
+      (async-scheduler-saved-dynamic-state-set! sched state)
+      (async-install-dynamic-state! state)
+      (async-scheduler-active-dynamic-version-set! sched
+        (async-dynamic-state-version state))
       (current-exception-state (async-scheduler-saved-exception-state sched)))
     ($async-scheduler sched)))
 
@@ -1034,7 +1078,8 @@
                    (async-scheduler-group-next-task-id-set! group (fx+ 1 id))
                    id))])
       (make-async-task id name 'ready entry #f #f group sched #f migratable? '() #f
-        (async-snapshot-dynamic-state)
+        (async-snapshot-dynamic-state
+          (async-scheduler-active-dynamic-version sched))
         (current-exception-state)
         parent-group #f '() #f '() #f #f #f #f #f #f #f #f (make-async-mutex)))))
 
@@ -1183,7 +1228,8 @@
       '() (make-async-mutex)
       (make-async-queue) (make-async-mutex)
       (if-feature pthreads (make-condition) #f)
-      (make-eq-hashtable) 0 0 #f 'created virtual? 0 '() #f #f #f #f
+      (make-eq-hashtable) 0 0 #f 'created virtual? 0 '() #f #f
+      (async-snapshot-dynamic-state 0) 0 (current-exception-state)
       0 0 preemption-ticks 0 0 0 #f #f #f)))
 
 (define async-drain-remote!
@@ -2040,7 +2086,7 @@
                       (make-async-mutex)
                       (if-feature pthreads (make-condition) #f)
                       (make-async-queue) (make-eq-hashtable) 0
-                      '#() #f 0 0 0 #f #f '())]
+                      (cons 0 '()) '#() #f 0 0 0 #f #f '())]
              [schedulers (make-vector parallelism)])
         (do ([i 0 (fx+ i 1)]) ((fx= i parallelism))
           (vector-set! schedulers i

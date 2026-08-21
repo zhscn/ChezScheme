@@ -789,6 +789,35 @@
                   (list (task-join a) (task-join b))))))
     '(task-a initial))
 
+  ;; parameter allocation is published lazily to fibers on every worker
+  (or (not (threaded?))
+      (equal? (run-async
+                (lambda ()
+                  (let ([ready (make-future)]
+                        [pbox (box #f)]
+                        [readers (make-vector 8)])
+                    (do ([i 0 (fx+ i 1)]) ((fx= i (vector-length readers)))
+                      (vector-set! readers i
+                        (spawn-task
+                          (lambda ()
+                            (future-get ready)
+                            ((unbox pbox)))
+                          'migratable? #t)))
+                    (let ([creator
+                           (spawn-task
+                             (lambda ()
+                               (let ([p (make-thread-parameter 'initial)])
+                                 (set-box! pbox p)
+                                 (p 'creator)
+                                 (future-fulfil! ready #t)
+                                 (task-yield)
+                                 (p)))
+                             'migratable? #t)])
+                      (cons (task-join creator)
+                        (vector->list (vector-map task-join readers))))))
+                'parallelism 4)
+              (cons 'creator (make-list 8 'initial))))
+
   ;; scheduler exit restores the caller's thread-parameter state
   (equal? (let ([p (make-thread-parameter 'outside)])
             (run-async (lambda () (p 'inside) (task-yield) (p)))
