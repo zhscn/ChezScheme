@@ -352,11 +352,21 @@
 (define async-pin-current-task!
   (lambda ()
     (let ([sched ($async-scheduler)])
-      (when (and (async-scheduler? sched)
-                 (async-scheduler-current-task sched))
-        (async-task-add-affinity!
-          (async-scheduler-current-task sched)
-          'io)))))
+      (if (and (async-scheduler? sched)
+               (async-scheduler-current-task sched))
+          (let* ([task (async-scheduler-current-task sched)]
+                 [token (list 'io)]
+                 [active? #t])
+            (async-task-add-affinity! task token)
+            ;; The returned release procedure is idempotent so native close
+            ;; and shutdown paths may safely converge on the same owner.
+            (lambda ()
+              (with-async-mutex (async-task-mutex task)
+                (when active?
+                  (set! active? #f)
+                  (async-task-affinity-reasons-set! task
+                    (remq token (async-task-affinity-reasons task)))))))
+          (lambda () (void))))))
 
 (define async-task-add-affinity!
   (lambda (task reason)
@@ -1018,7 +1028,28 @@
                "async deadlock: no runnable tasks and no pending timers")
              (async-scheduler-vtime-set! sched (async-timer-deadline (car ts)))))]
       [(async-scheduler-poll-proc sched)
-       => (lambda (poll) (poll sched #t))]
+       => (lambda (poll)
+            ;; The preceding nonblocking poll may consume a remote wakeup
+            ;; that arrived after the scheduler drained its queues.  Recheck
+            ;; under the queue locks before entering a blocking event-loop
+            ;; poll.  A submission after this check leaves uv_async pending.
+            (let ([group ($async-scheduler-group sched)])
+              (if (async-group-parallel? group)
+                  (let ([idle?
+                         (with-mutex (async-scheduler-group-mutex group)
+                           (and
+                             (async-queue-empty?
+                               (async-scheduler-group-ready-queue group))
+                             (with-mutex
+                               (async-scheduler-remote-mutex sched)
+                               (async-queue-empty?
+                                 (async-scheduler-remote-queue sched)))))])
+                    (when idle? (poll sched #t)))
+                  (let ([idle?
+                         (with-mutex (async-scheduler-remote-mutex sched)
+                           (async-queue-empty?
+                             (async-scheduler-remote-queue sched)))])
+                    (when idle? (poll sched #t))))))]
       [(async-group-parallel? ($async-scheduler-group sched))
        (let ([group ($async-scheduler-group sched)]
              [ts (async-scheduler-timers sched)])

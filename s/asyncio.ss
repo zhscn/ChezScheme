@@ -221,7 +221,8 @@
     (mutable read-queue)          ; list of (ss . deliver)
     (mutable reading?)
     (mutable eof?)
-    (mutable accept-queue)))      ; list of (ss . deliver)
+    (mutable accept-queue)        ; list of (ss . deliver)
+    (mutable affinities)))        ; list of (task . release)
 
 (define-record-type (async-file make-async-file% %async-file?)
   (nongenerative)
@@ -235,12 +236,14 @@
     (mutable closed?)
     (immutable mutex)
     (mutable busy?)
-    (mutable queue)))
+    (mutable queue)
+    (mutable affinities)))        ; list of (task . release)
 
 ;;; ------------------------------------------------- notify trampoline
 
 ;;; maps aio_loop_t pointers to their io state
 (define aio-loop-registry (make-eq-hashtable))
+(define aio-loop-registry-mutex (make-mutex))
 
 ;;; Runs inside uv_run on the scheduler thread.  Enqueues the completion and
 ;;; nothing more; a condition is swallowed rather than escaping through C.
@@ -248,7 +251,9 @@
   (let ([p (foreign-callable
              (lambda (lp id kind status aux)
                (guard (c [else (void)])
-                 (let ([st (hashtable-ref aio-loop-registry lp #f)])
+                 (let ([st
+                        (with-mutex aio-loop-registry-mutex
+                          (hashtable-ref aio-loop-registry lp #f))])
                    (when st
                      (aio-state-completions-set! st
                        (cons (list id kind status aux)
@@ -299,6 +304,46 @@
       (and p
            (let ([w (car p)])
              (and (not (bwp-object? w)) w))))))
+
+;;; A scheduler-local resource pins each task that uses it.  Closing the
+;;; resource releases every such task, allowing later scheduler migration.
+(define aio-bind-current-task-to-handle!
+  (lambda (h)
+    (let ([task (current-async-task)])
+      (when task
+        (with-mutex (aio-handle-mutex h)
+          (unless (assq task (aio-handle-affinities h))
+            (aio-handle-affinities-set! h
+              (cons (cons task ($async-pin-current-task!))
+                    (aio-handle-affinities h)))))))))
+
+(define aio-release-handle-affinities!
+  (lambda (h)
+    (let ([affinities
+           (with-mutex (aio-handle-mutex h)
+             (let ([affinities (aio-handle-affinities h)])
+               (aio-handle-affinities-set! h '())
+               affinities))])
+      (for-each (lambda (entry) ((cdr entry))) affinities))))
+
+(define aio-bind-current-task-to-file!
+  (lambda (f)
+    (let ([task (current-async-task)])
+      (when task
+        (with-mutex (async-file-mutex f)
+          (unless (assq task (async-file-affinities f))
+            (async-file-affinities-set! f
+              (cons (cons task ($async-pin-current-task!))
+                    (async-file-affinities f)))))))))
+
+(define aio-release-file-affinities!
+  (lambda (f)
+    (let ([affinities
+           (with-mutex (async-file-mutex f)
+             (let ([affinities (async-file-affinities f)])
+               (async-file-affinities-set! f '())
+               affinities))])
+      (for-each (lambda (entry) ((cdr entry))) affinities))))
 
 ;;; register a request; finish runs exactly once at dispatch, canceled or
 ;;; not, and returns a payload to deliver or #f to stay silent
@@ -449,7 +494,7 @@
                           (if (eq? (aio-handle-kind h) 'pipe-listener)
                               'pipe-stream
                               'tcp-stream)
-                          st #f #f (make-mutex) #f #f '() #f #f '())])
+                          st #f #f (make-mutex) #f #f '() #f #f '() '())])
                  (aio-register-handle! st w)
                  (cons 'values (list w)))]
               [(fx= r (aio-eagain-code))
@@ -584,6 +629,13 @@
                       [(dns) (aio-dns-cancel cd)]
                       [else (void)]))))
               vs)))
+        (let-values ([(ks vs) (hashtable-entries (aio-state-handles st))])
+          (vector-for-each
+            (lambda (p)
+              (let ([w (car p)])
+                (unless (bwp-object? w)
+                  (aio-release-handle-affinities! w))))
+            vs))
         (aio-handle-close (aio-state-wakeup st))
         (aio-handle-close (aio-state-bridge st))
         (let loop ()
@@ -598,7 +650,8 @@
             (aio-drain-completions! st)
             (drain)))
         (aio-loop-destroy (aio-state-loop st))
-        (hashtable-delete! aio-loop-registry (aio-state-loop st))))))
+        (with-mutex aio-loop-registry-mutex
+          (hashtable-delete! aio-loop-registry (aio-state-loop st)))))))
 
 ;;; -------------------------------------------------------- state setup
 
@@ -610,7 +663,6 @@
         ($oops who "not in an async scheduler"))
       (when ($async-scheduler-virtual? sched)
         ($oops who "asynchronous I/O is not available on a virtual-clock scheduler"))
-      ($async-pin-current-task!)
       (or ($async-scheduler-io-state sched)
           (let ([loop (aio-loop-open)])
             (when (= loop 0)
@@ -632,7 +684,8 @@
                         1 (make-eq-hashtable) (make-mutex)
                         (make-eq-hashtable) '() '() (make-mutex) #f
                         (make-guardian))])
-                  (hashtable-set! aio-loop-registry loop st)
+                  (with-mutex aio-loop-registry-mutex
+                    (hashtable-set! aio-loop-registry loop st))
                   (aio-set-notify loop (foreign-callable-entry-point aio-notify-trampoline))
                   ($async-scheduler-io-state-set! sched st)
                   ($async-scheduler-poll-proc-set! sched aio-poll)
@@ -681,6 +734,7 @@
                             (aio-handle-accept-queue-set! w '())
                             (values #t waiters)))))])
       (when close?
+        (aio-release-handle-affinities! w)
         (let ([payload (cons 'raise (aio-closed-condition operation w))])
           (for-each
             (lambda (waiter)
@@ -709,7 +763,8 @@
       (unless (and sched
                    (eq? ($async-scheduler-io-state sched)
                         (aio-handle-state h)))
-        ($oops who "async handle belongs to another scheduler")))))
+        ($oops who "async handle belongs to another scheduler"))
+      (aio-bind-current-task-to-handle! h))))
 
 (define aio-check-stream-access!
   (lambda (who s allow-owned?)
@@ -895,7 +950,7 @@
          ($oops 'tcp-listen "cannot allocate a tcp handle"))
        (let ([w (make-aio-handle id h 'tcp-listener st
                   (format "~a:~a" host port) #f (make-mutex)
-                  #f #f '() #f #f '())])
+                  #f #f '() #f #f '() '())])
          (define (fail r)
            (aio-handle-close h)
            (raise (aio-io-condition 'listen w (aio-handle-path w) r)))
@@ -904,6 +959,7 @@
          (let ([r (aio-listen-start h backlog)])
            (when (fx< r 0) (fail r)))
          (aio-register-handle! st w)
+         (aio-bind-current-task-to-handle! w)
          w))]))
 
 (define %tcp-accept-operation
@@ -941,7 +997,9 @@
                  (append (aio-handle-accept-queue listener)
                          (list (cons ss deliver))))
                (list 'accept (aio-handle-id listener))])))
-        (lambda (vals) vals)
+        (lambda (vals)
+          (for-each aio-bind-current-task-to-handle! vals)
+          vals)
         (lambda (ss)
           (with-mutex (aio-handle-mutex listener)
             (aio-handle-accept-queue-set! listener
@@ -971,13 +1029,13 @@
                   #f)
                 (let ([w (make-aio-handle id h 'tcp-stream st
                            (format "~a:~a" host port) #f (make-mutex)
-                           #f #f '() #f #f '())])
+                           #f #f '() #f #f '() '())])
                   (aio-register-handle! st w)
+                  (aio-bind-current-task-to-handle! w)
                   (let ([r (aio-tcp-connect h host port id)])
                     (if (< r 0)
                         (begin
-                          (aio-handle-closing?-set! w #t)
-                          (aio-handle-close h)
+                          (aio-close-handle w 'connect)
                           (deliver
                             (cons 'raise
                               (aio-io-condition 'connect w (aio-handle-path w) r)))
@@ -988,14 +1046,12 @@
                               (lambda (canceled? status aux)
                                 (cond
                                   [canceled?
-                                   (aio-handle-closing?-set! w #t)
-                                   (aio-handle-close h)
+                                   (aio-close-handle w 'connect)
                                    #f]
                                   [(fx= status 0)
                                    (cons 'values (list w))]
                                   [else
-                                   (aio-handle-closing?-set! w #t)
-                                   (aio-handle-close h)
+                                   (aio-close-handle w 'connect)
                                    (cons 'raise
                                      (aio-io-condition 'connect w
                                        (aio-handle-path w) status))]))
@@ -1021,7 +1077,7 @@
        (when (= h 0)
          ($oops 'pipe-listen "cannot allocate a pipe handle"))
        (let ([w (make-aio-handle id h 'pipe-listener st path #f (make-mutex)
-                  #f #f '() #f #f '())])
+                  #f #f '() #f #f '() '())])
          (define (fail r)
            (aio-handle-close h)
            (raise (aio-io-condition 'listen w path r)))
@@ -1030,6 +1086,7 @@
          (let ([r (aio-listen-start h backlog)])
            (when (fx< r 0) (fail r)))
          (aio-register-handle! st w)
+         (aio-bind-current-task-to-handle! w)
          w))]))
 
 (define %pipe-connect-operation
@@ -1051,21 +1108,20 @@
                     (cons 'raise (aio-io-condition 'connect #f path -12)))
                   #f)
                 (let ([w (make-aio-handle id h 'pipe-stream st path #f (make-mutex)
-                           #f #f '() #f #f '())])
+                           #f #f '() #f #f '() '())])
                   (aio-register-handle! st w)
+                  (aio-bind-current-task-to-handle! w)
                   (aio-register-request! st id
                     (make-aio-req 'connect w deliver #f
                       (lambda (canceled? status aux)
                         (cond
                           [canceled?
-                           (aio-handle-closing?-set! w #t)
-                           (aio-handle-close h)
+                           (aio-close-handle w 'connect)
                            #f]
                           [(fx= status 0)
                            (cons 'values (list w))]
                           [else
-                           (aio-handle-closing?-set! w #t)
-                           (aio-handle-close h)
+                           (aio-close-handle w 'connect)
                            (cons 'raise
                              (aio-io-condition 'connect w path status))]))
                       #f))
@@ -1183,6 +1239,8 @@
        (make-operation
          (lambda (ss) #f)
          (lambda (ss deliver)
+           (when serial-file
+             (aio-check-file-owner! who serial-file))
            (letrec ([submit
                      (lambda ()
                        (define submit-native
@@ -1268,21 +1326,42 @@
        ($oops 'file-open-operation "~s is not a list of flag symbols" flags))
      (unless (and (fixnum? mode) (fx>= mode 0) (fx<= mode #o7777))
        ($oops 'file-open-operation "~s is not a valid file mode" mode))
-     (let ([bits (aio-open-flag-bits flags)] [st-box (box #f)])
+     (let ([bits (aio-open-flag-bits flags)]
+           [st-box (box #f)]
+           [owner-box (box #f)]
+           [release-box (box #f)])
+       (define release-open-affinity!
+         (lambda ()
+           (let ([release (unbox release-box)])
+             (when release
+               (set-box! release-box #f)
+               (release)))))
        (aio-fs-request-operation 'open #f path
          (lambda (st id)
            (set-box! st-box st)
-           (aio-fs-open (aio-state-loop st) path bits mode id))
+           (set-box! owner-box (current-async-task))
+           (set-box! release-box ($async-pin-current-task!))
+           (let ([r (aio-fs-open (aio-state-loop st) path bits mode id)])
+             (when (< r 0) (release-open-affinity!))
+             r))
          (lambda (status aux)
            (if (>= status 0)
-               (cons 'values
-                 (list (make-async-file% status path (unbox st-box) #f
-                         (if (fxlogtest bits 16) -1 0) ; append: track end lazily
-                         #f (make-mutex) #f '())))
-               (cons 'raise (aio-io-condition 'open #f path status))))
+               (let ([release (unbox release-box)])
+                 (set-box! release-box #f)
+                 (cons 'values
+                   (list (make-async-file% status path (unbox st-box) #f
+                           (if (fxlogtest bits 16) -1 0) ; append: track end lazily
+                           #f (make-mutex) #f '()
+                           (if release
+                               (list (cons (unbox owner-box) release))
+                               '())))))
+               (begin
+                 (release-open-affinity!)
+                 (cons 'raise (aio-io-condition 'open #f path status)))))
          (lambda (status aux)
            (when (>= status 0)
-             (aio-fs-close-now status)))))]))
+             (aio-fs-close-now status))
+           (release-open-affinity!))))]))
 
 (define aio-check-file
   (lambda (who f)
@@ -1303,7 +1382,8 @@
       (unless (and sched
                    (eq? ($async-scheduler-io-state sched)
                         (async-file-state f)))
-        ($oops who "async file belongs to another scheduler")))))
+        ($oops who "async file belongs to another scheduler"))
+      (aio-bind-current-task-to-file! f))))
 
 (define aio-claim-file-for-port!
   (lambda (who f)
@@ -1385,11 +1465,14 @@
         (if (fx= status 0)
             (begin
               (async-file-closed?-set! f #t)
+              (aio-release-file-affinities! f)
               (cons 'values '()))
             (cons 'raise
               (aio-io-condition 'close f (async-file-path f) status))))
       (lambda (status aux)
-        (when (fx= status 0) (async-file-closed?-set! f #t)))
+        (when (fx= status 0)
+          (async-file-closed?-set! f #t)
+          (aio-release-file-affinities! f)))
       f)))
 
 (define aio-stat-alist

@@ -256,6 +256,54 @@
           'parallelism 2)
         '((#t #t #t) (#t #t #t))))
 
+  ;; A live scheduler-local file keeps its users on the owning scheduler.
+  ;; Closing the file releases that resource affinity, so subsequent
+  ;; scheduler-neutral suspension points may migrate the tasks again.
+  (or (not (threaded?))
+      (let* ([n 6]
+             [paths
+              (list->vector
+                (map (lambda (i) (asyncio-temp-path (format "affinity-~a" i)))
+                  '(0 1 2 3 4 5)))]
+             [results
+              (run-async
+                (lambda ()
+                  (let ([tasks (make-vector n)])
+                    (do ([i 0 (fx+ i 1)]) ((fx= i n))
+                      (let ([i i])
+                        (vector-set! tasks i
+                          (spawn-task
+                            (lambda ()
+                              (let* ([file
+                                      (file-open (vector-ref paths i)
+                                        '(write create truncate))]
+                                     [owner (current-async-scheduler)]
+                                     [stable? #t]
+                                     [migrated? #f])
+                                (do ([j 0 (fx+ j 1)]) ((fx= j 8))
+                                  (task-yield)
+                                  (unless (eq? owner
+                                               (current-async-scheduler))
+                                    (set! stable? #f)))
+                                (file-close file)
+                                (do ([j 0 (fx+ j 1)]) ((fx= j 32))
+                                  (task-yield)
+                                  (unless (eq? owner
+                                               (current-async-scheduler))
+                                    (set! migrated? #t)))
+                                (list stable? migrated?)))
+                            'migratable? #t))))
+                    (let loop ([i 0] [results '()])
+                      (if (fx= i n)
+                          (reverse results)
+                          (loop (fx+ i 1)
+                            (cons (task-join (vector-ref tasks i))
+                                  results))))))
+                'parallelism 3)])
+        (vector-for-each asyncio-delete-if-present paths)
+        (and (for-all car results)
+             (exists cadr results))))
+
   ;; A handle can only be operated by the scheduler that owns its libuv loop.
   (or (not (threaded?))
       (let ([path (asyncio-temp-path "foreign-owner")])
