@@ -24,6 +24,12 @@
   (lambda (path)
     (when (file-exists? path) (delete-file path))))
 
+(define asyncio-test-burn
+  (lambda (n)
+    (let loop ([i 0])
+      (unless (fx= i n)
+        (loop (fx+ i 1))))))
+
 (mat asyncio
 
   ;; conditions and argument validation
@@ -50,6 +56,7 @@
     (let ((result
            (run-async
              (lambda ()
+               (asyncio-test-burn 100000)
                (let ((out (file-open path '(write create truncate))))
                  (let ((n (file-write out (string->utf8 "hello async"))))
                    (file-close out)
@@ -59,7 +66,8 @@
                             (stat (file-stat in)))
                        (file-close in)
                        (list n (utf8->string bv) (eof-object? eof)
-                             (cdr (assq 'size stat)))))))))))
+                             (cdr (assq 'size stat))))))))
+             'preemption-ticks 20)))
       (asyncio-delete-if-present path)
       (equal? result '(11 "hello async" #t 11))))
 

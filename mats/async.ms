@@ -17,6 +17,12 @@
 (import (chezscheme async channels))
 (import (chezscheme control))
 
+(define async-test-burn
+  (lambda (n)
+    (let loop ([i 0])
+      (unless (fx= i n)
+        (loop (fx+ i 1))))))
+
 (mat async
 
   ;; ---- basic scheduling
@@ -84,6 +90,9 @@
   (error? (run-async (lambda () (spawn-task (lambda () 1) 'bogus-option 1))))
   (error? (run-async (lambda () 1) 'clock 'bogus))
   (error? (run-async (lambda () 1) 'parallelism 0))
+  (error? (run-async (lambda () 1) 'preemption-ticks 0))
+  (error? (run-async (lambda () 1) 'preemption-ticks -1))
+  (error? (run-async (lambda () 1) 'preemption-ticks 'often))
   (error? (run-async (lambda () 1) 'clock 'virtual 'parallelism 2))
   (error? (make-channel -1))
   (error? (run-async (lambda () (channel-put 'not-a-channel 1))))
@@ -122,6 +131,77 @@
                 (task-yield)
                 n)))
     22)
+
+  ;; ---- timed preemption
+
+  ;; Cooperative mode remains the default.  With a bounded engine turn, a
+  ;; CPU-bound root task gives a ready child a scheduler turn.
+  (equal?
+    (list
+      (run-async
+        (lambda ()
+          (let ([ran? (box #f)])
+            (spawn-task (lambda () (set-box! ran? #t)))
+            (async-test-burn 100000)
+            (unbox ran?))))
+      (run-async
+        (lambda ()
+          (let ([ran? (box #f)])
+            (spawn-task (lambda () (set-box! ran? #t)))
+            (async-test-burn 100000)
+            (unbox ran?)))
+        'preemption-ticks 10))
+    '(#f #t))
+
+  ;; Engine expiration preserves values and composes with an explicit async
+  ;; suspension later in the same task.
+  (equal?
+    (call-with-values
+      (lambda ()
+        (run-async
+          (lambda ()
+            (async-test-burn 100000)
+            (async-sleep 1)
+            (async-test-burn 100000)
+            (values 'a 'b 'c))
+          'clock 'virtual
+          'preemption-ticks 20))
+      list)
+    '(a b c))
+
+  ;; Exception handlers and fiber-local parameters survive repeated engine
+  ;; expiration and resumption.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([p (make-thread-parameter 'outer)])
+          (parameterize ([p 'inner])
+            (guard (c [else (list (p) (condition-message c))])
+              (async-test-burn 100000)
+              (error 'preemption-test "boom")))))
+      'preemption-ticks 10)
+    '(inner "boom"))
+
+  ;; async-aware winders run for the user extent, not for timer-driven
+  ;; continuation transfers.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([before 0] [after 0])
+          (async-dynamic-wind
+            (lambda () (set! before (fx+ before 1)))
+            (lambda () (async-test-burn 100000))
+            (lambda () (set! after (fx+ after 1))))
+          (list before after)))
+      'preemption-ticks 10)
+    '(1 1))
+
+  ;; A scheduler entered by preempted user code would nest engines and is
+  ;; rejected before it can capture scheduler internals.
+  (error?
+    (run-async
+      (lambda () (run-async (lambda () 'nested)))
+      'preemption-ticks 10))
 
   ;; ---- timers (virtual clock)
 

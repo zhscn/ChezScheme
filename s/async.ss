@@ -18,9 +18,9 @@
 ;;; tasks on one operating-system thread.  Tasks suspend with shift0-at and
 ;;; are resumed through one-shot resumptions.  Waitables (timers, channels,
 ;;; futures, joins) are expressed as operations with try/block/wrap/nack
-;;; components.  Layer-1..3: cooperative scheduler, dynamic-state capture,
-;;; operations/timers/futures/channels.  libuv-backed I/O plugs in through
-;;; the scheduler's io fields (asyncio.ss).
+;;; components.  The cooperative scheduler optionally bounds user task turns
+;;; with Chez Scheme engines.  libuv-backed I/O plugs in through the
+;;; scheduler's io fields (asyncio.ss).
 
 ;;; ----------------------------------------------------------- utilities
 
@@ -96,6 +96,12 @@
 (define $async-scheduler
   ($make-thread-parameter #f (lambda (x) x)))
 
+;;; True only while a preemptive scheduler is executing a task engine.  It is
+;;; scheduler-owned state rather than fiber dynamic state, and prevents a
+;;; nested run-async from attempting to nest engines.
+(define $async-engine-active
+  ($make-thread-parameter #f (lambda (x) x)))
+
 ;;; -------------------------------------------------------- sync states
 ;;;
 ;;; A sync state is a box holding one of:
@@ -113,7 +119,7 @@
 ;;; ------------------------------------------------------------ records
 
 (define-record-type (async-scheduler make-async-scheduler% $async-scheduler?)
-  (nongenerative async-scheduler-layer5)
+  (nongenerative async-scheduler-layer6)
   (sealed #t)
   (fields
     (immutable prompt-tag)          ; private continuation-prompt tag
@@ -138,6 +144,8 @@
     (mutable saved-exception-state) ; ambient exception state
     (mutable turn-count $async-scheduler-turn-count $async-scheduler-turn-count-set!)
     (mutable exec-count)
+    (immutable preemption-ticks)   ; #f for cooperative scheduling
+    (mutable preemption-count)
     (mutable suspension-count $async-scheduler-suspension-count $async-scheduler-suspension-count-set!)
     (mutable wakeup-count $async-scheduler-wakeup-count $async-scheduler-wakeup-count-set!)
     (mutable wake-proc)             ; io layer wakeup hook, or #f
@@ -165,7 +173,7 @@
   (fields (immutable deadline) (immutable deliver)))
 
 (define-record-type (async-task make-async-task $async-task?)
-  (nongenerative async-task-layer5)
+  (nongenerative async-task-layer6)
   (sealed #t)
   (fields
     (immutable id)
@@ -173,6 +181,7 @@
     (mutable state)                 ; ready running waiting completed failed canceled
     (mutable entry)                 ; thunk before first run, #f after
     (mutable resumption)            ; resumption procedure while waiting/ready
+    (mutable engine)                ; suspended engine after timed preemption
     (mutable scheduler)             ; current owner; changes only while ready
     (immutable migratable?)
     (mutable pinned?)               ; captured continuation fixes affinity
@@ -346,11 +355,14 @@
 
 (define install-task-dynamic-state!
   (lambda (sched task)
-    (with-async-mutex (async-scheduler-group-mutex ($async-scheduler-group sched))
-      (async-scheduler-saved-dynamic-state-set! sched (async-snapshot-dynamic-state))
-      (async-scheduler-saved-exception-state-set! sched (current-exception-state))
-      (async-install-dynamic-state! (async-task-dynamic-state task))
-      (current-exception-state (async-task-exception-state task)))
+    (let ([engine-was-active? ($engine-active?)])
+      (with-async-mutex (async-scheduler-group-mutex ($async-scheduler-group sched))
+        (async-scheduler-saved-dynamic-state-set! sched (async-snapshot-dynamic-state))
+        (async-scheduler-saved-exception-state-set! sched (current-exception-state))
+        (async-install-dynamic-state! (async-task-dynamic-state task))
+        (unless engine-was-active? ($engine-reset-thread-state!))
+        (current-exception-state (async-task-exception-state task))))
+    ($async-engine-active #f)
     ($async-scheduler sched)))
 
 (define snapshot-task-dynamic-state!
@@ -729,7 +741,7 @@
                  (let ([id (async-scheduler-group-next-task-id group)])
                    (async-scheduler-group-next-task-id-set! group (fx+ 1 id))
                    id))])
-      (make-async-task id name 'ready entry #f sched migratable? #f
+      (make-async-task id name 'ready entry #f #f sched migratable? #f
         (async-snapshot-dynamic-state)
         (current-exception-state)
         parent-group #f '() #f '() #f #f #f #f #f #f #f #f (make-async-mutex)))))
@@ -791,6 +803,7 @@
              (async-task-state-set! task state)
              (async-task-current-wait-set! task #f)
              (async-task-resumption-set! task #f)
+             (async-task-engine-set! task #f)
              (case state
                [(completed) (async-task-result-values-set! task (cdr outcome))]
                [else (async-task-failure-condition-set! task (cdr outcome))])
@@ -861,7 +874,7 @@
 ;;; --------------------------------------------------------------- scheduler
 
 (define async-make-scheduler
-  (lambda (virtual? group index)
+  (lambda (virtual? group index preemption-ticks)
     (make-async-scheduler%
       (async-scheduler-group-prompt-tag group)
       group index
@@ -869,7 +882,7 @@
       (make-async-queue) (make-async-mutex)
       (if-feature pthreads (make-condition) #f)
       (make-eq-hashtable) 0 0 #f 'created virtual? 0 '() #f #f #f #f
-      0 0 0 0 #f #f #f)))
+      0 0 preemption-ticks 0 0 0 #f #f #f)))
 
 (define async-drain-remote!
   (lambda (sched)
@@ -936,6 +949,47 @@
                         (* (remainder delta 1000000) 1000)
                         (quotient delta 1000000)))))))])))
 
+(define async-engine-expiration-token (list 'async-engine-expired))
+
+;;; Enter only the user task continuation under an engine.  Scheduler queue
+;;; maintenance, polling, callbacks, and dynamic-state installation remain
+;;; outside the engine and therefore cannot be preempted.
+(define async-run-task-step
+  (lambda (sched task)
+    (if (async-task-entry task)
+        (let ([entry (async-task-entry task)])
+          (async-task-pinned?-set! task #t)
+          (async-task-entry-set! task #f)
+          ($control-reset-at (async-scheduler-prompt-tag sched) #t entry))
+        (let ([resumption (async-task-resumption task)]
+              [payload (async-task-payload task)])
+          (async-task-payload-set! task #f)
+          ;; Rewinding captured dynamic-winds is part of the scheduling
+          ;; switch, not a user-level wind entry.
+          (set-sched-switch! sched #t)
+          (resumption payload)))))
+
+(define async-run-task-engine
+  (lambda (sched task ticks)
+    (let* ([saved-engine (async-task-engine task)]
+           [engine (or saved-engine
+                       ($make-engine-with-timer-hooks
+                         (lambda () (async-run-task-step sched task))
+                         (lambda () (set-sched-switch! sched #t))
+                         (lambda () (set-sched-switch! sched #f))))]
+          [old-active ($async-engine-active)])
+      (async-task-engine-set! task #f)
+      ($async-engine-active #t)
+      (when saved-engine (set-sched-switch! sched #t))
+      (let ([outcome
+             (guard (c [else (cons 'internal-escape c)])
+               (engine ticks
+                 (lambda (remaining outcome) outcome)
+                 (lambda (next-engine)
+                   (cons async-engine-expiration-token next-engine))))])
+        ($async-engine-active old-active)
+        outcome))))
+
 (define async-run-task-once
   (lambda (sched task)
     (async-scheduler-exec-count-set! sched (fx+ 1 (async-scheduler-exec-count sched)))
@@ -948,26 +1002,27 @@
           (async-task-state-set! task 'running)
           (async-scheduler-current-task-set! sched task)
           (install-task-dynamic-state! sched task)
-          (let ([outcome
-                  (guard (c [else (cons 'internal-escape c)])
-                    (if (async-task-entry task)
-                        (let ([entry (async-task-entry task)])
-                          (async-task-pinned?-set! task #t)
-                          (async-task-entry-set! task #f)
-                          ($control-reset-at (async-scheduler-prompt-tag sched) #t
-                            entry))
-                        (let ([resumption (async-task-resumption task)]
-                              [payload (async-task-payload task)])
-                          (async-task-payload-set! task #f)
-                          ;; rewinding captured dynamic-winds is part of the
-                          ;; scheduling switch, not a user-level wind entry
-                          (set-sched-switch! sched #t)
-                          (resumption payload))))])
+          (let* ([ticks (async-scheduler-preemption-ticks sched)]
+                 [outcome
+                  (if ticks
+                      (async-run-task-engine sched task ticks)
+                      (guard (c [else (cons 'internal-escape c)])
+                        (async-run-task-step sched task)))])
+            (when (and (pair? outcome)
+                       (eq? (car outcome) async-engine-expiration-token))
+              (snapshot-task-dynamic-state! sched task))
             (set-sched-switch! sched #f)
             (async-scheduler-current-task-set! sched #f)
             (restore-scheduler-dynamic-state! sched)
             (cond
               [(eq? outcome async-suspend-token) (void)]
+              [(and (pair? outcome)
+                    (eq? (car outcome) async-engine-expiration-token))
+               (async-task-engine-set! task (cdr outcome))
+               (async-task-state-set! task 'ready)
+               (async-scheduler-preemption-count-set! sched
+                 (fx+ 1 (async-scheduler-preemption-count sched)))
+               (async-queue-push! (async-scheduler-next-queue sched) task)]
               [(and (pair? outcome) (eq? (car outcome) 'done))
                ;; a task that observes cancellation and still returns has
                ;; handled the request cooperatively
@@ -1549,7 +1604,7 @@
 (set-who! run-async
   (lambda (thunk . options)
     (unless (procedure? thunk) ($oops who "~s is not a procedure" thunk))
-    (let ([clock 'real] [parallelism 1])
+    (let ([clock 'real] [parallelism 1] [preemption-ticks #f])
       (let loop ([opts options])
         (unless (null? opts)
           (unless (and (pair? (cdr opts)))
@@ -1564,8 +1619,15 @@
                (unless (and (fixnum? v) (fx> v 0))
                  ($oops who "invalid parallelism ~s" v))
                (set! parallelism v)]
+              [(eq? k 'preemption-ticks)
+               (unless (or (not v) (and (fixnum? v) (fx> v 0)))
+                 ($oops who "invalid preemption tick count ~s" v))
+               (set! preemption-ticks v)]
               [else ($oops who "unrecognized run-async option ~s" k)]))
           (loop (cddr opts))))
+      (when (or ($async-engine-active)
+                (and preemption-ticks ($engine-active?)))
+        ($oops who "cannot nest an async scheduler inside a task engine"))
       (when (and (eq? clock 'virtual) (fx> parallelism 1))
         ($oops who "parallel scheduler groups require a real clock"))
       (when (fx> parallelism 1)
@@ -1580,7 +1642,8 @@
              [schedulers (make-vector parallelism)])
         (do ([i 0 (fx+ i 1)]) ((fx= i parallelism))
           (vector-set! schedulers i
-            (async-make-scheduler (eq? clock 'virtual) group i)))
+            (async-make-scheduler
+              (eq? clock 'virtual) group i preemption-ticks)))
         (async-scheduler-group-schedulers-set! group schedulers)
         (let* ([sched (vector-ref schedulers 0)]
                [root-group (make-async-group #f)]
