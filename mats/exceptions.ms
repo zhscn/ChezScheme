@@ -1232,6 +1232,25 @@
                       (set! saved k)
                       0)))])
            (list first (saved 1) (saved 2))))))
+  ;; Composing a continuation onto a dynamic context must not reinterpret an
+  ;; ordinary empty list in the captured stack as a winder list.
+  (equal? '(7 6 5 4 3 2 1 0)
+    ($control-eval
+      '(let ([saved #f])
+         (let ([first
+                (reset
+                  (let loop ([i 0] [values '()])
+                    (if (= i 8)
+                        values
+                        (let ([value
+                               (shift k
+                                 (set! saved k)
+                                 'suspended)])
+                          (loop (+ i 1) (cons value values))))))])
+           (let loop ([i 0] [result first])
+             (if (= i 8)
+                 result
+                 (loop (+ i 1) (saved i))))))))
   (equal?
     '(enter exit body enter exit)
     ($control-eval

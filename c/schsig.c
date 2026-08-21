@@ -537,9 +537,15 @@ static ptr compose_continuation_stack_value(compose_context *context, ptr value)
     ptr mapped, scan, slow;
     uptr steps;
 
-    if (value == context->old_winders)
+    /* The empty list is also an ordinary Scheme value. Rewriting every live
+     * occurrence would turn unrelated user data into the composed dynamic
+     * context when the prompt boundary has no winders or attachments. */
+    if (context->old_winders != Snil
+        && value == context->old_winders)
         return context->new_winders;
-    if (value == context->old_attachments)
+    if (context->old_attachments != Snil
+        && context->old_attachments != Sfalse
+        && value == context->old_attachments)
         return context->new_attachments;
     mapped = compose_memo_ref(&context->winder_lists, value);
     if (mapped != (ptr)0)

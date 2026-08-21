@@ -585,6 +585,7 @@
         ($oops who "not in an async scheduler"))
       (when ($async-scheduler-virtual? sched)
         ($oops who "asynchronous I/O is not available on a virtual-clock scheduler"))
+      ($async-pin-current-task!)
       (or ($async-scheduler-io-state sched)
           (let ([loop (aio-loop-open)])
             (when (= loop 0)

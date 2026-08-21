@@ -15,6 +15,7 @@
 
 (begin
 (set! $async-new-thread-parameter (lambda (index initval size) (void)))
+(set! $async-pin-current-task! (lambda () (void)))
 
 (define-who make-parameter
   (case-lambda

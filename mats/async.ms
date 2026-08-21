@@ -39,6 +39,24 @@
                          (lambda () (task-join (spawn-task (lambda () (values)))))
                          list)))
     '())
+  (equal? (run-async
+            (lambda ()
+              (let ([tasks
+                     (let loop ([i 0] [tasks '()])
+                       (if (fx= i 8)
+                           tasks
+                           (loop (fx+ i 1)
+                             (cons
+                               (spawn-task
+                                 (let ([i i])
+                                   (lambda () (task-yield) i)))
+                               tasks))))])
+                (let loop ([tasks tasks] [values '()])
+                  (if (null? tasks)
+                      values
+                      (loop (cdr tasks)
+                        (cons (task-join (car tasks)) values)))))))
+    '(0 1 2 3 4 5 6 7))
 
   ;; user prompts cannot intercept scheduler suspension
   (equal? (reset (run-async (lambda () (task-yield) 'private-prompt)))
@@ -65,6 +83,8 @@
   (error? (run-async (lambda () (spawn-task (lambda () 1) 'name))))
   (error? (run-async (lambda () (spawn-task (lambda () 1) 'bogus-option 1))))
   (error? (run-async (lambda () 1) 'clock 'bogus))
+  (error? (run-async (lambda () 1) 'parallelism 0))
+  (error? (run-async (lambda () 1) 'clock 'virtual 'parallelism 2))
   (error? (make-channel -1))
   (error? (run-async (lambda () (channel-put 'not-a-channel 1))))
   (error? (run-async (lambda () (task-join 'not-a-task))))
@@ -658,6 +678,130 @@
                 (future-get f))))
     'from-thread)
 
+  ;; ---- scheduler groups
+
+  (or (not (threaded?))
+      (equal?
+        (run-async
+          (lambda ()
+            (let* ([n 6]
+                   [tasks (make-vector n)]
+                   [results (make-vector n #f)]
+                   [gate (make-future)]
+                   [mutex (make-mutex)]
+                   [condition (make-condition)]
+                   [parameter (make-thread-parameter 'unset)]
+                   [started 0])
+              (do ([i 0 (fx+ i 1)]) ((fx= i n))
+                (vector-set! tasks i
+                  (spawn-task
+                    (let ([i i])
+                      (lambda ()
+                        (let ([scheduler (current-async-scheduler)]
+                              [thread-id (get-thread-id)])
+                          (parameter i)
+                          ;; Hold one task on each scheduler until all three
+                          ;; scheduler threads have entered user code.
+                          (with-mutex mutex
+                            (set! started (fx+ started 1))
+                            (when (fx= started 3)
+                              (condition-broadcast condition))
+                            (let loop ()
+                              (unless (fx>= started 3)
+                                (condition-wait condition mutex)
+                                (loop))))
+                          (future-get gate)
+                          (task-yield)
+                          (vector-set! results i
+                            (list (async-scheduler? scheduler)
+                                  (eq? (task-scheduler (current-async-task))
+                                       (current-async-scheduler))
+                                  (fx= (parameter) i)
+                                  (and (eq? scheduler
+                                            (current-async-scheduler))
+                                       (fx= thread-id (get-thread-id))))))))
+                    'migratable? #t)))
+              (let loop ()
+                (unless (with-mutex mutex (fx= started n))
+                  (task-yield)
+                  (loop)))
+              ;; Completing a future on the main scheduler remotely wakes
+              ;; tasks pinned to worker schedulers.
+              (future-fulfil! gate 'go)
+              (do ([i 0 (fx+ i 1)]) ((fx= i n))
+                (task-join (vector-ref tasks i)))
+              (let ([ids (make-eqv-hashtable)]
+                    [schedulers (vector-map task-scheduler tasks)])
+                (vector-for-each
+                  (lambda (task) (hashtable-set! ids (task-id task) #t))
+                  tasks)
+                (list
+                  (for-all (lambda (r) (equal? r '(#t #t #t #t)))
+                    (vector->list results))
+                  (fx= (hashtable-size ids) n)
+                  (exists
+                    (lambda (scheduler)
+                      (not (eq? scheduler (vector-ref schedulers 0))))
+                    (cdr (vector->list schedulers)))))))
+          'parallelism 3)
+        '(#t #t #t)))
+
+  ;; Channel delivery can cross scheduler threads while each continuation
+  ;; remains on the scheduler where it first ran.
+  (or (not (threaded?))
+      (equal?
+        (run-async
+          (lambda ()
+            (let ([ch (make-channel)]
+                  [mutex (make-mutex)]
+                  [condition (make-condition)]
+                  [started 0])
+              (define rendezvous
+                (lambda ()
+                  (with-mutex mutex
+                    (set! started (fx+ started 1))
+                    (when (fx= started 2)
+                      (condition-broadcast condition))
+                    (let loop ()
+                      (unless (fx= started 2)
+                        (condition-wait condition mutex)
+                        (loop))))))
+              (let ([consumer
+                     (spawn-task
+                       (lambda () (rendezvous) (channel-get ch))
+                       'migratable? #t)]
+                    [producer
+                     (spawn-task
+                       (lambda () (rendezvous) (channel-put ch 'cross-thread))
+                       'migratable? #t)])
+                (let ([value (task-join consumer)])
+                  (task-join producer)
+                  value))))
+          'parallelism 2)
+        'cross-thread))
+
+  ;; Cancellation published from another scheduler wakes a pinned waiter on
+  ;; its owning scheduler and preserves the cancellation reason.
+  (or (not (threaded?))
+      (equal?
+        (run-async
+          (lambda ()
+            (let ([started (make-future)] [blocked (make-future)])
+              (let ([task
+                     (spawn-task
+                       (lambda ()
+                         (future-fulfil! started)
+                         (future-get blocked))
+                       'migratable? #t)])
+                (future-get started)
+                (task-cancel! task 'remote-cancel)
+                (guard (c
+                         [(async-cancellation-condition? c)
+                          (async-cancellation-reason c)])
+                  (task-join task)))))
+          'parallelism 4)
+        'remote-cancel))
+
   ;; ---- observability
 
   (equal? (run-async
@@ -668,11 +812,13 @@
                 (task-yield)
                 (list (async-scheduler? sched)
                       (task? me)
+                      (eq? (task-scheduler me) sched)
                       (> (async-scheduler-turn-count sched) 0)
                       (> (async-scheduler-suspension-count sched) 0)
                       (>= (async-scheduler-task-count sched) 1)
                       (> (async-scheduler-wakeup-count sched) 0)))))
-    '(#t #t #t #t #t #t))
+    '(#t #t #t #t #t #t #t))
+  (error? (task-scheduler 'not-a-task))
   (equal? (current-async-task) #f)
   (equal? (current-async-scheduler) #f)
   (equal? (run-async

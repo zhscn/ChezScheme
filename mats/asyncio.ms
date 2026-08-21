@@ -88,6 +88,40 @@
                   (and (memv (caddr answer) '(4 6)) #t)))
            answers)))
 
+  ;; Each scheduler owns its libuv loop, and I/O completion resumes a task on
+  ;; the scheduler thread where that task began executing.
+  (or (not (threaded?))
+      (equal?
+        (run-async
+          (lambda ()
+            (let ([tasks (make-vector 2)]
+                  [mutex (make-mutex)]
+                  [condition (make-condition)]
+                  [started 0])
+              (do ([i 0 (fx+ i 1)]) ((fx= i 2))
+                (vector-set! tasks i
+                  (spawn-task
+                    (lambda ()
+                      (let ([scheduler (current-async-scheduler)]
+                            [thread-id (get-thread-id)])
+                        (with-mutex mutex
+                          (set! started (fx+ started 1))
+                          (when (fx= started 2)
+                            (condition-broadcast condition))
+                          (let loop ()
+                            (unless (fx= started 2)
+                              (condition-wait condition mutex)
+                              (loop))))
+                        (let ([answers (dns-lookup "localhost" "80")])
+                          (list (pair? answers)
+                                (eq? scheduler (current-async-scheduler))
+                                (fx= thread-id (get-thread-id))))))
+                    'migratable? #t)))
+              (list (task-join (vector-ref tasks 0))
+                    (task-join (vector-ref tasks 1)))))
+          'parallelism 2)
+        '((#t #t #t) (#t #t #t))))
+
   ;; local-domain streams support accept, bidirectional I/O, and shutdown
 
   (let ([path (asyncio-temp-path "pipe")])
