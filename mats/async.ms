@@ -890,7 +890,7 @@
                 (unless (with-mutex mutex (fx= started n))
                   (task-yield)
                   (loop)))
-              ;; Completing a future publishes parked tasks to the group.
+              ;; Completing a future publishes parked tasks to worker deques.
               (future-fulfil! gate 'go)
               (do ([i 0 (fx+ i 1)]) ((fx= i n))
                 (task-join (vector-ref tasks i)))
@@ -971,8 +971,8 @@
                 'remote-cancel)
               (loop (fx+ i 1))))))
 
-  ;; A cancellation can overtake a normal completion after the waiter has
-  ;; entered the shared ready queue.  Either result may win, and both paths
+  ;; A cancellation can overtake a normal completion after the waiter becomes
+  ;; runnable.  Either result may win, and both paths
   ;; preserve a valid fiber exception context.
   (or (not (threaded?))
       (let loop ([i 0])

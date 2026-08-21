@@ -193,6 +193,8 @@
     (immutable group-index)         ; stable index within the group
     (immutable current-queue)       ; tasks run this turn
     (immutable next-queue)          ; tasks run next turn
+    (mutable work-deque)            ; migratable tasks; owner front, thieves back
+    (immutable work-mutex)
     (immutable remote-queue)        ; cross-thread submissions
     (immutable remote-mutex)
     (immutable remote-cond)
@@ -230,6 +232,7 @@
     (mutable root-task)
     (mutable next-task-id)
     (mutable next-wake-index)
+    (mutable work-count)
     (mutable shutdown?)
     (mutable failure)
     (mutable workers)))
@@ -515,6 +518,106 @@
   (lambda (group)
     (fx> (vector-length (async-scheduler-group-schedulers group)) 1)))
 
+(define async-group-next-wake-target!
+  (lambda (group)
+    (with-async-mutex (async-scheduler-group-mutex group)
+      (let* ([schedulers (async-scheduler-group-schedulers group)]
+             [n (vector-length schedulers)]
+             [i (async-scheduler-group-next-wake-index group)])
+        (async-scheduler-group-next-wake-index-set! group
+          (fxmod (fx+ i 1) n))
+        (vector-ref schedulers i)))))
+
+(define async-work-push!
+  (lambda (sched task)
+    (with-async-mutex (async-scheduler-work-mutex sched)
+      (async-scheduler-work-deque-set! sched
+        (cons task (async-scheduler-work-deque sched)))
+      ;; Publish the count before releasing the deque lock, so a thief cannot
+      ;; remove the task and decrement an as-yet-unpublished count.
+      (let ([group ($async-scheduler-group sched)])
+        (with-async-mutex (async-scheduler-group-mutex group)
+          (async-scheduler-group-work-count-set! group
+            (fx+ 1 (async-scheduler-group-work-count group))))))))
+
+(define async-work-count-down!
+  (lambda (group)
+    (with-async-mutex (async-scheduler-group-mutex group)
+      (async-scheduler-group-work-count-set! group
+        (fx- (async-scheduler-group-work-count group) 1)))))
+
+(define async-work-pop!
+  (lambda (sched)
+    (let ([task
+           (with-async-mutex (async-scheduler-work-mutex sched)
+             (let ([work (async-scheduler-work-deque sched)])
+               (and (pair? work)
+                    (begin
+                      (async-scheduler-work-deque-set! sched (cdr work))
+                      (car work)))))])
+      (when task
+        (async-work-count-down! ($async-scheduler-group sched)))
+      task)))
+
+(define async-list-take-last
+  (lambda (xs)
+    (if (null? (cdr xs))
+        (values (car xs) '())
+        (let-values ([(last prefix) (async-list-take-last (cdr xs))])
+          (values last (cons (car xs) prefix))))))
+
+(define async-work-steal!
+  (lambda (victim)
+    (let ([task
+           (with-async-mutex (async-scheduler-work-mutex victim)
+             (let ([work (async-scheduler-work-deque victim)])
+               (if (null? work)
+                   #f
+                   (let-values ([(task remaining)
+                                 (async-list-take-last work)])
+                     (async-scheduler-work-deque-set! victim remaining)
+                     task))))])
+      (when task
+        (async-work-count-down! ($async-scheduler-group victim)))
+      task)))
+
+(define async-adopt-work!
+  (lambda (sched task)
+    (let ([old (async-task-scheduler task)])
+      (unless (eq? old sched)
+        (let ([group ($async-scheduler-group sched)])
+          (with-async-mutex (async-scheduler-group-mutex group)
+            (sched-registry-remove/raw! old task)
+            (async-task-scheduler-set! task sched)
+            (sched-registry-add/raw! sched task)))))
+    task))
+
+(define async-take-work!
+  (lambda (sched)
+    (let ([local (async-work-pop! sched)])
+      (if local
+          (async-adopt-work! sched local)
+          (let* ([group ($async-scheduler-group sched)]
+                 [schedulers (async-scheduler-group-schedulers group)]
+                 [n (vector-length schedulers)]
+                 [start (async-scheduler-group-index sched)])
+            (let loop ([offset 1])
+              (if (fx= offset n)
+                  #f
+                  (let ([task
+                         (async-work-steal!
+                           (vector-ref schedulers
+                             (fxmod (fx+ start offset) n)))])
+                    (if task
+                        (async-adopt-work! sched task)
+                        (loop (fx+ offset 1)))))))))))
+
+(define async-work-submit!
+  (lambda (task preferred)
+    (async-work-push! preferred task)
+    (async-wake-scheduler
+      (async-group-next-wake-target! (async-task-scheduler-group task)))))
+
 (define async-group-wake!
   (lambda (group)
     (if-feature pthreads
@@ -582,7 +685,7 @@
              ;; migrate before resumption.
              (let ([payload (async-task-payload task)])
                (not (and (pair? payload) (eq? (car payload) 'raise)))))
-        (async-group-submit! task)
+        (async-work-submit! task completion-sched)
         (if (and (async-scheduler-owner-thread completion-sched)
                  (fx= (async-scheduler-owner-thread completion-sched)
                       (get-thread-id)))
@@ -1071,6 +1174,7 @@
       (async-scheduler-group-prompt-tag group)
       group index
       (make-async-queue) (make-async-queue)
+      '() (make-async-mutex)
       (make-async-queue) (make-async-mutex)
       (if-feature pthreads (make-condition) #f)
       (make-eq-hashtable) 0 0 #f 'created virtual? 0 '() #f #f #f #f
@@ -1108,6 +1212,7 @@
                            (and
                              (async-queue-empty?
                                (async-scheduler-group-ready-queue group))
+                             (fx= (async-scheduler-group-work-count group) 0)
                              (with-mutex
                                (async-scheduler-remote-mutex sched)
                                (async-queue-empty?
@@ -1127,6 +1232,7 @@
                         (and
                           (async-queue-empty?
                             (async-scheduler-group-ready-queue group))
+                          (fx= (async-scheduler-group-work-count group) 0)
                           (not (async-scheduler-group-shutdown? group)))))
              (if (null? ts)
                  (condition-wait (async-scheduler-remote-cond sched)
@@ -1297,9 +1403,12 @@
       (let loop ()
         (async-drain-remote! sched)
         (when (async-group-parallel? ($async-scheduler-group sched))
-          (let ([task (async-group-take-ready! sched)])
+          (let ([task (async-take-work! sched)])
             (when task
-              (async-queue-push! (async-scheduler-next-queue sched) task))))
+              (if (and (eq? (async-task-state task) 'ready)
+                       (async-task-group-runnable? task))
+                  (async-queue-push! (async-scheduler-next-queue sched) task)
+                  (async-remote-submit (async-task-scheduler task) task)))))
         (async-fire-due-timers! sched)
         (let ([poll (async-scheduler-poll-proc sched)])
           (when poll (poll sched #f)))
@@ -1831,7 +1940,7 @@
             (sched-registry-add! sched task)
             (if (and migratable?
                      (async-group-parallel? ($async-scheduler-group sched)))
-                (async-group-submit! task)
+                (async-work-submit! task sched)
                 (async-queue-push! (async-scheduler-next-queue sched) task))
             task))))))
 
@@ -1932,7 +2041,7 @@
                       (control:make-continuation-prompt-tag 'async-scheduler-group)
                       (make-async-mutex)
                       (if-feature pthreads (make-condition) #f)
-                      (make-async-queue) '#() #f 0 0 #f #f '())]
+                      (make-async-queue) '#() #f 0 0 0 #f #f '())]
              [schedulers (make-vector parallelism)])
         (do ([i 0 (fx+ i 1)]) ((fx= i parallelism))
           (vector-set! schedulers i
