@@ -1979,6 +1979,7 @@
   ($as-time-goes-by [flags])
   ($async-io-shutdown [flags])
   ($async-monotonic-us [flags])
+  ($async-new-thread-parameter [flags])
   ($async-scheduler-io-state [flags])
   ($async-scheduler-io-state-set! [flags])
   ($async-scheduler-poll-proc-set! [flags])

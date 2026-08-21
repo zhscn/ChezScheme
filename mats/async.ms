@@ -481,6 +481,31 @@
                     (list inherited (p)))))))
     '(in-root in-root))
 
+  ;; a thread parameter allocated by one task starts at its initial value in
+  ;; siblings whose snapshots predate the allocation
+  (equal? (run-async
+            (lambda ()
+              (let ([pbox (box #f)])
+                (let ([a (spawn-task
+                           (lambda ()
+                             (let ([p (make-thread-parameter 'initial)])
+                               (set-box! pbox p)
+                               (p 'task-a)
+                               (task-yield)
+                               (p))))]
+                      [b (spawn-task
+                           (lambda ()
+                             (task-yield)
+                             ((unbox pbox))))])
+                  (list (task-join a) (task-join b))))))
+    '(task-a initial))
+
+  ;; scheduler exit restores the caller's thread-parameter state
+  (equal? (let ([p (make-thread-parameter 'outside)])
+            (run-async (lambda () (p 'inside) (task-yield) (p)))
+            (p))
+    'outside)
+
   ;; ordinary parameterize state rides each task's continuation
   (equal? (let ([p (make-parameter 'default)])
             (run-async
@@ -493,6 +518,25 @@
                     (task-yield)
                     (list (p) (task-join t)))))))
     '(root child))
+
+  ;; exception handler stacks are fiber-local across scheduler switches
+  (equal? (run-async
+            (lambda ()
+              (let ([root-state
+                     (create-exception-state (lambda (c) 'root-handler))]
+                    [child-state
+                     (create-exception-state (lambda (c) 'child-handler))])
+                (current-exception-state root-state)
+                (let ([child
+                       (spawn-task
+                         (lambda ()
+                           (current-exception-state child-state)
+                           (task-yield)
+                           (raise-continuable 'child-probe)))])
+                  (task-yield)
+                  (list (raise-continuable 'root-probe)
+                        (task-join child))))))
+    '(root-handler child-handler))
 
   ;; ---- remote wakeup from a plain thread
 

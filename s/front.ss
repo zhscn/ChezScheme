@@ -14,6 +14,8 @@
 ;;; limitations under the License.
 
 (begin
+(set! $async-new-thread-parameter (lambda (index initval size) (void)))
+
 (define-who make-parameter
   (case-lambda
     [(init guard) (#2%make-parameter init guard)]
@@ -69,6 +71,10 @@
                   (car index)
                   initval))
               ($thread-list))
+            ($async-new-thread-parameter
+              (car index)
+              initval
+              (vector-length ($tc-field 'parameters ($tc))))
             (index-guardian index)
             index)))))
   (define set-thread-parameter!

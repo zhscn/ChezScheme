@@ -233,6 +233,41 @@
               (vector-set! cur i (vector-ref snap i))))))
       (void))))
 
+(define async-set-dynamic-state-slot
+  (lambda (snap index initval size)
+    (and snap
+         (let ([snap
+                (if (fx< (vector-length snap) size)
+                    (let ([new (make-vector size)])
+                      (do ([i 0 (fx+ i 1)])
+                          ((fx= i (vector-length snap)))
+                        (vector-set! new i (vector-ref snap i)))
+                      new)
+                    snap)])
+           (vector-set! snap index initval)
+           snap))))
+
+;;; A thread parameter allocated while fibers are active introduces a new or
+;;; reused vector slot.  Give every saved fiber the parameter's initial value;
+;;; the allocating fiber's subsequent mutations are captured normally.
+(define async-new-thread-parameter
+  (lambda (index initval size)
+    (let ([sched ($async-scheduler)])
+      (when ($async-scheduler? sched)
+        (async-scheduler-saved-dynamic-state-set! sched
+          (async-set-dynamic-state-slot
+            (async-scheduler-saved-dynamic-state sched)
+            index initval size))
+        (let-values ([(ids tasks)
+                      (hashtable-entries (async-scheduler-tasks sched))])
+          (vector-for-each
+            (lambda (task)
+              (async-task-dynamic-state-set! task
+                (async-set-dynamic-state-slot
+                  (async-task-dynamic-state task)
+                  index initval size)))
+            tasks))))))
+
 ;;; ------------------------------------------- scheduler/task internal helpers
 
 
@@ -1360,6 +1395,8 @@
 
 ;;; Hooks consumed by asyncio.ss.  $async-io-shutdown is replaced by the io
 ;;; layer's real shutdown procedure when that file is loaded.
+(set! $async-new-thread-parameter async-new-thread-parameter)
+
 (set! $async-io-shutdown (lambda (sched) (void)))
 
 (set! $async-scheduler-io-state
