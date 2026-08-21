@@ -30,6 +30,11 @@
       (unless (fx= i n)
         (loop (fx+ i 1))))))
 
+(define asyncio-open-fd-count
+  (lambda ()
+    (and (file-exists? "/proc/self/fd")
+         (length (directory-list "/proc/self/fd")))))
+
 (mat asyncio
 
   ;; conditions and argument validation
@@ -77,6 +82,72 @@
       (asyncio-delete-if-present path)
       (equal? result '(11 "hello async" #t 11))))
 
+  ;; Implicit file positions are serialized across concurrent operations.
+  (let ([path (asyncio-temp-path "concurrent-offset")])
+    (asyncio-delete-if-present path)
+    (let ([result
+           (run-async
+             (lambda ()
+               (let* ([file (file-open path '(write create truncate))]
+                      [a (spawn-task
+                           (lambda ()
+                             (file-write file (string->utf8 "aaaa"))))]
+                      [b (spawn-task
+                           (lambda ()
+                             (file-write file (string->utf8 "bbbb"))))])
+                 (task-join a)
+                 (task-join b)
+                 (file-close file)
+                 (cdr (assq 'size (file-stat path))))))])
+      (asyncio-delete-if-present path)
+      (= result 8)))
+
+  ;; Canceling an operation while it is queued does not submit it later.
+  (let ([path (asyncio-temp-path "queued-cancel")]
+        [payload (make-bytevector (* 1024 1024) 7)])
+    (asyncio-delete-if-present path)
+    (let ([result
+           (run-async
+             (lambda ()
+               (let* ([file (file-open path '(write create truncate))]
+                      [first (spawn-task (lambda () (file-write file payload)))]
+                      [withdrawn
+                       (spawn-task
+                         (lambda ()
+                           (file-write file (string->utf8 "late"))))])
+                 (task-yield)
+                 (task-cancel! withdrawn)
+                 (guard (c [(async-cancellation-condition? c) (void)])
+                   (task-join withdrawn))
+                 (task-join first)
+                 (file-close file)
+                 (cdr (assq 'size (file-stat path))))))])
+      (asyncio-delete-if-present path)
+      (= result (bytevector-length payload))))
+
+  ;; A successful open result is closed when cancellation wins before the
+  ;; scheduler dispatches the completion.
+  (let ([before (asyncio-open-fd-count)])
+    (or (not before)
+        (begin
+          (run-async
+            (lambda ()
+              ;; Warm the libuv worker pool before opening the cancellation
+              ;; window measured below.
+              (file-stat "/dev/null")
+              (do ([i 0 (fx+ i 1)]) ((fx= i 16))
+                (let ([task
+                       (spawn-task
+                         (lambda () (file-open "/dev/null" '(read))))])
+                  (task-yield)
+                  (sleep (make-time 'time-duration 10000000 0))
+                  (task-cancel! task)
+                  (guard (c [(async-cancellation-condition? c) (void)])
+                    (let ([file (task-join task)])
+                      (file-close file)))))))
+          (let ([after (asyncio-open-fd-count)])
+            (and after (<= after (+ before 1)))))))
+
   ;; File adapters preserve port buffering, position, EOF, and ownership.
 
   (let ([path (asyncio-temp-path "file-port")]
@@ -107,6 +178,24 @@
       (asyncio-delete-if-present path)
       (equal? result
         (list #t (bytevector-length payload) payload #t #t 'closed))))
+
+  ;; Operations created before ownership transfer are rejected when they run.
+  (let ([path (asyncio-temp-path "file-operation-owner")])
+    (asyncio-delete-if-present path)
+    (let ([result
+           (run-async
+             (lambda ()
+               (let* ([file (file-open path '(write create truncate))]
+                      [op (file-write-operation file (bytevector 1))]
+                      [port (async-file->binary-output-port file)]
+                      [rejected?
+                       (guard (c [else #t])
+                         (perform-operation op)
+                         #f)])
+                 (close-port port)
+                 rejected?)))])
+      (asyncio-delete-if-present path)
+      result))
 
   ;; filesystem failures retain operation and path information
 
@@ -166,6 +255,53 @@
                     (task-join (vector-ref tasks 1)))))
           'parallelism 2)
         '((#t #t #t) (#t #t #t))))
+
+  ;; A handle can only be operated by the scheduler that owns its libuv loop.
+  (or (not (threaded?))
+      (let ([path (asyncio-temp-path "foreign-owner")])
+        (asyncio-delete-if-present path)
+        (let ([result
+               (run-async
+                 (lambda ()
+                   (let* ([listener (pipe-listen path)]
+                          [owner (current-async-scheduler)]
+                          [n 4]
+                          [infos (make-vector n)]
+                          [gates (make-vector n)]
+                          [tasks (make-vector n)]
+                          [servers (make-vector n)])
+                     (do ([i 0 (fx+ i 1)]) ((fx= i n))
+                       (let ([info (make-future)] [gate (make-future)])
+                         (vector-set! infos i info)
+                         (vector-set! gates i gate)
+                         (vector-set! tasks i
+                           (spawn-task
+                             (lambda ()
+                               (let ([stream (pipe-connect path)])
+                                 (future-fulfil! info
+                                   (current-async-scheduler) stream)
+                                 (future-get gate)
+                                 (stream-close stream)))
+                             'migratable? #t))))
+                     (do ([i 0 (fx+ i 1)]) ((fx= i n))
+                       (vector-set! servers i (tcp-accept listener)))
+                     (let ([foreign 0] [rejected 0])
+                       (do ([i 0 (fx+ i 1)]) ((fx= i n))
+                         (let-values ([(sched stream)
+                                      (future-get (vector-ref infos i))])
+                           (unless (eq? sched owner)
+                             (set! foreign (fx+ foreign 1))
+                             (guard (c [else (set! rejected (fx+ rejected 1))])
+                               (stream-write stream (bytevector 1))))))
+                       (do ([i 0 (fx+ i 1)]) ((fx= i n))
+                         (future-fulfil! (vector-ref gates i))
+                         (task-join (vector-ref tasks i))
+                         (stream-close (vector-ref servers i)))
+                       (tcp-listener-close listener)
+                       (and (fx> foreign 0) (fx= foreign rejected)))))
+                 'parallelism 2)])
+          (asyncio-delete-if-present path)
+          result)))
 
   ;; local-domain streams support accept, bidirectional I/O, and shutdown
 
@@ -232,6 +368,31 @@
                          (port-closed? port))))))])
       (asyncio-delete-if-present path)
       (equal? result '(#t ("ping" #t #t) "reply" #t))))
+
+  ;; Stream operations recheck ownership when performed, not only when they
+  ;; are constructed.
+  (let ([path (asyncio-temp-path "stream-operation-owner")])
+    (asyncio-delete-if-present path)
+    (let ([result
+           (run-async
+             (lambda ()
+               (let* ([listener (pipe-listen path)]
+                      [connector
+                       (spawn-task (lambda () (pipe-connect path)))]
+                      [server (tcp-accept listener)]
+                      [client (task-join connector)]
+                      [op (stream-read-operation server)]
+                      [port (async-stream->binary-input-port server)]
+                      [rejected?
+                       (guard (c [else #t])
+                         (perform-operation op)
+                         #f)])
+                 (close-port port)
+                 (stream-close client)
+                 (tcp-listener-close listener)
+                 rejected?)))])
+      (asyncio-delete-if-present path)
+      result))
 
   ;; A stream input port retains a libuv read chunk that is larger than the
   ;; destination supplied by a particular port read.

@@ -170,7 +170,7 @@
 (define-record-type (async-timer make-async-timer async-timer?)
   (nongenerative)
   (sealed #t)
-  (fields (immutable deadline) (immutable deliver)))
+  (fields (immutable deadline) (immutable deliver-box)))
 
 (define-record-type (async-task make-async-task $async-task?)
   (nongenerative async-task-layer6)
@@ -464,11 +464,14 @@
 (define $async-deliver-task
   (lambda (task payload)
     (let ([sched (async-task-scheduler task)])
-      (async-task-payload-set! task payload)
-      (async-task-current-wait-set! task #f)
-      (async-task-nack-thunk-set! task #f)
-      (async-task-state-set! task 'ready)
-      ($async-scheduler-wakeup-count-set! sched (fx+ 1 ($async-scheduler-wakeup-count sched)))
+      (with-async-mutex (async-task-mutex task)
+        (async-task-payload-set! task payload)
+        (async-task-current-wait-set! task #f)
+        (async-task-nack-thunk-set! task #f)
+        (async-task-state-set! task 'ready))
+      (with-async-mutex (async-scheduler-remote-mutex sched)
+        ($async-scheduler-wakeup-count-set! sched
+          (fx+ 1 ($async-scheduler-wakeup-count sched))))
       (if (and (async-task-migratable? task)
                (not (async-task-pinned? task))
                (async-group-parallel? ($async-scheduler-group sched)))
@@ -569,7 +572,14 @@
                   (cons (cons ss deliver) (async-task-group-waiters grp)))
                 (list 'task-group)))))
       (lambda (vals) vals)
-      (lambda (ss) (void)))))
+      (lambda (ss)
+        (with-async-mutex (async-task-group-mutex grp)
+          (async-task-group-waiters-set! grp
+            (let loop ([ws (async-task-group-waiters grp)])
+              (cond
+                [(null? ws) '()]
+                [(eq? (caar ws) ss) (cdr ws)]
+                [else (cons (car ws) (loop (cdr ws)))]))))))))
 
 
 
@@ -627,13 +637,13 @@
 
 (define async-schedule-timer!
   (lambda (sched deadline deliver)
-    (let ([timer (make-async-timer deadline deliver)])
+    (let ([timer (make-async-timer deadline (box deliver))])
       (let loop ([ts (async-scheduler-timers sched)] [acc '()])
         (if (and (pair? ts) (<= (async-timer-deadline (car ts)) deadline))
             (loop (cdr ts) (cons (car ts) acc))
             (async-scheduler-timers-set! sched
-              (append-reverse acc (cons timer ts))))))
-    (void)))
+              (append-reverse acc (cons timer ts)))))
+      timer)))
 
 (define append-reverse
   (lambda (ls tail)
@@ -648,7 +658,10 @@
                      (<= (async-timer-deadline (car ts)) now))
             (let ([timer (car ts)])
               (async-scheduler-timers-set! sched (cdr ts))
-              ((async-timer-deliver timer) (cons 'values '()))
+              (let* ([deliver-box (async-timer-deliver-box timer)]
+                     [deliver (unbox deliver-box)])
+                (when (and deliver (box-cas! deliver-box deliver #f))
+                  (deliver (cons 'values '()))))
               (loop))))))))
 
 
@@ -658,13 +671,15 @@
 
 (define future-complete!
   (lambda (f payload)
-    (with-async-mutex (async-future-mutex f)
-      (unless (box-cas! (async-future-state f) 'waiting 'claimed)
-        ($oops 'future-fulfil! "future is already fulfilled"))
-      (let ([waiters (async-future-waiters f)])
-        (async-future-waiters-set! f '())
-        (set-box! (async-future-state f) (cons 'done payload))
-        (for-each (lambda (w) ((cdr w) payload)) waiters)))))
+    (let ([waiters
+           (with-async-mutex (async-future-mutex f)
+             (unless (box-cas! (async-future-state f) 'waiting 'claimed)
+               ($oops 'future-fulfil! "future is already fulfilled"))
+             (let ([waiters (async-future-waiters f)])
+               (async-future-waiters-set! f '())
+               (set-box! (async-future-state f) (cons 'done payload))
+               waiters))])
+      (for-each (lambda (w) ((cdr w) payload)) waiters))))
 
 
 
@@ -859,7 +874,14 @@
               (begin (deliver payload) #f)
               (list 'join (async-task-id task)))))
       (lambda (vals) vals)
-      (lambda (ss) (void)))))
+      (lambda (ss)
+        (with-async-mutex (async-task-mutex task)
+          (async-task-join-waiters-set! task
+            (let loop ([ws (async-task-join-waiters task)])
+              (cond
+                [(null? ws) '()]
+                [(eq? (caar ws) ss) (cdr ws)]
+                [else (cons (car ws) (loop (cdr ws)))]))))))))
 
 
 ;;; ------------------------------------------------------------- cancellation
@@ -929,18 +951,19 @@
        (if-feature pthreads
          (let ([ts (async-scheduler-timers sched)])
            (with-mutex (async-scheduler-remote-mutex sched)
-             (if (null? ts)
-                 (condition-wait (async-scheduler-remote-cond sched)
-                                 (async-scheduler-remote-mutex sched))
-                 (let* ([deadline (async-timer-deadline (car ts))]
-                        [delta (max 0 (fx- deadline (async-monotonic-us)))]
-                        [timeout (add-duration (current-time)
-                                   (make-time 'time-duration
-                                     (* (remainder delta 1000000) 1000)
-                                     (quotient delta 1000000)))])
+             (when (async-queue-empty? (async-scheduler-remote-queue sched))
+               (if (null? ts)
                    (condition-wait (async-scheduler-remote-cond sched)
-                                   (async-scheduler-remote-mutex sched)
-                                   timeout)))))
+                                   (async-scheduler-remote-mutex sched))
+                   (let* ([deadline (async-timer-deadline (car ts))]
+                          [delta (max 0 (fx- deadline (async-monotonic-us)))]
+                          [timeout (add-duration (current-time)
+                                     (make-time 'time-duration
+                                       (* (remainder delta 1000000) 1000)
+                                       (quotient delta 1000000)))])
+                     (condition-wait (async-scheduler-remote-cond sched)
+                                     (async-scheduler-remote-mutex sched)
+                                     timeout))))))
          (let ([ts (async-scheduler-timers sched)])
            (unless (null? ts)
              (let* ([deadline (async-timer-deadline (car ts))]
@@ -999,6 +1022,11 @@
         (terminate-task! sched task 'canceled
           (cons 'raise (task-cancellation-condition task)))
         (begin
+          (when (and (not (async-task-entry task))
+                     (task-cancel-requested? task)
+                     (not (async-task-cancel-shield? task)))
+            (async-task-payload-set! task
+              (cons 'raise (task-cancellation-condition task))))
           (async-task-state-set! task 'running)
           (async-scheduler-current-task-set! sched task)
           (install-task-dynamic-state! sched task)
@@ -1190,12 +1218,17 @@
     (unless (task-group? grp) ($oops who "~s is not a task group" grp))
     (perform-operation (group-empty-operation grp))
     (let loop ()
-      (with-async-mutex (async-task-group-mutex grp)
-        (when (pair? (async-task-group-unobserved grp))
-          (let ([u (car (async-task-group-unobserved grp))])
-            (async-task-group-unobserved-set! grp (cdr (async-task-group-unobserved grp)))
-            (unless (async-task-observed? (car u))
-              (raise (cdr u)))))))
+      (let ([u
+             (with-async-mutex (async-task-group-mutex grp)
+               (and (pair? (async-task-group-unobserved grp))
+                    (let ([u (car (async-task-group-unobserved grp))])
+                      (async-task-group-unobserved-set! grp
+                        (cdr (async-task-group-unobserved grp)))
+                      u)))])
+        (when u
+          (if (async-task-observed? (car u))
+              (loop)
+              (raise (cdr u))))))
     (void)))
 
 (set-who! make-operation
@@ -1334,16 +1367,23 @@
   (lambda (seconds)
     (unless (async-valid-seconds? seconds)
       ($oops who "~s is not a nonnegative real number" seconds))
-    (make-async-operation
-      (lambda (ss)
-        (and (<= seconds 0) (cons 'values '())))
-      (lambda (ss deliver)
-        (let* ([sched ($async-scheduler)]
-               [deadline (+ (sched-now sched) (async-seconds->us seconds))])
-          (async-schedule-timer! sched deadline deliver)
-          (list 'sleep deadline)))
-      (lambda (vals) vals)
-      (lambda (ss) (void)))))
+    (let ([timer-box (box #f)])
+      (make-async-operation
+        (lambda (ss)
+          (and (<= seconds 0) (cons 'values '())))
+        (lambda (ss deliver)
+          (let* ([sched ($async-scheduler)]
+                 [deadline (+ (sched-now sched) (async-seconds->us seconds))]
+                 [timer (async-schedule-timer! sched deadline deliver)])
+            (set-box! timer-box timer)
+            (list 'sleep deadline)))
+        (lambda (vals) vals)
+        (lambda (ss)
+          (let ([timer (unbox timer-box)])
+            (when timer
+              (let* ([deliver-box (async-timer-deliver-box timer)]
+                     [deliver (unbox deliver-box)])
+                (when deliver (box-cas! deliver-box deliver #f))))))))))
 
 (set-who! async-sleep
   (lambda (seconds)
@@ -1382,7 +1422,14 @@
                   (async-future-waiters-set! f (cons (cons ss deliver) (async-future-waiters f)))
                   (list 'future))))))
       (lambda (vals) vals)
-      (lambda (ss) (void)))))
+      (lambda (ss)
+        (with-async-mutex (async-future-mutex f)
+          (async-future-waiters-set! f
+            (let loop ([ws (async-future-waiters f)])
+              (cond
+                [(null? ws) '()]
+                [(eq? (caar ws) ss) (cdr ws)]
+                [else (cons (car ws) (loop (cdr ws)))]))))))))
 
 (set-who! future-get
   (lambda (f)
@@ -1426,7 +1473,11 @@
                       (append (async-channel-puts ch) (list (list v ss deliver))))
                     (list 'channel-put ch))))))
       (lambda (vals) vals)
-      (lambda (ss) (void)))))
+      (lambda (ss)
+        (with-async-mutex (async-channel-mutex ch)
+          (async-channel-puts-set! ch
+            (filter (lambda (p) (not (eq? (cadr p) ss)))
+              (async-channel-puts ch))))))))
 
 (set-who! channel-get-operation
   (lambda (ch)
@@ -1482,7 +1533,11 @@
                  (append (async-channel-gets ch) (list (cons ss deliver))))
                (list 'channel-get ch)]))))
       (lambda (vals) vals)
-      (lambda (ss) (void)))))
+      (lambda (ss)
+        (with-async-mutex (async-channel-mutex ch)
+          (async-channel-gets-set! ch
+            (filter (lambda (g) (not (eq? (car g) ss)))
+              (async-channel-gets ch))))))))
 
 (set-who! channel-put
   (lambda (ch v)

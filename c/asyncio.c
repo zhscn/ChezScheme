@@ -631,6 +631,17 @@ intptr_t aio_fs_close_fd(void *al_, int64_t fd, int64_t reqid) {
   return (intptr_t)ctx;
 }
 
+/* Reclaim a descriptor returned by an open request whose Scheme waiter was
+   canceled after the operating-system operation had already succeeded. */
+int aio_fs_close_now(int64_t fd) {
+  uv_fs_t req;
+  int r;
+  memset(&req, 0, sizeof(req));
+  r = uv_fs_close(NULL, &req, (uv_file)fd, NULL);
+  uv_fs_req_cleanup(&req);
+  return r;
+}
+
 intptr_t aio_fs_stat(void *al_, const char *path, int64_t reqid) {
   aio_loop_t *al = (aio_loop_t *)al_;
   aio_fs_ctx_t *ctx = aio_fs_ctx_new(reqid);
@@ -744,6 +755,7 @@ void S_asyncio_init(void) {
   AIO_REGISTER(aio_fs_read);
   AIO_REGISTER(aio_fs_write);
   AIO_REGISTER(aio_fs_close_fd);
+  AIO_REGISTER(aio_fs_close_now);
   AIO_REGISTER(aio_fs_stat);
   AIO_REGISTER(aio_fs_fstat);
   AIO_REGISTER(aio_fs_unlink);

@@ -444,7 +444,11 @@
                   (task-yield)
                   (future-fulfil! f 'completed)
                   (task-cancel! completed-first)
-                  (let ([first-result (task-join completed-first)]
+                  (let ([first-result
+                         (guard (c
+                                  [(async-cancellation-condition? c)
+                                   'canceled])
+                           (task-join completed-first))]
                         [f2 (make-future)])
                     (let ([canceled-first
                            (spawn-task (lambda () (future-get f2)))])
@@ -456,7 +460,7 @@
                                      [(async-cancellation-condition? c)
                                       'canceled])
                               (task-join canceled-first)))))))))
-    '(completed canceled))
+    '(canceled canceled))
 
   ;; ---- joining and exception propagation
 
@@ -600,6 +604,43 @@
                 (guard (c [(message-condition? c) 'reported])
                   (task-group-wait g)))))
     'reported)
+
+  ;; Observed failures do not hide older unobserved failures in the group.
+  (equal? (run-async
+            (lambda ()
+              (let ([g (make-task-group)])
+                (let ([unobserved
+                       (spawn-task
+                         (lambda () (raise (make-message-condition "unobserved")))
+                         'group g)]
+                      [observed
+                       (spawn-task
+                         (lambda ()
+                           (task-yield)
+                           (raise (make-message-condition "observed")))
+                         'group g)])
+                  (guard (c [else (void)]) (task-join observed))
+                  (guard (c [(and (message-condition? c)
+                                  (string=? (condition-message c) "unobserved"))
+                             'reported])
+                    (task-group-wait g))))))
+    'reported)
+
+  ;; A foreign completion cannot be lost between the scheduler's queue check
+  ;; and its condition wait.
+  (or (not (threaded?))
+      (equal?
+        (run-async
+          (lambda ()
+            (let loop ([i 0])
+              (if (fx= i 200)
+                  'done
+                  (let ([f (make-future)])
+                    (fork-thread (lambda () (future-fulfil! f i)))
+                    (unless (fx= (future-get f) i)
+                      (errorf 'foreign-completion "wrong future value"))
+                    (loop (fx+ i 1)))))))
+        'done))
 
   ;; unobserved child failure fails the draining root task
   (equal? (guard (c [(message-condition? c) 'failed-as-expected])

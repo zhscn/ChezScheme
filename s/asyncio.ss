@@ -91,6 +91,7 @@
 (define aio-fs-read #f)
 (define aio-fs-write #f)
 (define aio-fs-close-fd #f)
+(define aio-fs-close-now #f)
 (define aio-fs-stat #f)
 (define aio-fs-fstat #f)
 (define aio-fs-unlink #f)
@@ -144,6 +145,7 @@
     (set! aio-fs-read (foreign-procedure "aio_fs_read" (void* integer-64 integer-64 integer-64 integer-64) integer-64))
     (set! aio-fs-write (foreign-procedure "aio_fs_write" (void* integer-64 u8* integer-64 integer-64 integer-64) integer-64))
     (set! aio-fs-close-fd (foreign-procedure "aio_fs_close_fd" (void* integer-64 integer-64) integer-64))
+    (set! aio-fs-close-now (foreign-procedure "aio_fs_close_now" (integer-64) int))
     (set! aio-fs-stat (foreign-procedure "aio_fs_stat" (void* string integer-64) integer-64))
     (set! aio-fs-fstat (foreign-procedure "aio_fs_fstat" (void* integer-64 integer-64) integer-64))
     (set! aio-fs-unlink (foreign-procedure "aio_fs_unlink" (void* string integer-64) integer-64))
@@ -227,9 +229,13 @@
   (fields
     (immutable fd)
     (immutable path)
+    (immutable state)
     (mutable port-owned?)
     (mutable offset)
-    (mutable closed?)))
+    (mutable closed?)
+    (immutable mutex)
+    (mutable busy?)
+    (mutable queue)))
 
 ;;; ------------------------------------------------- notify trampoline
 
@@ -303,11 +309,18 @@
 
 ;;; finish proc for requests whose native context is a uv_fs_t wrapper
 (define aio-fs-finish
-  (lambda (gen)
+  (lambda (gen canceled-gen)
     (lambda (canceled? status aux)
-      (let ([payload (and (not canceled?) (gen status aux))])
-        (aio-fs-buf-free aux)
-        (aio-fs-req-free aux)
+      (let ([payload #f])
+        (dynamic-wind
+          (lambda () (void))
+          (lambda ()
+            (if canceled?
+                (canceled-gen status aux)
+                (set! payload (gen status aux))))
+          (lambda ()
+            (aio-fs-buf-free aux)
+            (aio-fs-req-free aux)))
         payload))))
 
 ;;; finish proc for dns requests
@@ -385,30 +398,39 @@
       (cond
         [(not h) (when (fx> status 0) (aio-free aux))]
         [else
-         (aio-handle-reading?-set! h #f)
-         (let next ()
-           (let ([q (aio-handle-read-queue h)])
-             (cond
-               [(null? q)
-                (when (fx> status 0) (aio-free aux))
-                (when (fx= status (aio-eof-code))
-                  (aio-handle-eof?-set! h #t))]
-               [(aio-waiter-dead? (caar q))
-                (aio-handle-read-queue-set! h (cdr q))
-                (next)]
-               [(aio-state-closing? st)
-                (when (fx> status 0) (aio-free aux))]
-               [else
-                (aio-handle-read-queue-set! h (cdr q))
-                ((cdar q) (aio-read-payload h status aux))])))
-         ;; arm the next reader, if any
-         (with-mutex (aio-handle-mutex h)
+         (let ([deliveries '()] [free-aux? #f])
+           (with-mutex (aio-handle-mutex h)
+             (aio-handle-reading?-set! h #f)
+             (aio-handle-read-queue-set! h
+               (filter (lambda (w) (not (aio-waiter-dead? (car w))))
+                 (aio-handle-read-queue h)))
+             (let ([q (aio-handle-read-queue h)])
+               (cond
+                 [(or (aio-state-closing? st) (aio-handle-closing? h))
+                  (set! free-aux? (fx> status 0))]
+                 [(fx= status (aio-eof-code))
+                  (aio-handle-eof?-set! h #t)
+                  (aio-handle-read-queue-set! h '())
+                  (set! deliveries
+                    (map (lambda (w)
+                           (cons (cdr w) (cons 'values (list #!eof))))
+                      q))]
+                 [(null? q)
+                  (set! free-aux? (fx> status 0))]
+                 [else
+                  (aio-handle-read-queue-set! h (cdr q))
+                  (set! deliveries
+                    (list (cons (cdar q)
+                            (aio-read-payload h status aux))))]))
+             ;; arm the next reader, if any
            (when (and (not (aio-handle-reading? h))
                       (not (aio-handle-closing? h))
                       (not (aio-handle-eof? h))
                       (pair? (aio-handle-read-queue h)))
              (aio-handle-reading?-set! h #t)
-             (aio-read-start (aio-handle-handle h))))]))))
+               (aio-read-start (aio-handle-handle h))))
+           (when free-aux? (aio-free aux))
+           (for-each (lambda (d) ((car d) (cdr d))) deliveries))]))))
 
 ;;; attempt one accept; returns a payload, or #f when nothing is pending
 (define aio-attempt-accept
@@ -441,25 +463,23 @@
   (lambda (st id status)
     (let ([h (aio-lookup-handle st id)])
       (when (and h (not (aio-state-closing? st)))
-        (let next ()
-          (let ([q (aio-handle-accept-queue h)])
-            (cond
-              [(null? q) (void)]
-              [(aio-waiter-dead? (caar q))
-               (aio-handle-accept-queue-set! h (cdr q))
-               (next)]
-              [else
-               (if (fx< status 0)
-                   (begin
-                     (aio-handle-accept-queue-set! h (cdr q))
-                     ((cdar q)
-                       (cons 'raise (aio-io-condition 'accept h (aio-handle-path h) status))))
-                   (let ([payload (aio-attempt-accept st h)])
-                     (if payload
-                         (begin
-                           (aio-handle-accept-queue-set! h (cdr q))
-                           ((cdar q) payload))
-                         (void))))])))))))
+        (let ([delivery #f])
+          (with-mutex (aio-handle-mutex h)
+            (aio-handle-accept-queue-set! h
+              (filter (lambda (w) (not (aio-waiter-dead? (car w))))
+                (aio-handle-accept-queue h)))
+            (let ([q (aio-handle-accept-queue h)])
+              (when (pair? q)
+                (let ([payload
+                       (if (fx< status 0)
+                           (cons 'raise
+                             (aio-io-condition 'accept h
+                               (aio-handle-path h) status))
+                           (aio-attempt-accept st h))])
+                  (when payload
+                    (aio-handle-accept-queue-set! h (cdr q))
+                    (set! delivery (cons (cdar q) payload)))))))
+          (when delivery ((car delivery) (cdr delivery))))))))
 
 (define aio-on-close
   (lambda (st id)
@@ -524,13 +544,12 @@
   (lambda (sched block?)
     (let ([st ($async-scheduler-io-state sched)])
       (when (and st (not (aio-state-closing? st)))
-        (guard (c [else (void)]) ; polling must not break the scheduler loop
-          (aio-drain-guardian! st)
-          (aio-drain-stop-set! st)
-          (when block? (aio-arm-bridge st sched))
-          (aio-loop-run (aio-state-loop st) (if block? 1 0))
-          (when block? (aio-bridge-stop (aio-state-loop st)))
-          (aio-drain-completions! st))))))
+        (aio-drain-guardian! st)
+        (aio-drain-stop-set! st)
+        (when block? (aio-arm-bridge st sched))
+        (aio-loop-run (aio-state-loop st) (if block? 1 0))
+        (when block? (aio-bridge-stop (aio-state-loop st)))
+        (aio-drain-completions! st)))))
 
 ;;; ------------------------------------------------------------ shutdown
 
@@ -574,6 +593,10 @@
             (aio-loop-run (aio-state-loop st) 1)
             (aio-drain-completions! st)
             (loop)))
+        (let drain ()
+          (when (pair? (aio-state-completions st))
+            (aio-drain-completions! st)
+            (drain)))
         (aio-loop-destroy (aio-state-loop st))
         (hashtable-delete! aio-loop-registry (aio-state-loop st))))))
 
@@ -645,22 +668,25 @@
 
 (define aio-close-handle
   (lambda (w operation)
-    (with-mutex (aio-handle-mutex w)
-      (unless (aio-handle-closing? w)
-        (aio-handle-closing?-set! w #t)
-        (let ([c (aio-closed-condition operation w)])
+    (let-values ([(close? waiters)
+                  (with-mutex (aio-handle-mutex w)
+                    (if (aio-handle-closing? w)
+                        (values #f '())
+                        (begin
+                          (aio-handle-closing?-set! w #t)
+                          (let ([waiters
+                                 (append (aio-handle-read-queue w)
+                                         (aio-handle-accept-queue w))])
+                            (aio-handle-read-queue-set! w '())
+                            (aio-handle-accept-queue-set! w '())
+                            (values #t waiters)))))])
+      (when close?
+        (let ([payload (cons 'raise (aio-closed-condition operation w))])
           (for-each
             (lambda (waiter)
               (unless (aio-waiter-dead? (car waiter))
-                ((cdr waiter) (cons 'raise c))))
-            (aio-handle-read-queue w))
-          (aio-handle-read-queue-set! w '())
-          (for-each
-            (lambda (waiter)
-              (unless (aio-waiter-dead? (car waiter))
-                ((cdr waiter) (cons 'raise c))))
-            (aio-handle-accept-queue w))
-          (aio-handle-accept-queue-set! w '()))
+                ((cdr waiter) payload)))
+            waiters))
         (aio-cancel-handle-requests! w operation)
         (aio-handle-close (aio-handle-handle w))))))
 
@@ -677,9 +703,27 @@
     (when (aio-handle-port-owned? s)
       ($oops who "async stream ownership has been transferred to a port"))))
 
+(define aio-check-handle-owner!
+  (lambda (who h)
+    (let ([sched (current-async-scheduler)])
+      (unless (and sched
+                   (eq? ($async-scheduler-io-state sched)
+                        (aio-handle-state h)))
+        ($oops who "async handle belongs to another scheduler")))))
+
+(define aio-check-stream-access!
+  (lambda (who s allow-owned?)
+    (aio-check-stream who s)
+    (aio-check-handle-owner! who s)
+    (unless allow-owned?
+      (with-mutex (aio-handle-mutex s)
+        (when (aio-handle-port-owned? s)
+          ($oops who "async stream ownership has been transferred to a port"))))))
+
 (define aio-claim-stream-for-port!
   (lambda (who s)
     (aio-check-stream who s)
+    (aio-check-handle-owner! who s)
     (with-mutex (aio-handle-mutex s)
       (when (aio-handle-port-owned? s)
         ($oops who "async stream ownership has already been transferred to a port"))
@@ -687,18 +731,27 @@
         (raise (aio-closed-condition who s)))
       (aio-handle-port-owned?-set! s #t))))
 
+(define aio-close-owned-handle
+  (lambda (who h)
+    (aio-check-handle-owner! who h)
+    (aio-close-handle h 'close)))
+
 (define %stream-read-operation
-  (lambda (s)
+  (lambda (s . allow-owned-option)
     (aio-check-stream 'stream-read-operation s)
-    (make-operation
-      (lambda (ss)
+    (let ([allow-owned? (and (pair? allow-owned-option)
+                             (car allow-owned-option))])
+      (make-operation
+        (lambda (ss)
+          (aio-check-stream-access! 'stream-read-operation s allow-owned?)
         (with-mutex (aio-handle-mutex s)
           (cond
             [(aio-handle-eof? s) (cons 'values (list #!eof))]
             [(aio-handle-closing? s)
              (cons 'raise (aio-closed-condition 'read s))]
             [else #f])))
-      (lambda (ss deliver)
+        (lambda (ss deliver)
+          (aio-check-stream-access! 'stream-read-operation s allow-owned?)
         (with-mutex (aio-handle-mutex s)
           (cond
             [(aio-handle-eof? s)
@@ -714,8 +767,8 @@
                (aio-handle-reading?-set! s #t)
                (aio-read-start (aio-handle-handle s)))
              (list 'read (aio-handle-id s))])))
-      (lambda (vals) vals)
-      (lambda (ss)
+        (lambda (vals) vals)
+        (lambda (ss)
         (with-mutex (aio-handle-mutex s)
           (aio-handle-read-queue-set! s
             (let loop ([q (aio-handle-read-queue s)])
@@ -725,19 +778,24 @@
                 [else (cons (car q) (loop (cdr q)))]))))
         (let ([st (aio-handle-state s)])
           (with-mutex (aio-state-stop-mutex st)
-            (aio-state-stop-set-set! st (cons s (aio-state-stop-set st)))))))))
+            (aio-state-stop-set-set! st
+              (cons s (aio-state-stop-set st))))))))))
 
 (define %stream-write-operation
-  (lambda (s bv)
+  (lambda (s bv . allow-owned-option)
     (aio-check-stream 'stream-write-operation s)
     (unless (bytevector? bv)
       ($oops 'stream-write-operation "~s is not a bytevector" bv))
-    (let ([st-box (box #f)] [id-box (box #f)])
+    (let ([st-box (box #f)] [id-box (box #f)]
+          [allow-owned? (and (pair? allow-owned-option)
+                             (car allow-owned-option))])
       (make-operation
         (lambda (ss)
+          (aio-check-stream-access! 'stream-write-operation s allow-owned?)
           (and (aio-handle-closing? s)
                (cons 'raise (aio-closed-condition 'write s))))
         (lambda (ss deliver)
+          (aio-check-stream-access! 'stream-write-operation s allow-owned?)
           (if (aio-handle-closing? s)
               (begin
                 (deliver (cons 'raise (aio-closed-condition 'write s)))
@@ -774,9 +832,11 @@
     (let ([st-box (box #f)] [id-box (box #f)])
       (make-operation
         (lambda (ss)
+          (aio-check-stream-access! 'stream-shutdown s #f)
           (and (aio-handle-closing? s)
                (cons 'raise (aio-closed-condition 'shutdown s))))
         (lambda (ss deliver)
+          (aio-check-stream-access! 'stream-shutdown s #f)
           (if (aio-handle-closing? s)
               (begin
                 (deliver (cons 'raise (aio-closed-condition 'shutdown s)))
@@ -853,6 +913,7 @@
     (let ([st (aio-handle-state listener)])
       (make-operation
         (lambda (ss)
+          (aio-check-handle-owner! 'tcp-accept-operation listener)
           (with-mutex (aio-handle-mutex listener)
             (cond
               [(aio-handle-closing? listener)
@@ -861,6 +922,7 @@
                (aio-attempt-accept st listener)]
               [else #f])))
         (lambda (ss deliver)
+          (aio-check-handle-owner! 'tcp-accept-operation listener)
           (with-mutex (aio-handle-mutex listener)
             (cond
               [(aio-handle-closing? listener)
@@ -1080,28 +1142,121 @@
       0 flags)))
 
 (define aio-fs-request-operation
-  (lambda (who handle path start gen)
-    ;; start: st id -> ctx pointer or negative error
-    ;; gen: status aux -> payload
-    (let ([st-box (box #f)] [id-box (box #f)])
-      (make-operation
-        (lambda (ss) #f)
-        (lambda (ss deliver)
-          (let* ([st (aio-ensure-state! who)]
-                 [id (aio-next-id st)]
-                 [r (start st id)])
-            (set-box! st-box st)
-            (set-box! id-box id)
-            (if (< r 0)
-                (begin
-                  (deliver (cons 'raise (aio-io-condition who handle path r)))
-                  #f)
-                (begin
-                  (aio-register-request! st id
-                    (make-aio-req 'fs handle deliver r (aio-fs-finish gen) #f))
-                  (list 'fs id)))))
-        (lambda (vals) vals)
-        (aio-request-nack st-box id-box)))))
+  (case-lambda
+    [(who handle path start gen)
+     (aio-fs-request-operation who handle path start gen
+       (lambda (status aux) (void)) #f)]
+    [(who handle path start gen canceled-gen)
+     (aio-fs-request-operation who handle path start gen canceled-gen #f)]
+    [(who handle path start gen canceled-gen serial-file)
+     ;; start: st id -> ctx pointer or negative error
+     ;; gen: status aux -> payload
+     (let ([st-box (box #f)] [id-box (box #f)]
+           [started? (box #f)] [entry-box (box #f)])
+       (define release!
+         (lambda ()
+           (when serial-file
+             (let ([next
+                    (with-mutex (async-file-mutex serial-file)
+                      (let ([q (async-file-queue serial-file)])
+                        (if (null? q)
+                            (begin
+                              (async-file-busy?-set! serial-file #f)
+                              #f)
+                            (let ([entry (car q)])
+                              (async-file-queue-set! serial-file (cdr q))
+                              (set-box! (cadr entry) #t)
+                              (caddr entry)))))])
+               (when next (next))))))
+       (define finish-normal
+         (lambda (status aux)
+           (dynamic-wind
+             (lambda () (void))
+             (lambda () (gen status aux))
+             release!)))
+       (define finish-canceled
+         (lambda (status aux)
+           (dynamic-wind
+             (lambda () (void))
+             (lambda () (canceled-gen status aux))
+             release!)))
+       (make-operation
+         (lambda (ss) #f)
+         (lambda (ss deliver)
+           (letrec ([submit
+                     (lambda ()
+                       (define submit-native
+                         (lambda ()
+                           (let ([st (aio-ensure-state! who)])
+                             (when (and serial-file
+                                        (not (eq? st
+                                               (async-file-state serial-file))))
+                               ($oops who
+                                 "async file belongs to another scheduler"))
+                             (let* ([id (aio-next-id st)]
+                                    [r (start st id)])
+                               (set-box! st-box st)
+                               (set-box! id-box id)
+                               (if (< r 0)
+                                   (cons 'error r)
+                                   (begin
+                                     (aio-register-request! st id
+                                       (make-aio-req 'fs handle deliver r
+                                         (aio-fs-finish finish-normal
+                                           finish-canceled)
+                                         #f))
+                                     (cons 'submitted id)))))))
+                       (let ([result
+                              (guard (c [else (cons 'exception c)])
+                                (if serial-file
+                                    (with-mutex (async-file-mutex serial-file)
+                                      (if (aio-waiter-dead? ss)
+                                          '(withdrawn)
+                                          (submit-native)))
+                                    (submit-native)))])
+                         (case (car result)
+                           [(submitted) (list 'fs (cdr result))]
+                           [(withdrawn)
+                            (release!)
+                            #f]
+                           [(error)
+                            (release!)
+                            (deliver
+                              (cons 'raise
+                                (aio-io-condition who handle path
+                                  (cdr result))))
+                            #f]
+                           [else
+                            (release!)
+                            (deliver (cons 'raise (cdr result)))
+                            #f])))])
+             (if serial-file
+                 (let ([entry (list ss started? submit)] [start-now? #f])
+                   (set-box! entry-box entry)
+                   (with-mutex (async-file-mutex serial-file)
+                     (if (async-file-busy? serial-file)
+                         (async-file-queue-set! serial-file
+                           (append (async-file-queue serial-file)
+                             (list entry)))
+                         (begin
+                           (async-file-busy?-set! serial-file #t)
+                           (set-box! started? #t)
+                           (set! start-now? #t))))
+                   (when start-now? (submit))
+                   (list 'file who))
+                 (submit))))
+         (lambda (vals) vals)
+         (lambda (ss)
+           (let ([nack-started? (not serial-file)])
+             (when serial-file
+               (with-mutex (async-file-mutex serial-file)
+                 (if (unbox started?)
+                     (set! nack-started? #t)
+                     (async-file-queue-set! serial-file
+                       (remq (unbox entry-box)
+                         (async-file-queue serial-file))))))
+             (when nack-started?
+               ((aio-request-nack st-box id-box) ss))))))]))
 
 (define %file-open-operation
   (case-lambda
@@ -1113,18 +1268,21 @@
        ($oops 'file-open-operation "~s is not a list of flag symbols" flags))
      (unless (and (fixnum? mode) (fx>= mode 0) (fx<= mode #o7777))
        ($oops 'file-open-operation "~s is not a valid file mode" mode))
-     (let ([bits (aio-open-flag-bits flags)])
+     (let ([bits (aio-open-flag-bits flags)] [st-box (box #f)])
        (aio-fs-request-operation 'open #f path
          (lambda (st id)
+           (set-box! st-box st)
            (aio-fs-open (aio-state-loop st) path bits mode id))
          (lambda (status aux)
            (if (>= status 0)
                (cons 'values
-                 (list (make-async-file% status path
-                         #f
+                 (list (make-async-file% status path (unbox st-box) #f
                          (if (fxlogtest bits 16) -1 0) ; append: track end lazily
-                         #f)))
-               (cons 'raise (aio-io-condition 'open #f path status))))))]))
+                         #f (make-mutex) #f '())))
+               (cons 'raise (aio-io-condition 'open #f path status))))
+         (lambda (status aux)
+           (when (>= status 0)
+             (aio-fs-close-now status)))))]))
 
 (define aio-check-file
   (lambda (who f)
@@ -1139,12 +1297,22 @@
     (when (async-file-port-owned? f)
       ($oops who "async file ownership has been transferred to a port"))))
 
+(define aio-check-file-owner!
+  (lambda (who f)
+    (let ([sched (current-async-scheduler)])
+      (unless (and sched
+                   (eq? ($async-scheduler-io-state sched)
+                        (async-file-state f)))
+        ($oops who "async file belongs to another scheduler")))))
+
 (define aio-claim-file-for-port!
   (lambda (who f)
     (aio-check-file who f)
-    (when (async-file-port-owned? f)
-      ($oops who "async file ownership has already been transferred to a port"))
-    (async-file-port-owned?-set! f #t)))
+    (aio-check-file-owner! who f)
+    (with-mutex (async-file-mutex f)
+      (when (async-file-port-owned? f)
+        ($oops who "async file ownership has already been transferred to a port"))
+      (async-file-port-owned?-set! f #t))))
 
 (define aio-file-offset!
   (lambda (f n)
@@ -1155,12 +1323,17 @@
       off)))
 
 (define %file-read-operation
-  (lambda (f len)
+  (lambda (f len . allow-owned-option)
     (aio-check-file 'file-read-operation f)
     (unless (and (fixnum? len) (fx> len 0) (fx<= len (expt 2 30)))
       ($oops 'file-read-operation "~s is not a positive fixnum length" len))
-    (aio-fs-request-operation 'read f (async-file-path f)
+    (let ([allow-owned? (and (pair? allow-owned-option)
+                             (car allow-owned-option))])
+      (aio-fs-request-operation 'read f (async-file-path f)
       (lambda (st id)
+        (if allow-owned?
+            (aio-check-file 'file-read-operation f)
+            (aio-check-file-unowned 'file-read-operation f))
         (aio-fs-read (aio-state-loop st) (async-file-fd f) len
           (aio-file-offset! f 0) id))
       (lambda (status aux)
@@ -1173,15 +1346,23 @@
           [(fx= status 0) (cons 'values (list #!eof))]
           [else
            (cons 'raise
-             (aio-io-condition 'read f (async-file-path f) status))])))))
+             (aio-io-condition 'read f (async-file-path f) status))]))
+      (lambda (status aux)
+        (when (fx>= status 0) (aio-file-offset! f status)))
+      f))))
 
 (define %file-write-operation
-  (lambda (f bv)
+  (lambda (f bv . allow-owned-option)
     (aio-check-file 'file-write-operation f)
     (unless (bytevector? bv)
       ($oops 'file-write-operation "~s is not a bytevector" bv))
-    (aio-fs-request-operation 'write f (async-file-path f)
+    (let ([allow-owned? (and (pair? allow-owned-option)
+                             (car allow-owned-option))])
+      (aio-fs-request-operation 'write f (async-file-path f)
       (lambda (st id)
+        (if allow-owned?
+            (aio-check-file 'file-write-operation f)
+            (aio-check-file-unowned 'file-write-operation f))
         (aio-fs-write (aio-state-loop st) (async-file-fd f) bv
           (bytevector-length bv) (aio-file-offset! f 0) id))
       (lambda (status aux)
@@ -1190,7 +1371,26 @@
               (aio-file-offset! f status)
               (cons 'values (list status)))
             (cons 'raise
-              (aio-io-condition 'write f (async-file-path f) status)))))))
+              (aio-io-condition 'write f (async-file-path f) status))))
+      (lambda (status aux)
+        (when (fx>= status 0) (aio-file-offset! f status)))
+      f))))
+
+(define %file-close-operation
+  (lambda (f)
+    (aio-fs-request-operation 'close f (async-file-path f)
+      (lambda (st id)
+        (aio-fs-close-fd (aio-state-loop st) (async-file-fd f) id))
+      (lambda (status aux)
+        (if (fx= status 0)
+            (begin
+              (async-file-closed?-set! f #t)
+              (cons 'values '()))
+            (cons 'raise
+              (aio-io-condition 'close f (async-file-path f) status))))
+      (lambda (status aux)
+        (when (fx= status 0) (async-file-closed?-set! f #t)))
+      f)))
 
 (define aio-stat-alist
   (lambda (aux)
@@ -1260,27 +1460,27 @@
   (lambda (s)
     (aio-port-read-procedure
       (lambda (count)
-        (perform-operation (%stream-read-operation s))))))
+        (perform-operation (%stream-read-operation s #t))))))
 
 (define aio-stream-port-write-procedure
   (lambda (s)
     (aio-port-write-procedure
       (lambda (bv)
         (let ([n (bytevector-length bv)])
-          (perform-operation (%stream-write-operation s bv))
+          (perform-operation (%stream-write-operation s bv #t))
           n)))))
 
 (define aio-file-port-read-procedure
   (lambda (f)
     (aio-port-read-procedure
       (lambda (count)
-        (perform-operation (%file-read-operation f count))))))
+        (perform-operation (%file-read-operation f count #t))))))
 
 (define aio-file-port-write-procedure
   (lambda (f)
     (aio-port-write-procedure
       (lambda (bv)
-        (perform-operation (%file-write-operation f bv))))))
+        (perform-operation (%file-write-operation f bv #t))))))
 
 (define aio-file-port-position-procedures
   (lambda (f)
@@ -1297,17 +1497,7 @@
 (define aio-close-file-from-port
   (lambda (f)
     (aio-check-file 'close-port f)
-    (perform-operation
-      (aio-fs-request-operation 'close f (async-file-path f)
-        (lambda (st id)
-          (aio-fs-close-fd (aio-state-loop st) (async-file-fd f) id))
-        (lambda (status aux)
-          (if (fx= status 0)
-              (begin
-                (async-file-closed?-set! f #t)
-                (cons 'values '()))
-              (cons 'raise
-                (aio-io-condition 'close f (async-file-path f) status))))))))
+    (perform-operation (%file-close-operation f))))
 
 (define aio-file-port-id
   (lambda (f)
@@ -1334,6 +1524,8 @@
        (aio-check-file 'file-stat-operation target)
        (aio-fs-request-operation 'stat target (async-file-path target)
          (lambda (st id)
+           (aio-check-file-owner! 'file-stat-operation target)
+           (aio-check-file-unowned 'file-stat-operation target)
            (aio-fs-fstat (aio-state-loop st) (async-file-fd target) id))
          (lambda (status aux)
            (if (fx= status 0)
@@ -1380,7 +1572,7 @@
   (lambda (listener)
     (unless (tcp-listener? listener)
       ($oops who "~s is not a listener" listener))
-    (aio-close-handle listener 'close)))
+    (aio-close-owned-handle who listener)))
 (set-who! tcp-accept
   (lambda (listener)
     (perform-operation (%tcp-accept-operation listener))))
@@ -1405,7 +1597,7 @@
 (set-who! stream-close
   (lambda (s)
     (aio-check-stream-unowned who s)
-    (aio-close-handle s 'close)))
+    (aio-close-owned-handle who s)))
 (set! stream-closed?
   (lambda (s)
     (and (aio-handle? s)
@@ -1430,14 +1622,14 @@
     (make-custom-binary-input-port (aio-stream-port-id s)
       (aio-stream-port-read-procedure s)
       #f #f
-      (lambda () (aio-close-handle s 'close)))))
+      (lambda () (aio-close-owned-handle who s)))))
 (set-who! async-stream->binary-output-port
   (lambda (s)
     (aio-claim-stream-for-port! who s)
     (make-custom-binary-output-port (aio-stream-port-id s)
       (aio-stream-port-write-procedure s)
       #f #f
-      (lambda () (aio-close-handle s 'close)))))
+      (lambda () (aio-close-owned-handle who s)))))
 (set-who! async-stream->binary-input/output-port
   (lambda (s)
     (aio-claim-stream-for-port! who s)
@@ -1446,7 +1638,7 @@
              (aio-stream-port-read-procedure s)
              (aio-stream-port-write-procedure s)
              #f #f
-             (lambda () (aio-close-handle s 'close)))])
+             (lambda () (aio-close-owned-handle who s)))])
       ;; A stream cannot seek backward over input prefetched by a duplex port.
       ($reset-port-flags! p (constant port-flag-block-buffered))
       p)))
@@ -1472,17 +1664,7 @@
 (set-who! file-close
   (lambda (f)
     (aio-check-file-unowned who f)
-    (perform-operation
-      (aio-fs-request-operation 'close f (async-file-path f)
-        (lambda (st id)
-          (aio-fs-close-fd (aio-state-loop st) (async-file-fd f) id))
-        (lambda (status aux)
-          (if (fx= status 0)
-              (begin
-                (async-file-closed?-set! f #t)
-                (cons 'values '()))
-              (cons 'raise
-                (aio-io-condition 'close f (async-file-path f) status))))))
+    (perform-operation (%file-close-operation f))
     (void)))
 (set-who! async-file->binary-input-port
   (lambda (f)
