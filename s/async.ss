@@ -228,6 +228,8 @@
     (immutable mutex)
     (immutable condition)
     (immutable ready-queue)         ; ready migratable tasks
+    (immutable tasks)               ; stable id -> task registry for the group
+    (mutable task-count)
     (mutable schedulers)
     (mutable root-task)
     (mutable next-task-id)
@@ -366,17 +368,18 @@
                 (async-scheduler-saved-dynamic-state-set! s
                   (async-set-dynamic-state-slot
                     (async-scheduler-saved-dynamic-state s)
-                    index initval size))
-                (let-values ([(ids tasks)
-                              (hashtable-entries (async-scheduler-tasks s))])
-                  (vector-for-each
-                    (lambda (task)
-                      (async-task-dynamic-state-set! task
-                        (async-set-dynamic-state-slot
-                          (async-task-dynamic-state task)
-                          index initval size)))
-                    tasks)))
-              (async-scheduler-group-schedulers group))))))))
+                    index initval size)))
+              (async-scheduler-group-schedulers group))
+            (let-values ([(ids tasks)
+                          (hashtable-entries
+                            (async-scheduler-group-tasks group))])
+              (vector-for-each
+                (lambda (task)
+                  (async-task-dynamic-state-set! task
+                    (async-set-dynamic-state-slot
+                      (async-task-dynamic-state task)
+                      index initval size)))
+                tasks))))))))
 
 ;;; ------------------------------------------- scheduler/task internal helpers
 
@@ -494,13 +497,23 @@
 
 (define sched-registry-add/raw!
   (lambda (sched task)
-    (hashtable-set! (async-scheduler-tasks sched) (async-task-id task) task)
-    ($async-scheduler-task-count-set! sched (fx+ 1 ($async-scheduler-task-count sched)))))
+    (let* ([group ($async-scheduler-group sched)]
+           [tasks (async-scheduler-group-tasks group)]
+           [id (async-task-id task)])
+      (unless (hashtable-ref tasks id #f)
+        (hashtable-set! tasks id task)
+        (async-scheduler-group-task-count-set! group
+          (fx+ 1 (async-scheduler-group-task-count group)))))))
 
 (define sched-registry-remove/raw!
   (lambda (sched task)
-    (hashtable-delete! (async-scheduler-tasks sched) (async-task-id task))
-    ($async-scheduler-task-count-set! sched (fx- ($async-scheduler-task-count sched) 1))))
+    (let* ([group ($async-scheduler-group sched)]
+           [tasks (async-scheduler-group-tasks group)]
+           [id (async-task-id task)])
+      (when (hashtable-ref tasks id #f)
+        (hashtable-delete! tasks id)
+        (async-scheduler-group-task-count-set! group
+          (fx- (async-scheduler-group-task-count group) 1))))))
 
 (define sched-registry-add!
   (lambda (sched task)
@@ -583,13 +596,8 @@
 
 (define async-adopt-work!
   (lambda (sched task)
-    (let ([old (async-task-scheduler task)])
-      (unless (eq? old sched)
-        (let ([group ($async-scheduler-group sched)])
-          (with-async-mutex (async-scheduler-group-mutex group)
-            (sched-registry-remove/raw! old task)
-            (async-task-scheduler-set! task sched)
-            (sched-registry-add/raw! sched task)))))
+    (unless (eq? (async-task-scheduler task) sched)
+      (async-task-scheduler-set! task sched))
     task))
 
 (define async-take-work!
@@ -662,9 +670,7 @@
                           (async-task-group-runnable? task))
                      (let ([old (async-task-scheduler task)])
                        (unless (eq? old sched)
-                         (sched-registry-remove/raw! old task)
-                         (async-task-scheduler-set! task sched)
-                         (sched-registry-add/raw! sched task))
+                         (async-task-scheduler-set! task sched))
                        task)
                      (loop)))])))))))
 
@@ -1325,11 +1331,7 @@
             ;; A normal completion may have published the task globally just
             ;; before cancellation.  Return it to the suspension owner before
             ;; replacing the value payload with a cancellation raise.
-            (let ([group (async-task-scheduler-group task)])
-              (with-async-mutex (async-scheduler-group-mutex group)
-                (sched-registry-remove/raw! sched task)
-                (async-task-scheduler-set! task wait-owner)
-                (sched-registry-add/raw! wait-owner task)))
+            (async-task-scheduler-set! task wait-owner)
             (async-remote-submit wait-owner task)
             #f)
           (begin
@@ -1420,13 +1422,9 @@
           (async-fifo-head-set! next '())
           (async-fifo-tail-set! next '()))
         (if (async-queue-empty? current)
-            (if (fx= ($async-scheduler-task-count sched) 0)
-                (if (async-scheduler-group-shutdown?
-                      ($async-scheduler-group sched))
-                    (void)
-                    (begin
-                      (async-idle-wait sched)
-                      (loop)))
+            (if (async-scheduler-group-shutdown?
+                  ($async-scheduler-group sched))
+                (void)
                 (begin
                   (async-idle-wait sched)
                   (loop)))
@@ -1502,7 +1500,7 @@
   (lambda (r p wr)
     (fprintf p "#<async-scheduler ~a tasks=~a turns=~a>"
       (async-scheduler-status r)
-      ($async-scheduler-task-count r)
+      (async-scheduler-group-task-count ($async-scheduler-group r))
       ($async-scheduler-turn-count r))))
 
 (record-writer (type-descriptor async-channel)
@@ -2041,7 +2039,8 @@
                       (control:make-continuation-prompt-tag 'async-scheduler-group)
                       (make-async-mutex)
                       (if-feature pthreads (make-condition) #f)
-                      (make-async-queue) '#() #f 0 0 0 #f #f '())]
+                      (make-async-queue) (make-eq-hashtable) 0
+                      '#() #f 0 0 0 #f #f '())]
              [schedulers (make-vector parallelism)])
         (do ([i 0 (fx+ i 1)]) ((fx= i parallelism))
           (vector-set! schedulers i
@@ -2112,7 +2111,9 @@
 (set-who! async-scheduler-task-count
   (lambda (sched)
     (unless (async-scheduler? sched) ($oops who "~s is not a scheduler" sched))
-    ($async-scheduler-task-count sched)))
+    (let ([group ($async-scheduler-group sched)])
+      (with-async-mutex (async-scheduler-group-mutex group)
+        (async-scheduler-group-task-count group)))))
 
 (set-who! async-scheduler-turn-count
   (lambda (sched)
