@@ -414,6 +414,30 @@
                 (spawn-task (lambda () (future-fail! f c0)))
                 (guard (c [else (eq? c c0)]) (future-get f)))))
     #t)
+  ;; An exceptional completion resumes on the wait owner before raising
+  ;; through the captured fiber exception context.
+  (or (not (threaded?))
+      (let loop ([i 0])
+        (or (fx= i 32)
+            (and
+              (equal?
+                (run-async
+                  (lambda ()
+                    (let ([started (make-future)] [blocked (make-future)])
+                      (let ([task
+                             (spawn-task
+                               (lambda ()
+                                 (future-fulfil! started)
+                                 (guard (c [else (condition-message c)])
+                                   (future-get blocked)))
+                               'migratable? #t)])
+                        (future-get started)
+                        (future-fail! blocked
+                          (make-message-condition "remote failure"))
+                        (task-join task))))
+                  'parallelism 4)
+                "remote failure")
+              (loop (fx+ i 1))))))
   (error? (run-async (lambda () (let ([f (make-future)])
                                   (future-fulfil! f 1)
                                   (future-fulfil! f 2)))))
@@ -819,7 +843,8 @@
                     (let ([i i])
                       (lambda ()
                         (let ([scheduler (current-async-scheduler)]
-                              [thread-id (get-thread-id)])
+                              [thread-id (get-thread-id)]
+                              [migrated? #f])
                           (parameter i)
                           ;; Hold one task on each scheduler until all three
                           ;; scheduler threads have entered user code.
@@ -832,22 +857,24 @@
                                 (condition-wait condition mutex)
                                 (loop))))
                           (future-get gate)
-                          (task-yield)
+                          (do ([j 0 (fx+ j 1)]) ((fx= j 16))
+                            (task-yield)
+                            (when (or (not (eq? scheduler
+                                                 (current-async-scheduler)))
+                                      (not (fx= thread-id (get-thread-id))))
+                              (set! migrated? #t)))
                           (vector-set! results i
                             (list (async-scheduler? scheduler)
                                   (eq? (task-scheduler (current-async-task))
                                        (current-async-scheduler))
                                   (fx= (parameter) i)
-                                  (and (eq? scheduler
-                                            (current-async-scheduler))
-                                       (fx= thread-id (get-thread-id))))))))
+                                  migrated?)))))
                     'migratable? #t)))
               (let loop ()
                 (unless (with-mutex mutex (fx= started n))
                   (task-yield)
                   (loop)))
-              ;; Completing a future on the main scheduler remotely wakes
-              ;; tasks pinned to worker schedulers.
+              ;; Completing a future publishes parked tasks to the group.
               (future-fulfil! gate 'go)
               (do ([i 0 (fx+ i 1)]) ((fx= i n))
                 (task-join (vector-ref tasks i)))
@@ -857,18 +884,19 @@
                   (lambda (task) (hashtable-set! ids (task-id task) #t))
                   tasks)
                 (list
-                  (for-all (lambda (r) (equal? r '(#t #t #t #t)))
+                  (for-all (lambda (r) (equal? (list-head r 3) '(#t #t #t)))
                     (vector->list results))
+                  (exists cadddr (vector->list results))
                   (fx= (hashtable-size ids) n)
                   (exists
                     (lambda (scheduler)
                       (not (eq? scheduler (vector-ref schedulers 0))))
                     (cdr (vector->list schedulers)))))))
           'parallelism 3)
-        '(#t #t #t)))
+        '(#t #t #t #t)))
 
-  ;; Channel delivery can cross scheduler threads while each continuation
-  ;; remains on the scheduler where it first ran.
+  ;; Channel delivery can cross scheduler threads and resume a migratable
+  ;; continuation on any scheduler in the group.
   (or (not (threaded?))
       (equal?
         (run-async
@@ -901,27 +929,60 @@
           'parallelism 2)
         'cross-thread))
 
-  ;; Cancellation published from another scheduler wakes a pinned waiter on
-  ;; its owning scheduler and preserves the cancellation reason.
+  ;; Cancellation published from another scheduler wakes a parked waiter and
+  ;; preserves the cancellation reason across resumption.
   (or (not (threaded?))
-      (equal?
-        (run-async
-          (lambda ()
-            (let ([started (make-future)] [blocked (make-future)])
-              (let ([task
-                     (spawn-task
-                       (lambda ()
-                         (future-fulfil! started)
-                         (future-get blocked))
-                       'migratable? #t)])
-                (future-get started)
-                (task-cancel! task 'remote-cancel)
-                (guard (c
-                         [(async-cancellation-condition? c)
-                          (async-cancellation-reason c)])
-                  (task-join task)))))
-          'parallelism 4)
-        'remote-cancel))
+      (let loop ([i 0])
+        (or (fx= i 32)
+            (and
+              (equal?
+                (run-async
+                  (lambda ()
+                    (let ([started (make-future)] [blocked (make-future)])
+                      (let ([task
+                             (spawn-task
+                               (lambda ()
+                                 (future-fulfil! started)
+                                 (future-get blocked))
+                               'migratable? #t)])
+                        (future-get started)
+                        (task-cancel! task 'remote-cancel)
+                        (guard (c
+                                 [(async-cancellation-condition? c)
+                                  (async-cancellation-reason c)])
+                          (task-join task)))))
+                  'parallelism 4)
+                'remote-cancel)
+              (loop (fx+ i 1))))))
+
+  ;; A cancellation can overtake a normal completion after the waiter has
+  ;; entered the shared ready queue.  Either result may win, and both paths
+  ;; preserve a valid fiber exception context.
+  (or (not (threaded?))
+      (let loop ([i 0])
+        (or (fx= i 64)
+            (and
+              (memq
+                (run-async
+                  (lambda ()
+                    (let ([started (make-future)] [blocked (make-future)])
+                      (let ([task
+                             (spawn-task
+                               (lambda ()
+                                 (future-fulfil! started)
+                                 (future-get blocked)
+                                 'completed)
+                               'migratable? #t)])
+                        (future-get started)
+                        (future-fulfil! blocked 'ready)
+                        (task-cancel! task 'racing-cancel)
+                        (guard (c
+                                 [(async-cancellation-condition? c)
+                                  'canceled])
+                          (task-join task)))))
+                  'parallelism 4)
+                '(completed canceled))
+              (loop (fx+ i 1))))))
 
   ;; ---- observability
 

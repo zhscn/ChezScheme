@@ -182,9 +182,12 @@
     (mutable entry)                 ; thunk before first run, #f after
     (mutable resumption)            ; resumption procedure while waiting/ready
     (mutable engine)                ; suspended engine after timed preemption
-    (mutable scheduler)             ; current owner; changes only while ready
+    (immutable scheduler-group)     ; scheduler group in which the task runs
+    (mutable scheduler)             ; current or most recent execution scheduler
+    (mutable wait-scheduler)        ; scheduler that owns the current wait
     (immutable migratable?)
-    (mutable pinned?)               ; captured continuation fixes affinity
+    (mutable affinity-reasons)      ; scheduler-local resources held by the task
+    (mutable suspension-state)      ; #f | unwinding | parking | parked | delivered
     (mutable dynamic-state)         ; saved parameter vector
     (mutable exception-state)       ; exception-state record
     (mutable parent-group)          ; group this task belongs to
@@ -334,6 +337,12 @@
   (lambda (sched v)
     (async-scheduler-in-switch?-set! sched v)))
 
+(define set-current-sched-switch!
+  (lambda (v)
+    (let ([sched ($async-scheduler)])
+      (when (async-scheduler? sched)
+        (set-sched-switch! sched v)))))
+
 (define $async-scheduling-switch?
   (lambda ()
     (let ([sched ($async-scheduler)])
@@ -345,7 +354,32 @@
     (let ([sched ($async-scheduler)])
       (when (and (async-scheduler? sched)
                  (async-scheduler-current-task sched))
-        (async-task-pinned?-set! (async-scheduler-current-task sched) #t)))))
+        (async-task-add-affinity!
+          (async-scheduler-current-task sched)
+          'io)))))
+
+(define async-task-add-affinity!
+  (lambda (task reason)
+    (with-async-mutex (async-task-mutex task)
+      (unless (memq reason (async-task-affinity-reasons task))
+        (async-task-affinity-reasons-set! task
+          (cons reason (async-task-affinity-reasons task)))))))
+
+(define async-task-remove-affinity!
+  (lambda (task reason)
+    (with-async-mutex (async-task-mutex task)
+      (async-task-affinity-reasons-set! task
+        (remq reason (async-task-affinity-reasons task))))))
+
+(define async-task-affine?
+  (lambda (task)
+    (pair? (async-task-affinity-reasons task))))
+
+(define async-task-group-runnable?
+  (lambda (task)
+    (and (async-task-migratable? task)
+         (not (async-task-affine? task))
+         (async-group-parallel? (async-task-scheduler-group task)))))
 
 (define sched-now
   (lambda (sched)
@@ -418,7 +452,7 @@
 
 (define async-group-submit!
   (lambda (task)
-    (let ([group ($async-scheduler-group (async-task-scheduler task))])
+    (let ([group (async-task-scheduler-group task)])
       (with-async-mutex (async-scheduler-group-mutex group)
         (async-queue-push! (async-scheduler-group-ready-queue group) task)
         (if-feature pthreads
@@ -441,8 +475,7 @@
               [else
                (let ([task (async-queue-pop! q)])
                  (if (and (eq? (async-task-state task) 'ready)
-                          (async-task-migratable? task)
-                          (not (async-task-pinned? task)))
+                          (async-task-group-runnable? task))
                      (let ([old (async-task-scheduler task)])
                        (unless (eq? old sched)
                          (sched-registry-remove/raw! old task)
@@ -460,26 +493,78 @@
         (void)))
     (async-group-wake! group)))
 
-;;; Deliver a payload to a ready task.  May run on a foreign thread.
+(define async-publish-ready!
+  (lambda (task completion-sched)
+    (if (and (async-task-group-runnable? task)
+             ;; Raising through a captured suspension is entered on the
+             ;; scheduler that owns the wait.  Normal values remain free to
+             ;; migrate before resumption.
+             (let ([payload (async-task-payload task)])
+               (not (and (pair? payload) (eq? (car payload) 'raise)))))
+        (async-group-submit! task)
+        (if (and (async-scheduler-owner-thread completion-sched)
+                 (fx= (async-scheduler-owner-thread completion-sched)
+                      (get-thread-id)))
+            (async-queue-push! (async-scheduler-next-queue completion-sched) task)
+            (async-remote-submit completion-sched task)))))
+
+;;; Deliver a payload to a suspended task.  May run on a foreign thread.  A
+;;; completion can race with the old scheduler unwinding the suspension.  In
+;;; that case, record the delivery until the old execution has fully restored
+;;; its scheduler state.
 (define $async-deliver-task
   (lambda (task payload)
-    (let ([sched (async-task-scheduler task)])
-      (with-async-mutex (async-task-mutex task)
-        (async-task-payload-set! task payload)
-        (async-task-current-wait-set! task #f)
-        (async-task-nack-thunk-set! task #f)
-        (async-task-state-set! task 'ready))
-      (with-async-mutex (async-scheduler-remote-mutex sched)
-        ($async-scheduler-wakeup-count-set! sched
-          (fx+ 1 ($async-scheduler-wakeup-count sched))))
-      (if (and (async-task-migratable? task)
-               (not (async-task-pinned? task))
-               (async-group-parallel? ($async-scheduler-group sched)))
-          (async-group-submit! task)
-          (if (and (async-scheduler-owner-thread sched)
-                   (fx= (async-scheduler-owner-thread sched) (get-thread-id)))
-              (async-queue-push! (async-scheduler-next-queue sched) task)
-              (async-remote-submit sched task))))))
+    (let-values ([(completion-sched publish?)
+                  (with-async-mutex (async-task-mutex task)
+                    (let ([completion-sched
+                           (or (async-task-wait-scheduler task)
+                               (async-task-scheduler task))])
+                      (async-task-payload-set! task payload)
+                      (async-task-current-wait-set! task #f)
+                      (async-task-nack-thunk-set! task #f)
+                      (if (eq? (async-task-suspension-state task) 'parked)
+                          (begin
+                            (async-task-suspension-state-set! task #f)
+                            (async-task-state-set! task 'ready)
+                            (values completion-sched #t))
+                          (begin
+                            (async-task-suspension-state-set! task 'delivered)
+                            (values completion-sched #f)))))])
+      (with-async-mutex (async-scheduler-remote-mutex completion-sched)
+        ($async-scheduler-wakeup-count-set! completion-sched
+          (fx+ 1 ($async-scheduler-wakeup-count completion-sched))))
+      (when publish?
+        (async-publish-ready! task completion-sched)))))
+
+;;; Mark the suspension as leaving the task runner.  Publication is deferred
+;;; until async-run-task-once has returned to the scheduler loop, so the reset
+;;; call that captured the continuation is no longer active.
+(define async-finish-suspension!
+  (lambda (task)
+    (with-async-mutex (async-task-mutex task)
+      (unless (eq? (async-task-suspension-state task) 'delivered)
+        (async-task-suspension-state-set! task 'parking)))))
+
+;;; Complete the handoff after the task runner has returned.  A result that
+;;; arrived during unwind is published here; otherwise later delivery can
+;;; publish directly from the parked state.
+(define async-complete-suspension!
+  (lambda (task)
+    (let-values ([(completion-sched publish?)
+                  (with-async-mutex (async-task-mutex task)
+                    (if (eq? (async-task-suspension-state task) 'delivered)
+                        (begin
+                          (async-task-suspension-state-set! task #f)
+                          (async-task-state-set! task 'ready)
+                          (values
+                            (or (async-task-wait-scheduler task)
+                                (async-task-scheduler task))
+                            #t))
+                        (begin
+                          (async-task-suspension-state-set! task 'parked)
+                          (values #f #f))))])
+      (when publish?
+        (async-publish-ready! task completion-sched)))))
 
 (define async-remote-submit
   (lambda (sched task)
@@ -601,6 +686,8 @@
                 (with-async-mutex (async-task-mutex task)
                   (async-task-state-set! task 'waiting)
                   (async-task-resumption-set! task k)
+                  (async-task-wait-scheduler-set! task sched)
+                  (async-task-suspension-state-set! task 'unwinding)
                   (async-task-sync-state-set! task ss)
                   ($async-scheduler-suspension-count-set! sched
                     (fx+ 1 ($async-scheduler-suspension-count sched))))
@@ -608,7 +695,8 @@
                        [cancel?
                         (with-async-mutex (async-task-mutex task)
                           (when (and desc
-                                     (eq? (async-task-state task) 'waiting))
+                                     (eq? (async-task-state task) 'waiting)
+                                     (async-sync-state-live? ss))
                             (async-task-current-wait-set! task desc))
                           (and (async-task-cancel-state task)
                                (eq? (async-task-state task) 'waiting)
@@ -616,7 +704,9 @@
                   (when cancel?
                     ($async-cancel-waiting-task task)))
                 async-suspend-token))])
-      (set-sched-switch! sched #f)
+      ;; Resolve through the scheduler installed for this execution instead
+      ;; of retaining the scheduler that captured the continuation.
+      (set-current-sched-switch! #f)
       payload)))
 
 (define async-deliver-operation-payload
@@ -756,7 +846,7 @@
                  (let ([id (async-scheduler-group-next-task-id group)])
                    (async-scheduler-group-next-task-id-set! group (fx+ 1 id))
                    id))])
-      (make-async-task id name 'ready entry #f #f sched migratable? #f
+      (make-async-task id name 'ready entry #f #f group sched #f migratable? '() #f
         (async-snapshot-dynamic-state)
         (current-exception-state)
         parent-group #f '() #f '() #f #f #f #f #f #f #f #f (make-async-mutex)))))
@@ -817,6 +907,8 @@
            (with-async-mutex (async-task-mutex task)
              (async-task-state-set! task state)
              (async-task-current-wait-set! task #f)
+             (async-task-wait-scheduler-set! task #f)
+             (async-task-suspension-state-set! task #f)
              (async-task-resumption-set! task #f)
              (async-task-engine-set! task #f)
              (case state
@@ -981,7 +1073,6 @@
   (lambda (sched task)
     (if (async-task-entry task)
         (let ([entry (async-task-entry task)])
-          (async-task-pinned?-set! task #t)
           (async-task-entry-set! task #f)
           ($control-reset-at (async-scheduler-prompt-tag sched) #t entry))
         (let ([resumption (async-task-resumption task)]
@@ -998,10 +1089,12 @@
            [engine (or saved-engine
                        ($make-engine-with-timer-hooks
                          (lambda () (async-run-task-step sched task))
-                         (lambda () (set-sched-switch! sched #t))
-                         (lambda () (set-sched-switch! sched #f))))]
+                         (lambda () (set-current-sched-switch! #t))
+                         (lambda () (set-current-sched-switch! #f))))]
           [old-active ($async-engine-active)])
       (async-task-engine-set! task #f)
+      (when saved-engine
+        (async-task-remove-affinity! task 'engine))
       ($async-engine-active #t)
       (when saved-engine (set-sched-switch! sched #t))
       (let ([outcome
@@ -1016,53 +1109,85 @@
 (define async-run-task-once
   (lambda (sched task)
     (async-scheduler-exec-count-set! sched (fx+ 1 (async-scheduler-exec-count sched)))
-    (async-task-current-wait-set! task #f)
-    (if (and (async-task-entry task) (task-cancel-requested? task))
-        ;; a ready task observes cancellation before running user code
-        (terminate-task! sched task 'canceled
-          (cons 'raise (task-cancellation-condition task)))
-        (begin
-          (when (and (not (async-task-entry task))
-                     (task-cancel-requested? task)
-                     (not (async-task-cancel-shield? task)))
-            (async-task-payload-set! task
-              (cons 'raise (task-cancellation-condition task))))
-          (async-task-state-set! task 'running)
-          (async-scheduler-current-task-set! sched task)
-          (install-task-dynamic-state! sched task)
-          (let* ([ticks (async-scheduler-preemption-ticks sched)]
-                 [outcome
-                  (if ticks
-                      (async-run-task-engine sched task ticks)
-                      (guard (c [else (cons 'internal-escape c)])
-                        (async-run-task-step sched task)))])
-            (when (and (pair? outcome)
-                       (eq? (car outcome) async-engine-expiration-token))
-              (snapshot-task-dynamic-state! sched task))
-            (set-sched-switch! sched #f)
-            (async-scheduler-current-task-set! sched #f)
-            (restore-scheduler-dynamic-state! sched)
-            (cond
-              [(eq? outcome async-suspend-token) (void)]
-              [(and (pair? outcome)
-                    (eq? (car outcome) async-engine-expiration-token))
-               (async-task-engine-set! task (cdr outcome))
-               (async-task-state-set! task 'ready)
-               (async-scheduler-preemption-count-set! sched
-                 (fx+ 1 (async-scheduler-preemption-count sched)))
-               (async-queue-push! (async-scheduler-next-queue sched) task)]
-              [(and (pair? outcome) (eq? (car outcome) 'done))
-               ;; a task that observes cancellation and still returns has
-               ;; handled the request cooperatively
-               (terminate-task! sched task 'completed outcome)]
-              [(and (pair? outcome) (eq? (car outcome) 'failed))
-               (if (and (task-cancel-requested? task)
-                        ($async-cancellation-condition? (cdr outcome)))
-                   (terminate-task! sched task 'canceled outcome)
-                   (terminate-task! sched task 'failed outcome))]
-              [else
-               (terminate-task! sched task 'failed
-                 (cons 'raise (cdr outcome)))]))))))
+    (let ([wait-owner (async-task-wait-scheduler task)])
+      (if (and wait-owner
+               (not (eq? wait-owner sched))
+               (async-task-resumption task)
+               (task-cancel-requested? task))
+          (begin
+            ;; A normal completion may have published the task globally just
+            ;; before cancellation.  Return it to the suspension owner before
+            ;; replacing the value payload with a cancellation raise.
+            (let ([group (async-task-scheduler-group task)])
+              (with-async-mutex (async-scheduler-group-mutex group)
+                (sched-registry-remove/raw! sched task)
+                (async-task-scheduler-set! task wait-owner)
+                (sched-registry-add/raw! wait-owner task)))
+            (async-remote-submit wait-owner task)
+            #f)
+          (begin
+            (async-task-current-wait-set! task #f)
+            (async-task-wait-scheduler-set! task #f)
+            (async-task-suspension-state-set! task #f)
+            (if (and (async-task-entry task) (task-cancel-requested? task))
+                ;; A ready task observes cancellation before running user code.
+              (begin
+                (terminate-task! sched task 'canceled
+                  (cons 'raise (task-cancellation-condition task)))
+                #f)
+              (begin
+                (when (and (not (async-task-entry task))
+                           (task-cancel-requested? task)
+                           (not (async-task-cancel-shield? task)))
+                  (async-task-payload-set! task
+                    (cons 'raise (task-cancellation-condition task))))
+                (async-task-state-set! task 'running)
+                (async-scheduler-current-task-set! sched task)
+                (install-task-dynamic-state! sched task)
+                (let* ([ticks (async-scheduler-preemption-ticks sched)]
+                       [outcome
+                        (if ticks
+                            (async-run-task-engine sched task ticks)
+                            (guard (c [else (cons 'internal-escape c)])
+                              (async-run-task-step sched task)))])
+                  (when (and (pair? outcome)
+                             (eq? (car outcome)
+                                  async-engine-expiration-token))
+                    (snapshot-task-dynamic-state! sched task))
+                  (set-sched-switch! sched #f)
+                  (async-scheduler-current-task-set! sched #f)
+                  (restore-scheduler-dynamic-state! sched)
+                  (cond
+                    [(eq? outcome async-suspend-token)
+                     (async-finish-suspension! task)
+                     task]
+                    [(and (pair? outcome)
+                          (eq? (car outcome)
+                               async-engine-expiration-token))
+                     (async-task-engine-set! task (cdr outcome))
+                     (async-task-add-affinity! task 'engine)
+                     (async-task-state-set! task 'ready)
+                     (async-scheduler-preemption-count-set! sched
+                       (fx+ 1 (async-scheduler-preemption-count sched)))
+                     (async-queue-push!
+                       (async-scheduler-next-queue sched)
+                       task)
+                     #f]
+                    [(and (pair? outcome) (eq? (car outcome) 'done))
+                     ;; A task that observes cancellation and still returns
+                     ;; has handled the request cooperatively.
+                     (terminate-task! sched task 'completed outcome)
+                     #f]
+                    [(and (pair? outcome) (eq? (car outcome) 'failed))
+                     (if (and (task-cancel-requested? task)
+                              ($async-cancellation-condition? (cdr outcome)))
+                         (terminate-task! sched task 'canceled outcome)
+                         (terminate-task! sched task 'failed outcome))
+                     #f]
+                    [else
+                     (terminate-task! sched task 'failed
+                       (cons 'raise (cdr outcome)))
+                     #f])))))))))
 
 (define async-scheduler-run
   (lambda (sched)
@@ -1101,7 +1226,9 @@
                 (unless (async-queue-empty? current)
                   (let ([task (async-queue-pop! current)])
                     (when (eq? (async-task-state task) 'ready)
-                      (async-run-task-once sched task)))
+                      (let ([handoff (async-run-task-once sched task)])
+                        (when handoff
+                          (async-complete-suspension! handoff)))))
                   (turn-loop)))
               (loop)))))))
 
