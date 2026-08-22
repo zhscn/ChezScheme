@@ -17,6 +17,13 @@
 (import (chezscheme async io errors))
 (import (chezscheme async io stream))
 (import (chezscheme async io dns))
+(import (chezscheme async io system))
+(import (chezscheme async io poll))
+(import (chezscheme async io process))
+(import (chezscheme async io signal))
+(import (chezscheme async io watch))
+(import (chezscheme async io tty))
+(import (chezscheme async io udp))
 (import (chezscheme async io fs))
 
 (define asyncio-temp-path
@@ -211,6 +218,239 @@
       (asyncio-delete-if-present path)
       result))
 
+  ;; Extended filesystem requests preserve native result ownership and expose
+  ;; both operation and direct forms.
+  (let ([prefix (asyncio-temp-path "fs-XXXXXX")])
+    (let ([ok
+           (run-async
+             (lambda ()
+               (let* ([dir (temporary-directory-create prefix)]
+                      [path (string-append dir "/source")]
+                      [copy (string-append dir "/copy")]
+                      [hard (string-append dir "/hard")]
+                      [sym (string-append dir "/sym")]
+                      [file (file-open path '(read write create exclusive))])
+                 (file-write file (string->utf8 "abcdef"))
+                 (file-sync file)
+                 (file-data-sync file)
+                 (file-truncate file 3)
+                 (file-mode-set! file #o600)
+                 (file-times-set! file 1000 1001)
+                 (let ([stat (file-stat file)])
+                   (file-close file)
+                   (file-copy path copy '(exclusive))
+                   (file-link path hard)
+                   (file-symbolic-link path sym)
+                   (let* ([lstat (file-lstat sym)]
+                          [target (file-read-link sym)]
+                          [real (file-real-path sym)]
+                          [entries (directory-scan dir)]
+                          [fs (file-system-stat dir)]
+                          [access? (file-access? path '(read write))]
+                          [names (map car entries)])
+                     (file-delete sym)
+                     (file-delete hard)
+                     (file-delete copy)
+                     (file-delete path)
+                     (directory-delete dir)
+                     (and (= (cdr (assq 'size stat)) 3)
+                          (not (= (fxlogand (cdr (assq 'mode lstat)) #o170000)
+                                  #o100000))
+                          (string=? target path)
+                          (string=? real path)
+                          access?
+                          (for-all (lambda (name) (member name names))
+                            '("source" "copy" "hard" "sym"))
+                          (positive? (cdr (assq 'block-size fs)))))))))])
+      ok))
+
+  (let ([pattern (asyncio-temp-path "mkstemp-XXXXXX")])
+    (run-async
+      (lambda ()
+        (let-values ([(file path)
+                      (perform-operation
+                        (temporary-file-open-operation pattern))])
+          (let ([ok (and (async-file? file) (string? path)
+                         (file-access? path '(exists)))])
+            (perform-operation (file-close-operation file))
+            (perform-operation (file-delete-operation path))
+            ok)))))
+
+  ;; Streaming directory handles read bounded batches and close explicitly.
+  (let ([path (asyncio-temp-path "directory-handle")])
+    (when (file-exists? path) (rmdir path))
+    (run-async
+      (lambda ()
+        (directory-create path)
+        (for-each
+          (lambda (name)
+            (let ([f (file-open (string-append path "/" name)
+                       '(write create truncate))])
+              (file-close f)))
+          '("a" "b" "c"))
+        (let ([directory (directory-open path)])
+          (let loop ([names '()])
+            (let ([batch (directory-read directory 2)])
+              (if (null? batch)
+                  (begin
+                    (directory-close directory)
+                    (for-each
+                      (lambda (name) (file-delete (string-append path "/" name)))
+                      '("a" "b" "c"))
+                    (directory-delete path)
+                    (for-all (lambda (name) (and (member name names) #t))
+                      '("a" "b" "c")))
+                  (loop (append (map car batch) names)))))))))
+
+  ;; sendfile keeps both descriptors alive until libuv completes the request.
+  (let ([source (asyncio-temp-path "sendfile-source")]
+        [target (asyncio-temp-path "sendfile-target")])
+    (asyncio-delete-if-present source)
+    (asyncio-delete-if-present target)
+    (let ([result
+           (run-async
+             (lambda ()
+               (let ([input (file-open source '(read write create truncate))]
+                     [output (file-open target '(read write create truncate))])
+                 (file-write input (string->utf8 "0123456789"))
+                 (let ([sent (file-send output input 2 5)])
+                   (file-close input)
+                   (file-close output)
+                   (let ([check (file-open target '(read))])
+                     (let ([contents (utf8->string (file-read check 16))])
+                       (file-close check)
+                       (list sent contents)))))))])
+      (asyncio-delete-if-present source)
+      (asyncio-delete-if-present target)
+      (equal? result '(5 "23456"))))
+
+  ;; reverse DNS, random data, system information, and loop metrics.
+  (run-async
+    (lambda ()
+      (let-values ([(host service) (dns-reverse "127.0.0.1" 80 '(numeric))])
+        (let ([memory (system-memory-info)]
+              [process (system-process-info)]
+              [paths (system-path-info)]
+              [uname (system-uname)]
+              [usage (system-resource-usage)]
+              [metrics (async-loop-metrics)])
+          (and (string=? host "127.0.0.1")
+               (string=? service "80")
+               (= (bytevector-length (random-bytevector 32)) 32)
+               (positive? (system-high-resolution-time))
+               (real? (system-uptime))
+               (= (length (system-load-average)) 3)
+               (assq 'total memory)
+               (assq 'pid process)
+               (assq 'hostname paths)
+               (assq 'system uname)
+               (pair? (system-cpu-info))
+               (list? (system-interface-info))
+               (assq 'user-time usage)
+               (assq 'loop-count metrics))))))
+
+  ;; child stdio pipes use the ordinary stream protocol.
+  (run-async
+    (lambda ()
+      (let-values ([(child stdin stdout stderr)
+                    (process-spawn "/bin/sh"
+                      '("-c" "printf process-stdout; printf process-stderr >&2"))])
+        (stream-close stdin)
+        (let ([out (utf8->string (stream-read stdout))]
+              [err (utf8->string (stream-read stderr))])
+          (let-values ([(status signal) (process-wait child)])
+            (stream-close stdout)
+            (stream-close stderr)
+            (process-close child)
+            (and (string=? out "process-stdout")
+                 (string=? err "process-stderr")
+                 (= status 0)
+                 (= signal 0)))))))
+
+  ;; signal watchers deliver exactly one awaited occurrence.
+  (run-async
+    (lambda ()
+      (let* ([watcher (signal-open 10)]
+             [sender
+              (spawn-task
+                (lambda ()
+                  (async-sleep 0.01)
+                  (process-id-kill (get-process-id) 10)))])
+        (let ([received (signal-receive watcher)])
+          (task-join sender)
+          (signal-close watcher)
+          (= received 10)))))
+
+  ;; filesystem event and polling watchers report mutations.
+  (let ([path (asyncio-temp-path "watch")])
+    (asyncio-delete-if-present path)
+    (mkdir path)
+    (let ([result
+           (run-async
+             (lambda ()
+               (let* ([event (fs-event-open path)]
+                      [changed (string-append path "/changed")]
+                      [writer
+                       (spawn-task
+                         (lambda ()
+                           (async-sleep 0.01)
+                           (let ([f (file-open changed
+                                      '(write create truncate))])
+                             (file-write f (string->utf8 "x"))
+                             (file-close f))))])
+                 (let-values ([(name events) (fs-event-receive event)])
+                   (task-join writer)
+                   (fs-event-close event)
+                   (file-delete changed)
+                   (and (string? name)
+                        (or (memq 'rename events) (memq 'change events)))))))])
+      (rmdir path)
+      result))
+
+  (let ([path (asyncio-temp-path "fs-poll")])
+    (asyncio-delete-if-present path)
+    (call-with-output-file path
+      (lambda (p) (display "x" p))
+      'replace)
+    (let ([result
+           (run-async
+             (lambda ()
+               (let* ([poll (fs-poll-open path 10)]
+                      [writer
+                       (spawn-task
+                         (lambda ()
+                           (async-sleep 0.03)
+                           (let ([f (file-open path '(write truncate))])
+                             (file-write f (string->utf8 "xy"))
+                             (file-close f))))])
+                 (let-values ([(old current) (fs-poll-receive poll)])
+                   (task-join writer)
+                   (fs-poll-close poll)
+                   (and (= (cdr (assq 'size old)) 1)
+                        (= (cdr (assq 'size current)) 2))))))])
+      (asyncio-delete-if-present path)
+      result))
+
+  ;; A process pipe supplies a pollable descriptor without transferring it.
+  (let-values ([(to-stdin from-stdout from-stderr pid)
+                (open-process-ports "/bin/true")])
+    (let ([result
+           (run-async
+             (lambda ()
+               (let ([poll (fd-poll-open
+                             (port-file-descriptor from-stdout))])
+                 (let ([events (fd-poll poll '(readable disconnect))])
+                   (fd-poll-close poll)
+                   (pair? events)))))])
+      (close-output-port to-stdin)
+      (close-input-port from-stdout)
+      (close-input-port from-stderr)
+      result))
+
+  ;; TTY entry points validate descriptors even without a controlling TTY.
+  (and (error? (run-async (lambda () (tty-open -1))))
+       (memq (tty-virtual-terminal-state) '(supported unsupported)))
+
   ;; filesystem failures retain operation and path information
 
   (let ([path (asyncio-temp-path "missing")])
@@ -235,6 +475,28 @@
                   (= (cadr answer) 80)
                   (and (memv (caddr answer) '(4 6)) #t)))
            answers)))
+
+  ;; UDP preserves datagram boundaries and reports numeric peer addresses.
+  (run-async
+    (lambda ()
+      (let ([server (udp-open "127.0.0.1" 0)]
+            [client (udp-open "127.0.0.1" 0)])
+        (let-values ([(host port family) (udp-local-address server)])
+          (udp-connect! client host port)
+          (udp-option-set! client 'ttl 64)
+          (let ([sent (perform-operation
+                        (udp-send-operation client (string->utf8 "ping")))])
+            (let-values ([(bv peer peer-port peer-family)
+                          (perform-operation
+                            (udp-receive-operation server))])
+              (udp-disconnect! client)
+              (udp-close client)
+              (udp-close server)
+              (and (= sent 4)
+                   (string=? (utf8->string bv) "ping")
+                   (= family 4)
+                   (= peer-family 4)
+                   (positive? peer-port))))))))
 
   ;; Each scheduler owns its libuv loop, and I/O completion resumes a task on
   ;; the scheduler thread where that task began executing.

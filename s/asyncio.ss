@@ -36,6 +36,15 @@
 (define AIO-EV-FS 6)
 (define AIO-EV-DNS 7)
 (define AIO-EV-CLOSE 8)
+(define AIO-EV-UDP-RECV 9)
+(define AIO-EV-UDP-SEND 10)
+(define AIO-EV-NAMEINFO 11)
+(define AIO-EV-RANDOM 12)
+(define AIO-EV-POLL 13)
+(define AIO-EV-PROCESS 14)
+(define AIO-EV-SIGNAL 15)
+(define AIO-EV-FS-EVENT 16)
+(define AIO-EV-FS-POLL 17)
 
 ;;; per-poll dispatch bound so a sustained completion stream cannot starve
 ;;; runnable tasks
@@ -82,11 +91,80 @@
 (define aio-free #f)
 (define aio-write #f)
 (define aio-shutdown #f)
+(define aio-udp-init #f)
+(define aio-udp-bind #f)
+(define aio-udp-connect #f)
+(define aio-udp-recv-start #f)
+(define aio-udp-recv-stop #f)
+(define aio-udp-recv-copy #f)
+(define aio-udp-recv-addr #f)
+(define aio-udp-recv-free #f)
+(define aio-udp-send #f)
+(define aio-udp-address #f)
+(define aio-udp-set-membership #f)
+(define aio-udp-set-option #f)
+(define aio-udp-set-multicast-interface #f)
 (define aio-dns-lookup #f)
 (define aio-dns-cancel #f)
 (define aio-dns-count #f)
 (define aio-dns-addr #f)
 (define aio-dns-free #f)
+(define aio-dns-reverse #f)
+(define aio-dns-reverse-cancel #f)
+(define aio-dns-reverse-copy #f)
+(define aio-dns-reverse-free #f)
+(define aio-random #f)
+(define aio-random-cancel #f)
+(define aio-random-copy #f)
+(define aio-random-free #f)
+(define aio-poll-init #f)
+(define aio-poll-start #f)
+(define aio-poll-stop #f)
+(define aio-process-spawn #f)
+(define aio-process-pid #f)
+(define aio-process-kill #f)
+(define aio-kill #f)
+(define aio-process-term-signal #f)
+(define aio-process-result-free #f)
+(define aio-signal-init #f)
+(define aio-signal-start #f)
+(define aio-signal-stop #f)
+(define aio-fs-event-init #f)
+(define aio-fs-event-start #f)
+(define aio-fs-event-stop #f)
+(define aio-fs-event-result-copy #f)
+(define aio-fs-event-result-free #f)
+(define aio-fs-poll-init #f)
+(define aio-fs-poll-start #f)
+(define aio-fs-poll-stop #f)
+(define aio-fs-poll-result-field #f)
+(define aio-fs-poll-result-free #f)
+(define aio-tty-init #f)
+(define aio-tty-set-mode #f)
+(define aio-tty-winsize #f)
+(define aio-tty-get-vterm-state #f)
+(define aio-tty-set-vterm-state #f)
+(define aio-tty-reset-mode #f)
+(define aio-system-u64 #f)
+(define aio-system-double #f)
+(define aio-system-string #f)
+(define aio-uname-string #f)
+(define aio-cpu-info #f)
+(define aio-cpu-info-count #f)
+(define aio-cpu-info-model #f)
+(define aio-cpu-info-field #f)
+(define aio-cpu-info-free #f)
+(define aio-interface-info #f)
+(define aio-interface-count #f)
+(define aio-interface-name #f)
+(define aio-interface-address #f)
+(define aio-interface-internal #f)
+(define aio-interface-physical #f)
+(define aio-interface-free #f)
+(define aio-rusage #f)
+(define aio-rusage-field #f)
+(define aio-rusage-free #f)
+(define aio-loop-metric #f)
 (define aio-fs-open #f)
 (define aio-fs-read #f)
 (define aio-fs-write #f)
@@ -98,6 +176,36 @@
 (define aio-fs-rename #f)
 (define aio-fs-mkdir #f)
 (define aio-fs-rmdir #f)
+(define aio-fs-copyfile #f)
+(define aio-fs-mkdtemp #f)
+(define aio-fs-mkstemp #f)
+(define aio-fs-scandir #f)
+(define aio-fs-scandir-next #f)
+(define aio-fs-opendir #f)
+(define aio-fs-readdir #f)
+(define aio-fs-closedir #f)
+(define aio-fs-closedir-now #f)
+(define aio-fs-result-ptr #f)
+(define aio-fs-readdir-entry #f)
+(define aio-fs-fsync #f)
+(define aio-fs-fdatasync #f)
+(define aio-fs-ftruncate #f)
+(define aio-fs-sendfile #f)
+(define aio-fs-access #f)
+(define aio-fs-chmod #f)
+(define aio-fs-fchmod #f)
+(define aio-fs-utime #f)
+(define aio-fs-futime #f)
+(define aio-fs-lstat #f)
+(define aio-fs-link #f)
+(define aio-fs-readlink #f)
+(define aio-fs-result-string-length #f)
+(define aio-fs-result-string-copy #f)
+(define aio-fs-result-path-length #f)
+(define aio-fs-result-path-copy #f)
+(define aio-fs-chown #f)
+(define aio-fs-statfs #f)
+(define aio-fs-statfs-field #f)
 (define aio-fs-req-free #f)
 (define aio-fs-cancel #f)
 (define aio-fs-data #f)
@@ -136,11 +244,84 @@
     (set! aio-free (foreign-procedure "aio_free" (void*) void))
     (set! aio-write (foreign-procedure "aio_write" (void* u8* integer-64 integer-64) int))
     (set! aio-shutdown (foreign-procedure "aio_shutdown" (void* integer-64) int))
+    (set! aio-udp-init (foreign-procedure "aio_udp_init" (void* integer-64) void*))
+    (set! aio-udp-bind (foreign-procedure "aio_udp_bind" (void* string integer-64 int) int))
+    (set! aio-udp-connect (foreign-procedure "aio_udp_connect" (void* string integer-64) int))
+    (set! aio-udp-recv-start (foreign-procedure "aio_udp_recv_start" (void*) int))
+    (set! aio-udp-recv-stop (foreign-procedure "aio_udp_recv_stop" (void*) int))
+    (set! aio-udp-recv-copy (foreign-procedure "aio_udp_recv_copy" (void* u8* integer-64) void))
+    (set! aio-udp-recv-addr (foreign-procedure "aio_udp_recv_addr" (void* u8* integer-64) integer-64))
+    (set! aio-udp-recv-free (foreign-procedure "aio_udp_recv_free" (void*) void))
+    (set! aio-udp-send (foreign-procedure "aio_udp_send" (void* u8* integer-64 string integer-64 integer-64) int))
+    (set! aio-udp-address (foreign-procedure "aio_udp_address" (void* int u8* integer-64) integer-64))
+    (set! aio-udp-set-membership (foreign-procedure "aio_udp_set_membership" (void* string string string int) int))
+    (set! aio-udp-set-option (foreign-procedure "aio_udp_set_option" (void* int integer-64) int))
+    (set! aio-udp-set-multicast-interface (foreign-procedure "aio_udp_set_multicast_interface" (void* string) int))
     (set! aio-dns-lookup (foreign-procedure "aio_dns_lookup" (void* string string integer-64) integer-64))
     (set! aio-dns-cancel (foreign-procedure "aio_dns_cancel" (void*) int))
     (set! aio-dns-count (foreign-procedure "aio_dns_count" (void*) integer-64))
     (set! aio-dns-addr (foreign-procedure "aio_dns_addr" (void* integer-64 u8* integer-64) integer-64))
     (set! aio-dns-free (foreign-procedure "aio_dns_free" (void*) void))
+    (set! aio-dns-reverse (foreign-procedure "aio_dns_reverse" (void* string integer-64 int integer-64) integer-64))
+    (set! aio-dns-reverse-cancel (foreign-procedure "aio_dns_reverse_cancel" (void*) int))
+    (set! aio-dns-reverse-copy (foreign-procedure "aio_dns_reverse_copy" (void* int u8* integer-64) integer-64))
+    (set! aio-dns-reverse-free (foreign-procedure "aio_dns_reverse_free" (void*) void))
+    (set! aio-random (foreign-procedure "aio_random" (void* integer-64 integer-64) integer-64))
+    (set! aio-random-cancel (foreign-procedure "aio_random_cancel" (void*) int))
+    (set! aio-random-copy (foreign-procedure "aio_random_copy" (void* u8*) void))
+    (set! aio-random-free (foreign-procedure "aio_random_free" (void*) void))
+    (set! aio-poll-init (foreign-procedure "aio_poll_init" (void* integer-64 integer-64) void*))
+    (set! aio-poll-start (foreign-procedure "aio_poll_start" (void* int) int))
+    (set! aio-poll-stop (foreign-procedure "aio_poll_stop" (void*) int))
+    (set! aio-process-spawn
+      (foreign-procedure "aio_process_spawn"
+        (void* integer-64 string u8* integer-64 u8* integer-64 int string int
+         int integer-64 void* int integer-64 void* int integer-64 void*)
+        integer-64))
+    (set! aio-process-pid (foreign-procedure "aio_process_pid" (void*) integer-64))
+    (set! aio-process-kill (foreign-procedure "aio_process_kill" (void* int) int))
+    (set! aio-kill (foreign-procedure "aio_kill" (integer-64 int) int))
+    (set! aio-process-term-signal (foreign-procedure "aio_process_term_signal" (void*) integer-64))
+    (set! aio-process-result-free (foreign-procedure "aio_process_result_free" (void*) void))
+    (set! aio-signal-init (foreign-procedure "aio_signal_init" (void* integer-64) void*))
+    (set! aio-signal-start (foreign-procedure "aio_signal_start" (void* int int) int))
+    (set! aio-signal-stop (foreign-procedure "aio_signal_stop" (void*) int))
+    (set! aio-fs-event-init (foreign-procedure "aio_fs_event_init" (void* integer-64) void*))
+    (set! aio-fs-event-start (foreign-procedure "aio_fs_event_start" (void* string int) int))
+    (set! aio-fs-event-stop (foreign-procedure "aio_fs_event_stop" (void*) int))
+    (set! aio-fs-event-result-copy (foreign-procedure "aio_fs_event_result_copy" (void* u8* integer-64) int))
+    (set! aio-fs-event-result-free (foreign-procedure "aio_fs_event_result_free" (void*) void))
+    (set! aio-fs-poll-init (foreign-procedure "aio_fs_poll_init" (void* integer-64) void*))
+    (set! aio-fs-poll-start (foreign-procedure "aio_fs_poll_start" (void* string integer-64) int))
+    (set! aio-fs-poll-stop (foreign-procedure "aio_fs_poll_stop" (void*) int))
+    (set! aio-fs-poll-result-field (foreign-procedure "aio_fs_poll_result_field" (void* int integer-64) integer-64))
+    (set! aio-fs-poll-result-free (foreign-procedure "aio_fs_poll_result_free" (void*) void))
+    (set! aio-tty-init (foreign-procedure "aio_tty_init" (void* integer-64 integer-64) void*))
+    (set! aio-tty-set-mode (foreign-procedure "aio_tty_set_mode" (void* int) int))
+    (set! aio-tty-winsize (foreign-procedure "aio_tty_winsize" (void* int) int))
+    (set! aio-tty-get-vterm-state (foreign-procedure "aio_tty_get_vterm_state" () int))
+    (set! aio-tty-set-vterm-state (foreign-procedure "aio_tty_set_vterm_state" (int) void))
+    (set! aio-tty-reset-mode (foreign-procedure "aio_tty_reset_mode" () void))
+    (set! aio-system-u64 (foreign-procedure "aio_system_u64" (int) unsigned-64))
+    (set! aio-system-double (foreign-procedure "aio_system_double" (int) double))
+    (set! aio-system-string (foreign-procedure "aio_system_string" (int u8* integer-64) int))
+    (set! aio-uname-string (foreign-procedure "aio_uname_string" (int u8* integer-64) int))
+    (set! aio-cpu-info (foreign-procedure "aio_cpu_info" () void*))
+    (set! aio-cpu-info-count (foreign-procedure "aio_cpu_info_count" (void*) integer-64))
+    (set! aio-cpu-info-model (foreign-procedure "aio_cpu_info_model" (void* integer-64 u8* integer-64) int))
+    (set! aio-cpu-info-field (foreign-procedure "aio_cpu_info_field" (void* integer-64 int) unsigned-64))
+    (set! aio-cpu-info-free (foreign-procedure "aio_cpu_info_free" (void*) void))
+    (set! aio-interface-info (foreign-procedure "aio_interface_info" () void*))
+    (set! aio-interface-count (foreign-procedure "aio_interface_count" (void*) integer-64))
+    (set! aio-interface-name (foreign-procedure "aio_interface_name" (void* integer-64 u8* integer-64) int))
+    (set! aio-interface-address (foreign-procedure "aio_interface_address" (void* integer-64 int u8* integer-64) integer-64))
+    (set! aio-interface-internal (foreign-procedure "aio_interface_internal" (void* integer-64) int))
+    (set! aio-interface-physical (foreign-procedure "aio_interface_physical" (void* integer-64 u8*) int))
+    (set! aio-interface-free (foreign-procedure "aio_interface_free" (void*) void))
+    (set! aio-rusage (foreign-procedure "aio_rusage" () void*))
+    (set! aio-rusage-field (foreign-procedure "aio_rusage_field" (void* int) integer-64))
+    (set! aio-rusage-free (foreign-procedure "aio_rusage_free" (void*) void))
+    (set! aio-loop-metric (foreign-procedure "aio_loop_metric" (void* int) integer-64))
     (set! aio-fs-open (foreign-procedure "aio_fs_open" (void* string int integer-64 integer-64) integer-64))
     (set! aio-fs-read (foreign-procedure "aio_fs_read" (void* integer-64 integer-64 integer-64 integer-64) integer-64))
     (set! aio-fs-write (foreign-procedure "aio_fs_write" (void* integer-64 u8* integer-64 integer-64 integer-64) integer-64))
@@ -152,6 +333,36 @@
     (set! aio-fs-rename (foreign-procedure "aio_fs_rename" (void* string string integer-64) integer-64))
     (set! aio-fs-mkdir (foreign-procedure "aio_fs_mkdir" (void* string integer-64 integer-64) integer-64))
     (set! aio-fs-rmdir (foreign-procedure "aio_fs_rmdir" (void* string integer-64) integer-64))
+    (set! aio-fs-copyfile (foreign-procedure "aio_fs_copyfile" (void* string string int integer-64) integer-64))
+    (set! aio-fs-mkdtemp (foreign-procedure "aio_fs_mkdtemp" (void* string integer-64) integer-64))
+    (set! aio-fs-mkstemp (foreign-procedure "aio_fs_mkstemp" (void* string integer-64) integer-64))
+    (set! aio-fs-scandir (foreign-procedure "aio_fs_scandir" (void* string integer-64) integer-64))
+    (set! aio-fs-scandir-next (foreign-procedure "aio_fs_scandir_next" (void* u8* integer-64) int))
+    (set! aio-fs-opendir (foreign-procedure "aio_fs_opendir" (void* string integer-64) integer-64))
+    (set! aio-fs-readdir (foreign-procedure "aio_fs_readdir" (void* void* integer-64 integer-64) integer-64))
+    (set! aio-fs-closedir (foreign-procedure "aio_fs_closedir" (void* void* integer-64) integer-64))
+    (set! aio-fs-closedir-now (foreign-procedure "aio_fs_closedir_now" (void*) int))
+    (set! aio-fs-result-ptr (foreign-procedure "aio_fs_result_ptr" (void*) void*))
+    (set! aio-fs-readdir-entry (foreign-procedure "aio_fs_readdir_entry" (void* integer-64 u8* integer-64) int))
+    (set! aio-fs-fsync (foreign-procedure "aio_fs_fsync" (void* integer-64 integer-64) integer-64))
+    (set! aio-fs-fdatasync (foreign-procedure "aio_fs_fdatasync" (void* integer-64 integer-64) integer-64))
+    (set! aio-fs-ftruncate (foreign-procedure "aio_fs_ftruncate" (void* integer-64 integer-64 integer-64) integer-64))
+    (set! aio-fs-sendfile (foreign-procedure "aio_fs_sendfile" (void* integer-64 integer-64 integer-64 integer-64 integer-64) integer-64))
+    (set! aio-fs-access (foreign-procedure "aio_fs_access" (void* string int integer-64) integer-64))
+    (set! aio-fs-chmod (foreign-procedure "aio_fs_chmod" (void* string integer-64 integer-64) integer-64))
+    (set! aio-fs-fchmod (foreign-procedure "aio_fs_fchmod" (void* integer-64 integer-64 integer-64) integer-64))
+    (set! aio-fs-utime (foreign-procedure "aio_fs_utime" (void* string double double int integer-64) integer-64))
+    (set! aio-fs-futime (foreign-procedure "aio_fs_futime" (void* integer-64 double double integer-64) integer-64))
+    (set! aio-fs-lstat (foreign-procedure "aio_fs_lstat" (void* string integer-64) integer-64))
+    (set! aio-fs-link (foreign-procedure "aio_fs_link" (void* string string int int integer-64) integer-64))
+    (set! aio-fs-readlink (foreign-procedure "aio_fs_readlink" (void* string int integer-64) integer-64))
+    (set! aio-fs-result-string-length (foreign-procedure "aio_fs_result_string_length" (void*) integer-64))
+    (set! aio-fs-result-string-copy (foreign-procedure "aio_fs_result_string_copy" (void* u8* integer-64) int))
+    (set! aio-fs-result-path-length (foreign-procedure "aio_fs_result_path_length" (void*) integer-64))
+    (set! aio-fs-result-path-copy (foreign-procedure "aio_fs_result_path_copy" (void* u8* integer-64) int))
+    (set! aio-fs-chown (foreign-procedure "aio_fs_chown" (void* string integer-64 integer-64 integer-64 int integer-64) integer-64))
+    (set! aio-fs-statfs (foreign-procedure "aio_fs_statfs" (void* string integer-64) integer-64))
+    (set! aio-fs-statfs-field (foreign-procedure "aio_fs_statfs_field" (void* int) unsigned-64))
     (set! aio-fs-req-free (foreign-procedure "aio_fs_req_free" (void*) void))
     (set! aio-fs-cancel (foreign-procedure "aio_fs_cancel" (void*) int))
     (set! aio-fs-data (foreign-procedure "aio_fs_data" (void*) void*))
@@ -187,6 +398,7 @@
     (immutable requests-mutex)
     (immutable handles)           ; id -> weak-cons wrapper #t
     (immutable files)             ; fd -> weak-cons async-file #t
+    (immutable directories)       ; native pointer -> weak-cons async-directory #t
     (mutable completions)         ; list of (id kind status aux)
     (mutable commands)            ; owner-thread thunks, newest first
     (immutable command-mutex)     ; also guards closing and wakeup lifetime
@@ -194,7 +406,8 @@
     (immutable stop-mutex)
     (mutable closing?)
     (immutable guardian)
-    (immutable file-guardian)))
+    (immutable file-guardian)
+    (immutable directory-guardian)))
 
 (define-record-type (aio-req make-aio-req aio-req?)
   (nongenerative)
@@ -226,7 +439,8 @@
     (mutable read-queue)          ; list of (ss . deliver)
     (mutable reading?)
     (mutable eof?)
-    (mutable accept-queue)))      ; list of (ss . deliver)
+    (mutable accept-queue)        ; list of (ss . deliver)
+    (mutable result)))            ; process exit result, or #f
 
 (define-record-type (async-file make-async-file% %async-file?)
   (nongenerative)
@@ -237,6 +451,18 @@
     (immutable state)
     (mutable port-owned?)
     (mutable offset)
+    (mutable closed?)
+    (immutable mutex)
+    (mutable busy?)
+    (mutable queue)))
+
+(define-record-type (async-directory make-async-directory% %async-directory?)
+  (nongenerative)
+  (sealed #t)
+  (fields
+    (immutable pointer)
+    (immutable path)
+    (immutable state)
     (mutable closed?)
     (immutable mutex)
     (mutable busy?)
@@ -343,6 +569,22 @@
     (aio-debug-check-owner! (async-file-state f))
     (hashtable-delete! (aio-state-files (async-file-state f))
       (async-file-fd f))))
+
+(define aio-register-directory!
+  (lambda (st d)
+    (aio-debug-check-owner! st)
+    (aio-invariant (eq? (async-directory-state d) st)
+      "directory registered with a foreign loop" d)
+    (hashtable-set! (aio-state-directories st) (async-directory-pointer d)
+      (weak-cons d #t))
+    ((aio-state-directory-guardian st) d)
+    d))
+
+(define aio-unregister-directory!
+  (lambda (d)
+    (aio-debug-check-owner! (async-directory-state d))
+    (hashtable-delete! (aio-state-directories (async-directory-state d))
+      (async-directory-pointer d))))
 
 (define aio-lookup-handle
   (lambda (st id)
@@ -474,6 +716,8 @@
                     (case (aio-req-kind req)
                       [(fs) (aio-fs-cancel cd)]
                       [(dns) (aio-dns-cancel cd)]
+                      [(nameinfo) (aio-dns-reverse-cancel cd)]
+                      [(random) (aio-random-cancel cd)]
                       [else (void)])))))))))))
 
 ;;; ------------------------------------------------------------- dispatch
@@ -485,6 +729,13 @@
       [(fx= kind AIO-EV-READ) (aio-on-read st id status aux)]
       [(fx= kind AIO-EV-ACCEPT) (aio-on-accept st id status)]
       [(fx= kind AIO-EV-CLOSE) (aio-on-close st id)]
+      [(fx= kind AIO-EV-UDP-RECV) (aio-on-udp-recv st id status aux)]
+      [(fx= kind AIO-EV-POLL) (aio-on-poll st id status aux)]
+      [(fx= kind AIO-EV-PROCESS) (aio-on-process-exit st id status aux)]
+      [(or (fx= kind AIO-EV-SIGNAL)
+           (fx= kind AIO-EV-FS-EVENT)
+           (fx= kind AIO-EV-FS-POLL))
+       (aio-on-watch st id kind status aux)]
       [else (aio-on-request st id status aux)])))
 
 (define aio-on-request
@@ -556,6 +807,146 @@
            (when free-aux? (aio-free aux))
            (for-each (lambda (d) ((car d) (cdr d))) deliveries))]))))
 
+(define aio-udp-address-values
+  (lambda (encoded buf)
+    (values (bv->cstring buf)
+            (fxmod encoded 65536)
+            (quotient encoded 65536))))
+
+(define aio-udp-recv-payload
+  (lambda (h status aux)
+    (if (fx>= status 0)
+        (let ([bv (make-bytevector status)] [addr (make-bytevector 64)])
+          (aio-udp-recv-copy aux bv status)
+          (let ([encoded (aio-udp-recv-addr aux addr 64)])
+            (aio-udp-recv-free aux)
+            (if (fx< encoded 0)
+                (cons 'raise
+                  (aio-io-condition 'udp-receive h (aio-handle-path h)
+                    encoded))
+                (let-values ([(host port family)
+                              (aio-udp-address-values encoded addr)])
+                  (cons 'values (list bv host port family))))))
+        (cons 'raise
+          (aio-io-condition 'udp-receive h (aio-handle-path h) status)))))
+
+(define aio-on-udp-recv
+  (lambda (st id status aux)
+    (let ([h (aio-lookup-handle st id)])
+      (if (not h)
+          (when aux (aio-udp-recv-free aux))
+          (let ([delivery #f] [free? #f])
+            (with-mutex (aio-handle-mutex h)
+              (aio-handle-reading?-set! h #f)
+              (aio-handle-read-queue-set! h
+                (filter (lambda (w) (not (aio-waiter-dead? (car w))))
+                  (aio-handle-read-queue h)))
+              (let ([q (aio-handle-read-queue h)])
+                (if (or (aio-handle-closing? h) (null? q))
+                    (set! free? (and aux #t))
+                    (begin
+                      (aio-handle-read-queue-set! h (cdr q))
+                      (set! delivery
+                        (cons (cdar q) (aio-udp-recv-payload h status aux))))))
+              (when (and (not (aio-handle-closing? h))
+                         (pair? (aio-handle-read-queue h)))
+                (aio-handle-reading?-set! h #t)
+                (aio-udp-recv-start (aio-handle-handle h))))
+            (when free? (aio-udp-recv-free aux))
+            (when delivery ((car delivery) (cdr delivery))))))))
+
+(define aio-poll-event-list
+  (lambda (bits)
+    (let ([events '()])
+      (when (fxlogtest bits 1) (set! events (cons 'readable events)))
+      (when (fxlogtest bits 2) (set! events (cons 'writable events)))
+      (when (fxlogtest bits 4) (set! events (cons 'disconnect events)))
+      (when (fxlogtest bits 8) (set! events (cons 'prioritized events)))
+      (reverse events))))
+
+(define aio-on-poll
+  (lambda (st id status aux)
+    (let ([h (aio-lookup-handle st id)])
+      (when h
+        (let ([waiter #f])
+          (with-mutex (aio-handle-mutex h)
+            (aio-handle-reading?-set! h #f)
+            (let ([q (aio-handle-read-queue h)])
+              (when (pair? q)
+                (set! waiter (car q))
+                (aio-handle-read-queue-set! h '()))))
+          (when (and waiter (not (aio-waiter-dead? (car waiter))))
+            ((cdr waiter)
+             (if (fx< status 0)
+                 (cons 'raise
+                   (aio-io-condition 'fd-poll h (aio-handle-path h) status))
+                 (cons 'values (list (aio-poll-event-list status)))))))))))
+
+(define aio-on-process-exit
+  (lambda (st id status aux)
+    (let ([process (aio-lookup-handle st id)])
+      (let ([term-signal (aio-process-term-signal aux)])
+        (when aux (aio-process-result-free aux))
+        (when process
+          (let ([waiters '()] [result (cons status term-signal)])
+            (with-mutex (aio-handle-mutex process)
+              (aio-handle-result-set! process result)
+              (set! waiters (aio-handle-accept-queue process))
+              (aio-handle-accept-queue-set! process '()))
+            (for-each
+              (lambda (waiter)
+                (unless (aio-waiter-dead? (car waiter))
+                  ((cdr waiter) (cons 'values (list status term-signal)))))
+              waiters)))))))
+
+(define aio-watch-payload
+  (lambda (h kind status aux)
+    (cond
+      [(fx= kind AIO-EV-SIGNAL) (cons 'values (list status))]
+      [(fx< status 0)
+       (cons 'raise
+         (aio-io-condition (aio-handle-kind h) h (aio-handle-path h) status))]
+      [(fx= kind AIO-EV-FS-EVENT)
+       (let ([buf (make-bytevector 4097)])
+         (let ([events (aio-fs-event-result-copy aux buf 4097)])
+           (if (fx< events 0)
+               (cons 'raise
+                 (aio-io-condition 'fs-event h (aio-handle-path h) events))
+               (cons 'values
+                 (list (bv->cstring buf)
+                       (append (if (fxlogtest events 1) '(rename) '())
+                               (if (fxlogtest events 2) '(change) '())))))))]
+      [else
+       (let ([stat
+              (lambda (current?)
+                (define (field i)
+                  (aio-fs-poll-result-field aux (if current? 1 0) i))
+                (list (cons 'dev (field 0)) (cons 'mode (field 1))
+                      (cons 'nlink (field 2)) (cons 'uid (field 3))
+                      (cons 'gid (field 4)) (cons 'rdev (field 5))
+                      (cons 'ino (field 6)) (cons 'size (field 7))
+                      (cons 'blksize (field 8)) (cons 'blocks (field 9))
+                      (cons 'atime (cons (field 12) (field 13)))
+                      (cons 'mtime (cons (field 14) (field 15)))
+                      (cons 'ctime (cons (field 16) (field 17)))))])
+         (cons 'values (list (stat #f) (stat #t))))])))
+
+(define aio-on-watch
+  (lambda (st id kind status aux)
+    (let ([h (aio-lookup-handle st id)] [waiter #f])
+      (when h
+        (with-mutex (aio-handle-mutex h)
+          (aio-handle-reading?-set! h #f)
+          (let ([q (aio-handle-read-queue h)])
+            (when (pair? q)
+              (set! waiter (car q))
+              (aio-handle-read-queue-set! h '())))))
+      (let ([payload (and h waiter (aio-watch-payload h kind status aux))])
+        (when (fx= kind AIO-EV-FS-EVENT) (aio-fs-event-result-free aux))
+        (when (fx= kind AIO-EV-FS-POLL) (aio-fs-poll-result-free aux))
+        (when (and waiter (not (aio-waiter-dead? (car waiter))))
+          ((cdr waiter) payload))))))
+
 ;;; attempt one accept; returns a payload, or #f when nothing is pending
 (define aio-attempt-accept
   (lambda (st h)
@@ -573,7 +964,7 @@
                           (if (eq? (aio-handle-kind h) 'pipe-listener)
                               'pipe-stream
                               'tcp-stream)
-                          st #f #f (make-mutex) #f #f '() #f #f '())])
+                          st #f #f (make-mutex) #f #f '() #f #f '() #f)])
                  (aio-register-handle! st w)
                  (cons 'values (list w)))]
               [(fx= r (aio-eagain-code))
@@ -643,7 +1034,14 @@
             (when (and (aio-handle-reading? h)
                        (null? (aio-handle-read-queue h)))
               (aio-handle-reading?-set! h #f)
-              (aio-read-stop (aio-handle-handle h)))))
+              ((case (aio-handle-kind h)
+                 [(udp) aio-udp-recv-stop]
+                 [(poll) aio-poll-stop]
+                 [(signal) aio-signal-stop]
+                 [(fs-event) aio-fs-event-stop]
+                 [(fs-poll) aio-fs-poll-stop]
+                 [else aio-read-stop])
+               (aio-handle-handle h)))))
         hs))))
 
 (define aio-drain-guardian!
@@ -677,6 +1075,27 @@
             (aio-finalize-file! f)
             (loop)))))))
 
+(define aio-finalize-directory!
+  (lambda (d)
+    (let ([close?
+           (with-mutex (async-directory-mutex d)
+             (if (async-directory-closed? d)
+                 #f
+                 (begin
+                   (async-directory-closed?-set! d #t)
+                   #t)))])
+      (when close? (aio-fs-closedir-now (async-directory-pointer d)))
+      (aio-unregister-directory! d))))
+
+(define aio-drain-directory-guardian!
+  (lambda (st)
+    (let ([g (aio-state-directory-guardian st)])
+      (let loop ()
+        (let ([d (g)])
+          (when d
+            (aio-finalize-directory! d)
+            (loop)))))))
+
 ;;; ------------------------------------------------------- poll and wake
 
 (define AIO-IDLE-RECHECK-MS 100)
@@ -703,6 +1122,7 @@
         (aio-debug-check-owner! st)
         (aio-drain-guardian! st)
         (aio-drain-file-guardian! st)
+        (aio-drain-directory-guardian! st)
         (aio-drain-commands! st)
         (aio-drain-stop-set! st)
         (when block? (aio-arm-bridge st sched))
@@ -744,6 +1164,8 @@
                     (case (aio-req-kind req)
                       [(fs) (aio-fs-cancel cd)]
                       [(dns) (aio-dns-cancel cd)]
+                      [(nameinfo) (aio-dns-reverse-cancel cd)]
+                      [(random) (aio-random-cancel cd)]
                       [else (void)]))))
               vs)))
         (aio-handle-close (aio-state-wakeup st))
@@ -768,12 +1190,21 @@
                 (unless (bwp-object? f)
                   (aio-finalize-file! f))))
             files))
+        (let-values ([(pointers directories)
+                      (hashtable-entries (aio-state-directories st))])
+          (vector-for-each
+            (lambda (p)
+              (let ([d (car p)])
+                (unless (bwp-object? d) (aio-finalize-directory! d))))
+            directories))
         (aio-invariant (fx= (hashtable-size (aio-state-requests st)) 0)
           "loop shutdown retained native requests" st)
         (aio-invariant (fx= (hashtable-size (aio-state-handles st)) 0)
           "loop shutdown retained native handles" st)
         (aio-invariant (fx= (hashtable-size (aio-state-files st)) 0)
           "loop shutdown retained native files" st)
+        (aio-invariant (fx= (hashtable-size (aio-state-directories st)) 0)
+          "loop shutdown retained native directories" st)
         (aio-loop-destroy (aio-state-loop st))
         (with-mutex aio-loop-registry-mutex
           (hashtable-delete! aio-loop-registry (aio-state-loop st)))))))
@@ -808,9 +1239,10 @@
                 (let ([st (make-aio-state sched loop wakeup bridge
                         1 (make-eq-hashtable) (make-mutex)
                         (make-eq-hashtable) (make-eq-hashtable)
+                        (make-eq-hashtable)
                         '() '() (make-mutex)
                         '() (make-mutex) #f
-                        (make-guardian) (make-guardian))])
+                        (make-guardian) (make-guardian) (make-guardian))])
                   (with-mutex aio-loop-registry-mutex
                     (hashtable-set! aio-loop-registry loop st))
                   (aio-set-notify loop (foreign-callable-entry-point aio-notify-trampoline))
@@ -1150,7 +1582,7 @@
          ($oops 'tcp-listen "cannot allocate a tcp handle"))
        (let ([w (make-aio-handle id h 'tcp-listener st
                   (format "~a:~a" host port) #f (make-mutex)
-                  #f #f '() #f #f '())])
+                  #f #f '() #f #f '() #f)])
          (define (fail r)
            (aio-handle-close h)
            (raise (aio-io-condition 'listen w (aio-handle-path w) r)))
@@ -1227,7 +1659,7 @@
                   #f)
                 (let ([w (make-aio-handle id h 'tcp-stream st
                            (format "~a:~a" host port) #f (make-mutex)
-                           #f #f '() #f #f '())])
+                           #f #f '() #f #f '() #f)])
                   (aio-register-handle! st w)
                   (let ([r (aio-tcp-connect h host port id)])
                     (if (< r 0)
@@ -1274,7 +1706,7 @@
        (when (= h 0)
          ($oops 'pipe-listen "cannot allocate a pipe handle"))
        (let ([w (make-aio-handle id h 'pipe-listener st path #f (make-mutex)
-                  #f #f '() #f #f '())])
+                  #f #f '() #f #f '() #f)])
          (define (fail r)
            (aio-handle-close h)
            (raise (aio-io-condition 'listen w path r)))
@@ -1303,7 +1735,7 @@
                     (cons 'raise (aio-io-condition 'connect #f path -12)))
                   #f)
                 (let ([w (make-aio-handle id h 'pipe-stream st path #f (make-mutex)
-                           #f #f '() #f #f '())])
+                           #f #f '() #f #f '() #f)])
                   (aio-register-handle! st w)
                   (aio-register-request! st id
                     (make-aio-req 'connect w deliver #f
@@ -1373,6 +1805,826 @@
          (lambda (vals) vals)
          (aio-request-nack token)))]))
 
+;;; ------------------------------------------------------------------ udp
+
+(define aio-check-udp
+  (lambda (who socket)
+    (unless (and (aio-handle? socket)
+                 (eq? (aio-handle-kind socket) 'udp))
+      ($oops who "~s is not a UDP socket" socket))))
+
+(define aio-check-udp-open!
+  (lambda (who socket)
+    (aio-check-udp who socket)
+    (aio-check-handle-scope! who socket)
+    (when (with-mutex (aio-handle-mutex socket)
+            (aio-handle-closing? socket))
+      (raise (aio-closed-condition who socket)))))
+
+(define aio-udp-bind-flag-bits
+  (lambda (who flags)
+    (unless (and (list? flags) (for-all symbol? flags))
+      ($oops who "~s is not a list of UDP bind flags" flags))
+    (fold-left
+      (lambda (bits flag)
+        (case flag
+          [(ipv6-only) (fxlogior bits 1)]
+          [(reuse-address) (fxlogior bits 2)]
+          [else ($oops who "~s is not a UDP bind flag" flag)]))
+      0 flags)))
+
+(define %udp-open
+  (case-lambda
+    [()
+     (let* ([st (aio-ensure-state! 'udp-open)]
+            [id (aio-next-id st)]
+            [h (aio-udp-init (aio-state-loop st) id)])
+       (when (= h 0) ($oops 'udp-open "cannot allocate a UDP handle"))
+       (let ([socket
+              (make-aio-handle id h 'udp st #f #f (make-mutex)
+                #f #f '() #f #f '() #f)])
+         (aio-register-handle! st socket)
+         socket))]
+    [(host port) (%udp-open host port '())]
+    [(host port flags)
+     (aio-check-host-port 'udp-open host port)
+     (let ([socket (%udp-open)])
+       (let ([r (aio-udp-bind (aio-handle-handle socket) host port
+                  (aio-udp-bind-flag-bits 'udp-open flags))])
+         (if (fx< r 0)
+             (begin
+               (aio-close-handle socket 'udp-open)
+               (raise (aio-io-condition 'udp-bind socket
+                        (format "~a:~a" host port) r)))
+             socket)))]))
+
+(define aio-start-udp-recv!
+  (lambda (socket)
+    (with-mutex (aio-handle-mutex socket)
+      (when (and (not (aio-handle-reading? socket))
+                 (not (aio-handle-closing? socket))
+                 (pair? (aio-handle-read-queue socket)))
+        (aio-handle-reading?-set! socket #t)
+        (let ([r (aio-udp-recv-start (aio-handle-handle socket))])
+          (when (fx< r 0)
+            (aio-handle-reading?-set! socket #f)
+            (let ([waiter (car (aio-handle-read-queue socket))])
+              (aio-handle-read-queue-set! socket
+                (cdr (aio-handle-read-queue socket)))
+              ((cdr waiter)
+               (cons 'raise
+                 (aio-io-condition 'udp-receive socket
+                   (aio-handle-path socket) r))))))))))
+
+(define %udp-receive-operation
+  (lambda (socket)
+    (aio-check-udp 'udp-receive-operation socket)
+    (make-operation
+      (lambda (ss)
+        (aio-check-udp-open! 'udp-receive-operation socket)
+        #f)
+      (lambda (ss deliver)
+        (aio-check-udp-open! 'udp-receive-operation socket)
+        (let ([blocked?
+               (with-mutex (aio-handle-mutex socket)
+                 (if (aio-handle-closing? socket)
+                     (begin
+                       (deliver (cons 'raise
+                                  (aio-closed-condition 'udp-receive socket)))
+                       #f)
+                     (begin
+                       (aio-handle-read-queue-set! socket
+                         (append (aio-handle-read-queue socket)
+                           (list (cons ss deliver))))
+                       #t)))])
+          (when blocked?
+            (aio-run-on-owner! (aio-handle-state socket)
+              (lambda () (aio-start-udp-recv! socket))))
+          (and blocked? (list 'udp-receive (aio-handle-id socket)))))
+      (lambda (vals) vals)
+      (lambda (ss)
+        (with-mutex (aio-handle-mutex socket)
+          (aio-handle-read-queue-set! socket
+            (filter (lambda (w) (not (eq? (car w) ss)))
+              (aio-handle-read-queue socket))))
+        (let ([st (aio-handle-state socket)])
+          (with-mutex (aio-state-stop-mutex st)
+            (aio-state-stop-set-set! st
+              (cons socket (aio-state-stop-set st)))))))))
+
+(define %udp-send-operation
+  (case-lambda
+    [(socket bv) (%udp-send-operation socket bv "" 0)]
+    [(socket bv host port)
+     (aio-check-udp 'udp-send-operation socket)
+     (unless (bytevector? bv)
+       ($oops 'udp-send-operation "~s is not a bytevector" bv))
+     (unless (string=? host "")
+       (aio-check-host-port 'udp-send-operation host port))
+     (let ([token (list 'udp-send-operation)])
+       (make-operation
+         (lambda (ss)
+           (aio-check-udp-open! 'udp-send-operation socket)
+           #f)
+         (lambda (ss deliver)
+           (aio-check-udp-open! 'udp-send-operation socket)
+           (let* ([st (aio-handle-state socket)]
+                  [id-box (box #f)]
+                  [canceled-box (box #f)]
+                  [len (bytevector-length bv)])
+             ($async-sync-slot-set! ss token
+               (vector st id-box canceled-box))
+             (if (aio-run-on-owner! st
+                   (lambda ()
+                     (unless (or (aio-atomic-box-ref canceled-box)
+                                 (aio-waiter-dead? ss))
+                       (let* ([id (aio-next-id st)]
+                              [r (aio-udp-send (aio-handle-handle socket)
+                                   bv len host port id)])
+                         (aio-atomic-box-set-once! id-box id)
+                         (if (fx< r 0)
+                             (deliver (cons 'raise
+                                        (aio-io-condition 'udp-send socket
+                                          (aio-handle-path socket) r)))
+                             (begin
+                               (aio-register-request! st id
+                                 (make-aio-req 'udp-send socket deliver #f
+                                   (aio-plain-finish
+                                     (lambda (status aux)
+                                       (if (fx= status 0)
+                                           (cons 'values (list len))
+                                           (cons 'raise
+                                             (aio-io-condition 'udp-send socket
+                                               (aio-handle-path socket)
+                                               status)))))
+                                   #f))
+                               (when (or (aio-atomic-box-ref canceled-box)
+                                         (aio-waiter-dead? ss))
+                                 (aio-cancel-request! st id))))))))
+                 (list 'udp-send (aio-handle-id socket))
+                 (begin
+                   (deliver (cons 'raise
+                              (aio-closed-condition 'udp-send socket)))
+                   #f))))
+         (lambda (vals) vals)
+         (aio-request-nack token)))]))
+
+(define aio-udp-control
+  (lambda (who socket thunk)
+    (aio-check-udp-open! who socket)
+    (let ([r (thunk)])
+      (when (fx< r 0)
+        (raise (aio-io-condition who socket (aio-handle-path socket) r))))))
+
+(define aio-udp-address-list
+  (lambda (who socket peer?)
+    (aio-check-udp-open! who socket)
+    (let ([buf (make-bytevector 64)])
+      (let ([encoded (aio-udp-address (aio-handle-handle socket)
+                       (if peer? 1 0) buf 64)])
+        (if (fx< encoded 0)
+            (raise (aio-io-condition who socket (aio-handle-path socket)
+                     encoded))
+            (let-values ([(host port family)
+                          (aio-udp-address-values encoded buf)])
+              (list host port family)))))))
+
+;;; ----------------------------------------- reverse DNS, random, fd poll
+
+(define aio-nameinfo-flag-bits
+  (lambda (who flags)
+    (unless (and (list? flags) (for-all symbol? flags))
+      ($oops who "~s is not a list of reverse-DNS flags" flags))
+    (fold-left
+      (lambda (bits flag)
+        (case flag
+          [(name-required) (fxlogior bits 1)]
+          [(numeric-host) (fxlogior bits 2)]
+          [(numeric-service) (fxlogior bits 4)]
+          [else ($oops who "~s is not a reverse-DNS flag" flag)]))
+      0 flags)))
+
+(define %dns-reverse-operation
+  (case-lambda
+    [(host port) (%dns-reverse-operation host port '())]
+    [(host port flags)
+     (aio-check-host-port 'dns-reverse-operation host port)
+     (let ([bits (aio-nameinfo-flag-bits 'dns-reverse-operation flags)]
+           [token (list 'dns-reverse-operation)])
+       (make-operation
+         (lambda (ss) #f)
+         (lambda (ss deliver)
+           (let* ([st (aio-ensure-state! 'dns-reverse-operation)]
+                  [id (aio-next-id st)]
+                  [ctx (aio-dns-reverse (aio-state-loop st) host port bits id)])
+             (if (fx< ctx 0)
+                 (begin
+                   (deliver
+                     (cons 'raise
+                       (aio-io-condition 'reverse-dns #f host ctx)))
+                   #f)
+                 (begin
+                   ($async-sync-slot-set! ss token (cons st id))
+                   (aio-register-request! st id
+                     (make-aio-req 'nameinfo #f deliver ctx
+                       (lambda (canceled? status aux)
+                         (dynamic-wind
+                           (lambda () (void))
+                           (lambda ()
+                             (and (not canceled?)
+                                  (if (fx= status 0)
+                                      (let ([host-buf (make-bytevector 1024)]
+                                            [service-buf (make-bytevector 256)])
+                                        (let ([hr (aio-dns-reverse-copy aux 0
+                                                    host-buf 1024)]
+                                              [sr (aio-dns-reverse-copy aux 1
+                                                    service-buf 256)])
+                                          (if (or (fx< hr 0) (fx< sr 0))
+                                              (cons 'raise
+                                                (aio-io-condition 'reverse-dns
+                                                  #f host
+                                                  (if (fx< hr 0) hr sr)))
+                                              (cons 'values
+                                                (list (bv->cstring host-buf)
+                                                      (bv->cstring service-buf))))))
+                                      (cons 'raise
+                                        (aio-io-condition 'reverse-dns #f host
+                                          status)))))
+                           (lambda () (aio-dns-reverse-free aux))))
+                       #f))
+                   (list 'reverse-dns id)))))
+         (lambda (vals) vals)
+         (aio-request-nack token)))]))
+
+(define %random-bytevector-operation
+  (lambda (length)
+    (unless (and (fixnum? length) (fx>= length 0))
+      ($oops 'random-bytevector-operation
+        "~s is not a nonnegative fixnum" length))
+    (let ([token (list 'random-bytevector-operation)])
+      (make-operation
+        (lambda (ss) #f)
+        (lambda (ss deliver)
+          (let* ([st (aio-ensure-state! 'random-bytevector-operation)]
+                 [id (aio-next-id st)]
+                 [ctx (aio-random (aio-state-loop st) length id)])
+            (if (fx< ctx 0)
+                (begin
+                  (deliver
+                    (cons 'raise (aio-io-condition 'random #f #f ctx)))
+                  #f)
+                (begin
+                  ($async-sync-slot-set! ss token (cons st id))
+                  (aio-register-request! st id
+                    (make-aio-req 'random #f deliver ctx
+                      (lambda (canceled? status aux)
+                        (dynamic-wind
+                          (lambda () (void))
+                          (lambda ()
+                            (and (not canceled?)
+                                 (if (fx= status 0)
+                                     (let ([bv (make-bytevector length)])
+                                       (aio-random-copy aux bv)
+                                       (cons 'values (list bv)))
+                                     (cons 'raise
+                                       (aio-io-condition 'random #f #f status)))))
+                          (lambda () (aio-random-free aux))))
+                      #f))
+                  (list 'random id))))
+        (lambda (vals) vals)
+        (aio-request-nack token))))))
+
+(define aio-poll-event-bits
+  (lambda (who events)
+    (unless (and (list? events) (for-all symbol? events))
+      ($oops who "~s is not a list of poll events" events))
+    (let ([bits
+           (fold-left
+             (lambda (bits event)
+               (case event
+                 [(readable) (fxlogior bits 1)]
+                 [(writable) (fxlogior bits 2)]
+                 [(disconnect) (fxlogior bits 4)]
+                 [(prioritized) (fxlogior bits 8)]
+                 [else ($oops who "~s is not a poll event" event)]))
+             0 events)])
+      (when (fx= bits 0) ($oops who "poll event list is empty"))
+      bits)))
+
+(define %fd-poll-open
+  (lambda (fd)
+    (unless (and (fixnum? fd) (fx>= fd 0))
+      ($oops 'fd-poll-open "~s is not a file descriptor" fd))
+    (let* ([st (aio-ensure-state! 'fd-poll-open)]
+           [id (aio-next-id st)]
+           [h (aio-poll-init (aio-state-loop st) fd id)])
+      (when (= h 0)
+        (raise (aio-io-condition 'fd-poll-open #f #f 'init-failed)))
+      (let ([poll (make-aio-handle id h 'poll st (format "fd ~a" fd)
+                    #f (make-mutex) #f #f '() #f #f '() #f)])
+        (aio-register-handle! st poll)
+        poll))))
+
+(define %fd-poll-operation
+  (lambda (poll events)
+    (unless (and (aio-handle? poll) (eq? (aio-handle-kind poll) 'poll))
+      ($oops 'fd-poll-operation "~s is not an fd poll handle" poll))
+    (let ([bits (aio-poll-event-bits 'fd-poll-operation events)])
+      (make-operation
+        (lambda (ss)
+          (aio-check-handle-scope! 'fd-poll-operation poll)
+          (with-mutex (aio-handle-mutex poll)
+            (cond
+              [(aio-handle-closing? poll)
+               (cons 'raise (aio-closed-condition 'fd-poll poll))]
+              [(pair? (aio-handle-read-queue poll))
+               (cons 'raise
+                 (aio-io-condition 'fd-poll poll (aio-handle-path poll)
+                   'busy))]
+              [else #f])))
+        (lambda (ss deliver)
+          (aio-check-handle-scope! 'fd-poll-operation poll)
+          (let ([start?
+                 (with-mutex (aio-handle-mutex poll)
+                   (cond
+                     [(aio-handle-closing? poll)
+                      (deliver
+                        (cons 'raise (aio-closed-condition 'fd-poll poll)))
+                      #f]
+                     [(pair? (aio-handle-read-queue poll))
+                      (deliver
+                        (cons 'raise
+                          (aio-io-condition 'fd-poll poll
+                            (aio-handle-path poll) 'busy)))
+                      #f]
+                     [else
+                      (aio-handle-read-queue-set! poll
+                        (list (cons ss deliver)))
+                      (aio-handle-reading?-set! poll #t)
+                      #t]))])
+            (when start?
+              (aio-run-on-owner! (aio-handle-state poll)
+                (lambda ()
+                  (let ([r (aio-poll-start (aio-handle-handle poll) bits)])
+                    (when (fx< r 0)
+                      (aio-on-poll (aio-handle-state poll)
+                        (aio-handle-id poll) r 0))))))
+            (and start? (list 'fd-poll (aio-handle-id poll)))))
+        (lambda (vals) vals)
+        (lambda (ss)
+          (with-mutex (aio-handle-mutex poll)
+            (aio-handle-read-queue-set! poll '()))
+          (let ([st (aio-handle-state poll)])
+            (with-mutex (aio-state-stop-mutex st)
+              (aio-state-stop-set-set! st
+                (cons poll (aio-state-stop-set st))))))))))
+
+;;; ---------------------------------------------------------- processes
+
+(define aio-string-has-nul?
+  (lambda (s)
+    (let loop ([i 0])
+      (and (fx< i (string-length s))
+           (or (char=? (string-ref s i) #\nul) (loop (fx+ i 1)))))))
+
+(define aio-string-list-blob
+  (lambda (who strings empty-ok?)
+    (unless (and (list? strings) (for-all string? strings))
+      ($oops who "~s is not a list of strings" strings))
+    (when (and (null? strings) (not empty-ok?))
+      ($oops who "argument list is empty"))
+    (for-each
+      (lambda (s)
+        (when (aio-string-has-nul? s)
+          ($oops who "string contains a nul character: ~s" s)))
+      strings)
+    (if (null? strings)
+        (make-bytevector 1 0)
+        (let* ([parts (map string->utf8 strings)]
+               [length (fold-left
+                         (lambda (n bv) (fx+ n (fx+ (bytevector-length bv) 1)))
+                         0 parts)]
+               [blob (make-bytevector length 0)])
+          (let loop ([parts parts] [offset 0])
+            (if (null? parts)
+                blob
+                (let ([n (bytevector-length (car parts))])
+                  (bytevector-copy! (car parts) 0 blob offset n)
+                  (loop (cdr parts) (fx+ offset (fx+ n 1))))))))))
+
+(define aio-process-option
+  (lambda (options key default)
+    (let ([entry (assq key options)]) (if entry (cdr entry) default))))
+
+(define aio-process-flags
+  (lambda (who flags)
+    (unless (and (list? flags) (for-all symbol? flags))
+      ($oops who "~s is not a list of process flags" flags))
+    (fold-left
+      (lambda (bits flag)
+        (case flag
+          [(detached) (fxlogior bits 1)]
+          [(windows-hide) (fxlogior bits 2)]
+          [(windows-verbatim-arguments) (fxlogior bits 4)]
+          [else ($oops who "~s is not a process flag" flag)]))
+      0 flags)))
+
+(define aio-process-stdio
+  (lambda (who value child-reads? inherit-fd)
+    (cond
+      [(eq? value 'pipe) (values (if child-reads? 2 3) -1 #t)]
+      [(eq? value 'ignore) (values 0 -1 #f)]
+      [(eq? value 'inherit) (values 1 inherit-fd #f)]
+      [(and (fixnum? value) (fx>= value 0)) (values 1 value #f)]
+      [else ($oops who "~s is not a stdio specification" value)])))
+
+(define %process-spawn
+  (case-lambda
+    [(file arguments) (%process-spawn file arguments '())]
+    [(file arguments options)
+     (aio-check-path 'process-spawn file)
+     (unless (list? options) ($oops 'process-spawn "~s is not an alist" options))
+     (let* ([argv (aio-string-list-blob 'process-spawn
+                    (cons file arguments) #f)]
+            [environment (aio-process-option options 'environment #f)]
+            [env-present? (not (eq? environment #f))]
+            [env-strings
+             (and env-present?
+                  (map (lambda (entry)
+                         (unless (and (pair? entry) (string? (car entry))
+                                      (string? (cdr entry)))
+                           ($oops 'process-spawn
+                             "~s is not an environment entry" entry))
+                         (string-append (car entry) "=" (cdr entry)))
+                       environment))]
+            [env (aio-string-list-blob 'process-spawn
+                   (or env-strings '()) #t)]
+            [cwd (aio-process-option options 'cwd "")]
+            [flags (aio-process-flags 'process-spawn
+                     (aio-process-option options 'flags '()))]
+            [st (aio-ensure-state! 'process-spawn)]
+            [process-id (aio-next-id st)])
+       (unless (string? cwd) ($oops 'process-spawn "~s is not a cwd" cwd))
+       (let-values ([(in-mode in-fd in-pipe?)
+                     (aio-process-stdio 'process-spawn
+                       (aio-process-option options 'stdin 'pipe) #t 0)]
+                    [(out-mode out-fd out-pipe?)
+                     (aio-process-stdio 'process-spawn
+                       (aio-process-option options 'stdout 'pipe) #f 1)]
+                    [(err-mode err-fd err-pipe?)
+                     (aio-process-stdio 'process-spawn
+                       (aio-process-option options 'stderr 'pipe) #f 2)])
+         (let* ([in-id (and in-pipe? (aio-next-id st))]
+                [out-id (and out-pipe? (aio-next-id st))]
+                [err-id (and err-pipe? (aio-next-id st))]
+                [in-h (if in-pipe? (aio-pipe-init (aio-state-loop st) in-id) 0)]
+                [out-h (if out-pipe? (aio-pipe-init (aio-state-loop st) out-id) 0)]
+                [err-h (if err-pipe? (aio-pipe-init (aio-state-loop st) err-id) 0)])
+           (define (close-pipes)
+             (when (and in-pipe? (not (= in-h 0))) (aio-handle-close in-h))
+             (when (and out-pipe? (not (= out-h 0))) (aio-handle-close out-h))
+             (when (and err-pipe? (not (= err-h 0))) (aio-handle-close err-h)))
+           (when (or (and in-pipe? (= in-h 0))
+                     (and out-pipe? (= out-h 0))
+                     (and err-pipe? (= err-h 0)))
+             (close-pipes)
+             ($oops 'process-spawn "cannot allocate a stdio pipe"))
+           (let ([ph (aio-process-spawn (aio-state-loop st) process-id file
+                       argv (bytevector-length argv)
+                       env (bytevector-length env) (if env-present? 1 0)
+                       cwd flags
+                       in-mode in-fd in-h out-mode out-fd out-h
+                       err-mode err-fd err-h)])
+             (if (fx< ph 0)
+                 (begin
+                   (close-pipes)
+                   (raise (aio-io-condition 'process-spawn #f file ph)))
+                 (let ([process (make-aio-handle process-id ph 'process st file
+                                  #f (make-mutex) #f #f '() #f #f '() #f)]
+                       [stdin (and in-pipe?
+                                (make-aio-handle in-id in-h 'pipe-stream st
+                                  "process stdin" #f (make-mutex)
+                                  #f #f '() #f #f '() #f))]
+                       [stdout (and out-pipe?
+                                 (make-aio-handle out-id out-h 'pipe-stream st
+                                   "process stdout" #f (make-mutex)
+                                   #f #f '() #f #f '() #f))]
+                       [stderr (and err-pipe?
+                                 (make-aio-handle err-id err-h 'pipe-stream st
+                                   "process stderr" #f (make-mutex)
+                                   #f #f '() #f #f '() #f))])
+                   (aio-register-handle! st process)
+                   (when stdin (aio-register-handle! st stdin))
+                   (when stdout (aio-register-handle! st stdout))
+                   (when stderr (aio-register-handle! st stderr))
+                   (values process stdin stdout stderr)))))))]))
+
+(define %process-wait-operation
+  (lambda (process)
+    (unless (and (aio-handle? process)
+                 (eq? (aio-handle-kind process) 'process))
+      ($oops 'process-wait-operation "~s is not an async process" process))
+    (make-operation
+      (lambda (ss)
+        (aio-check-handle-scope! 'process-wait-operation process)
+        (with-mutex (aio-handle-mutex process)
+          (let ([result (aio-handle-result process)])
+            (cond
+              [result (cons 'values (list (car result) (cdr result)))]
+              [(aio-handle-closing? process)
+               (cons 'raise (aio-closed-condition 'process-wait process))]
+              [else #f]))))
+      (lambda (ss deliver)
+        (aio-check-handle-scope! 'process-wait-operation process)
+        (let ([blocked?
+               (with-mutex (aio-handle-mutex process)
+                 (let ([result (aio-handle-result process)])
+                   (cond
+                     [result
+                      (deliver (cons 'values (list (car result) (cdr result))))
+                      #f]
+                     [(aio-handle-closing? process)
+                      (deliver
+                        (cons 'raise
+                          (aio-closed-condition 'process-wait process)))
+                      #f]
+                     [else
+                      (aio-handle-accept-queue-set! process
+                        (append (aio-handle-accept-queue process)
+                          (list (cons ss deliver))))
+                      #t])))])
+          (and blocked? (list 'process-wait (aio-handle-id process)))))
+      (lambda (vals) vals)
+      (lambda (ss)
+        (with-mutex (aio-handle-mutex process)
+          (aio-handle-accept-queue-set! process
+            (filter (lambda (waiter) (not (eq? (car waiter) ss)))
+              (aio-handle-accept-queue process))))))))
+
+;;; --------------------------------------- signal and filesystem watchers
+
+(define aio-watch-open
+  (lambda (who kind path init config)
+    (let* ([st (aio-ensure-state! who)]
+           [id (aio-next-id st)]
+           [native (init (aio-state-loop st) id)])
+      (when (= native 0) ($oops who "cannot allocate a native watcher"))
+      (let ([watcher (make-aio-handle id native kind st path #f
+                       (make-mutex) #f #f '() #f #f '() config)])
+        (aio-register-handle! st watcher)
+        watcher))))
+
+(define aio-check-watcher
+  (lambda (who watcher kind)
+    (unless (and (aio-handle? watcher) (eq? (aio-handle-kind watcher) kind))
+      ($oops who "~s is not an async ~a watcher" watcher kind))))
+
+(define aio-watch-operation
+  (lambda (who watcher kind start)
+    (aio-check-watcher who watcher kind)
+    (make-operation
+      (lambda (ss)
+        (aio-check-handle-scope! who watcher)
+        (with-mutex (aio-handle-mutex watcher)
+          (cond
+            [(aio-handle-closing? watcher)
+             (cons 'raise (aio-closed-condition who watcher))]
+            [(pair? (aio-handle-read-queue watcher))
+             (cons 'raise
+               (aio-io-condition who watcher (aio-handle-path watcher) 'busy))]
+            [else #f])))
+      (lambda (ss deliver)
+        (aio-check-handle-scope! who watcher)
+        (let ([start?
+               (with-mutex (aio-handle-mutex watcher)
+                 (cond
+                   [(aio-handle-closing? watcher)
+                    (deliver (cons 'raise (aio-closed-condition who watcher)))
+                    #f]
+                   [(pair? (aio-handle-read-queue watcher))
+                    (deliver
+                      (cons 'raise
+                        (aio-io-condition who watcher
+                          (aio-handle-path watcher) 'busy)))
+                    #f]
+                   [else
+                    (aio-handle-read-queue-set! watcher
+                      (list (cons ss deliver)))
+                    (aio-handle-reading?-set! watcher #t)
+                    #t]))])
+          (when start?
+            (aio-run-on-owner! (aio-handle-state watcher)
+              (lambda ()
+                (let ([r (start)])
+                  (when (fx< r 0)
+                    (aio-on-watch (aio-handle-state watcher)
+                      (aio-handle-id watcher)
+                      (case kind
+                        [(signal) AIO-EV-SIGNAL]
+                        [(fs-event) AIO-EV-FS-EVENT]
+                        [else AIO-EV-FS-POLL])
+                      r 0))))))
+          (and start? (list who (aio-handle-id watcher)))))
+      (lambda (vals) vals)
+      (lambda (ss)
+        (with-mutex (aio-handle-mutex watcher)
+          (aio-handle-read-queue-set! watcher '()))
+        (let ([st (aio-handle-state watcher)])
+          (with-mutex (aio-state-stop-mutex st)
+            (aio-state-stop-set-set! st
+              (cons watcher (aio-state-stop-set st)))))))))
+
+(define %signal-open
+  (lambda (signum)
+    (unless (fixnum? signum) ($oops 'signal-open "~s is not a signal" signum))
+    (aio-resolve-kernel!)
+    (aio-watch-open 'signal-open 'signal (format "signal ~a" signum)
+      aio-signal-init signum)))
+
+(define %signal-receive-operation
+  (lambda (watcher)
+    (aio-check-watcher 'signal-receive-operation watcher 'signal)
+    (aio-watch-operation 'signal-receive watcher 'signal
+      (lambda ()
+        (aio-signal-start (aio-handle-handle watcher)
+          (aio-handle-result watcher) 1)))))
+
+(define aio-fs-event-flag-bits
+  (lambda (who flags)
+    (unless (and (list? flags) (for-all symbol? flags))
+      ($oops who "~s is not a list of filesystem event flags" flags))
+    (fold-left
+      (lambda (bits flag)
+        (case flag
+          [(watch-entry) (fxlogior bits 1)]
+          [(stat) (fxlogior bits 2)]
+          [(recursive) (fxlogior bits 4)]
+          [else ($oops who "~s is not a filesystem event flag" flag)]))
+      0 flags)))
+
+(define %fs-event-open
+  (case-lambda
+    [(path) (%fs-event-open path '())]
+    [(path flags)
+     (aio-check-path 'fs-event-open path)
+     (aio-resolve-kernel!)
+     (aio-watch-open 'fs-event-open 'fs-event path aio-fs-event-init
+       (aio-fs-event-flag-bits 'fs-event-open flags))]))
+
+(define %fs-event-receive-operation
+  (lambda (watcher)
+    (aio-check-watcher 'fs-event-receive-operation watcher 'fs-event)
+    (aio-watch-operation 'fs-event-receive watcher 'fs-event
+      (lambda ()
+        (aio-fs-event-start (aio-handle-handle watcher)
+          (aio-handle-path watcher) (aio-handle-result watcher))))))
+
+(define %fs-poll-open
+  (lambda (path interval)
+    (aio-check-path 'fs-poll-open path)
+    (unless (and (fixnum? interval) (fx> interval 0))
+      ($oops 'fs-poll-open "~s is not a positive interval" interval))
+    (aio-resolve-kernel!)
+    (aio-watch-open 'fs-poll-open 'fs-poll path aio-fs-poll-init interval)))
+
+(define %fs-poll-receive-operation
+  (lambda (watcher)
+    (aio-check-watcher 'fs-poll-receive-operation watcher 'fs-poll)
+    (aio-watch-operation 'fs-poll-receive watcher 'fs-poll
+      (lambda ()
+        (aio-fs-poll-start (aio-handle-handle watcher)
+          (aio-handle-path watcher) (aio-handle-result watcher))))))
+
+;;; ----------------------------------------------------------------- tty
+
+(define %tty-open
+  (lambda (fd)
+    (unless (and (fixnum? fd) (fx>= fd 0))
+      ($oops 'tty-open "~s is not a file descriptor" fd))
+    (let* ([st (aio-ensure-state! 'tty-open)]
+           [id (aio-next-id st)]
+           [native (aio-tty-init (aio-state-loop st) fd id)])
+      (when (= native 0)
+        (raise (aio-io-condition 'tty-open #f (format "fd ~a" fd)
+                 'init-failed)))
+      (let ([tty (make-aio-handle id native 'tty-stream st
+                   (format "tty fd ~a" fd) #f (make-mutex)
+                   #f #f '() #f #f '() #f)])
+        (aio-register-handle! st tty)
+        tty))))
+
+;;; ----------------------------------------------------- system snapshots
+
+(define aio-system-cstring
+  (lambda (who proc field)
+    (aio-resolve-kernel!)
+    (let ([buf (make-bytevector 4096)])
+      (let ([r (proc field buf 4096)])
+        (if (fx< r 0)
+            (raise (aio-io-condition who #f #f r))
+            (bv->cstring buf))))))
+
+(define %system-cpu-info
+  (lambda ()
+    (aio-resolve-kernel!)
+    (let ([ctx (aio-cpu-info)])
+      (when (= ctx 0)
+        (raise (aio-io-condition 'system-cpu-info #f #f 'unavailable)))
+      (dynamic-wind
+        (lambda () (void))
+        (lambda ()
+          (let ([count (aio-cpu-info-count ctx)] [buf (make-bytevector 1024)])
+            (let loop ([i 0] [items '()])
+              (if (fx= i count)
+                  (reverse items)
+                  (let ([r (aio-cpu-info-model ctx i buf 1024)])
+                    (when (fx< r 0)
+                      (raise (aio-io-condition 'system-cpu-info #f #f r)))
+                    (loop (fx+ i 1)
+                      (cons
+                        (list (cons 'model (bv->cstring buf))
+                              (cons 'speed (aio-cpu-info-field ctx i 0))
+                              (cons 'user (aio-cpu-info-field ctx i 1))
+                              (cons 'nice (aio-cpu-info-field ctx i 2))
+                              (cons 'system (aio-cpu-info-field ctx i 3))
+                              (cons 'idle (aio-cpu-info-field ctx i 4))
+                              (cons 'irq (aio-cpu-info-field ctx i 5)))
+                        items)))))))
+        (lambda () (aio-cpu-info-free ctx))))))
+
+(define %system-interface-info
+  (lambda ()
+    (aio-resolve-kernel!)
+    (let ([ctx (aio-interface-info)])
+      (when (= ctx 0)
+        (raise (aio-io-condition 'system-interface-info #f #f 'unavailable)))
+      (dynamic-wind
+        (lambda () (void))
+        (lambda ()
+          (let ([count (aio-interface-count ctx)]
+                [name (make-bytevector 1024)]
+                [address (make-bytevector 64)]
+                [netmask (make-bytevector 64)])
+            (let loop ([i 0] [items '()])
+              (if (fx= i count)
+                  (reverse items)
+                  (let ([nr (aio-interface-name ctx i name 1024)]
+                        [ar (aio-interface-address ctx i 0 address 64)]
+                        [mr (aio-interface-address ctx i 1 netmask 64)]
+                        [physical (make-bytevector 6)])
+                    (when (or (fx< nr 0) (fx< ar 0) (fx< mr 0))
+                      (raise (aio-io-condition 'system-interface-info #f #f
+                               (cond [(fx< nr 0) nr] [(fx< ar 0) ar] [else mr]))))
+                    (aio-interface-physical ctx i physical)
+                    (loop (fx+ i 1)
+                      (cons
+                        (list (cons 'name (bv->cstring name))
+                              (cons 'address (bv->cstring address))
+                              (cons 'netmask (bv->cstring netmask))
+                              (cons 'family (quotient ar 65536))
+                              (cons 'internal? (not (fx= 0
+                                (aio-interface-internal ctx i))))
+                              (cons 'physical-address physical))
+                        items)))))))
+        (lambda () (aio-interface-free ctx))))))
+
+(define %system-resource-usage
+  (lambda ()
+    (aio-resolve-kernel!)
+    (let ([ctx (aio-rusage)])
+      (when (= ctx 0)
+        (raise (aio-io-condition 'system-resource-usage #f #f 'unavailable)))
+      (dynamic-wind
+        (lambda () (void))
+        (lambda ()
+          (define (field i) (aio-rusage-field ctx i))
+          (list (cons 'user-time (cons (field 0) (field 1)))
+                (cons 'system-time (cons (field 2) (field 3)))
+                (cons 'maximum-resident-set-size (field 4))
+                (cons 'minor-page-faults (field 8))
+                (cons 'major-page-faults (field 9))
+                (cons 'swaps (field 10))
+                (cons 'input-blocks (field 11))
+                (cons 'output-blocks (field 12))
+                (cons 'signals (field 15))
+                (cons 'voluntary-context-switches (field 16))
+                (cons 'involuntary-context-switches (field 17))))
+        (lambda () (aio-rusage-free ctx))))))
+
+(define %async-loop-metrics
+  (lambda ()
+    (let ([st (aio-ensure-state! 'async-loop-metrics)])
+      (define (field i) (aio-loop-metric (aio-state-loop st) i))
+      (aio-debug-check-owner! st)
+      (list (cons 'now (field 0))
+            (cons 'idle-time (field 1))
+            (cons 'backend-timeout (field 2))
+            (cons 'backend-fd (field 3))
+            (cons 'alive? (not (= (field 4) 0)))
+            (cons 'loop-count (field 5))
+            (cons 'events (field 6))
+            (cons 'events-waiting (field 7))))))
+
 ;;; ---------------------------------------------------------------- files
 
 ;;; flag bits mirrored by aio_map_open_flags in c/asyncio.c
@@ -1390,6 +2642,54 @@
           [else ($oops 'file-open "~s is not a file-open flag" f)]))
       0 flags)))
 
+(define aio-serial-state
+  (lambda (resource)
+    (if (%async-file? resource)
+        (async-file-state resource)
+        (async-directory-state resource))))
+
+(define aio-serial-mutex
+  (lambda (resource)
+    (if (%async-file? resource)
+        (async-file-mutex resource)
+        (async-directory-mutex resource))))
+
+(define aio-serial-busy?
+  (lambda (resource)
+    (if (%async-file? resource)
+        (async-file-busy? resource)
+        (async-directory-busy? resource))))
+
+(define aio-serial-busy?-set!
+  (lambda (resource value)
+    (if (%async-file? resource)
+        (async-file-busy?-set! resource value)
+        (async-directory-busy?-set! resource value))))
+
+(define aio-serial-queue
+  (lambda (resource)
+    (if (%async-file? resource)
+        (async-file-queue resource)
+        (async-directory-queue resource))))
+
+(define aio-serial-queue-set!
+  (lambda (resource value)
+    (if (%async-file? resource)
+        (async-file-queue-set! resource value)
+        (async-directory-queue-set! resource value))))
+
+(define aio-check-serial-scope!
+  (lambda (who resource)
+    (if (%async-file? resource)
+        (aio-check-file-scope! who resource)
+        (let ([sched (current-async-scheduler)])
+          (unless (and sched
+                       (eq? ($async-scheduler-group-token sched)
+                            ($async-scheduler-group-token
+                              (aio-state-owner
+                                (async-directory-state resource)))))
+            ($oops who "async directory belongs to another scheduler group"))))))
+
 (define aio-fs-request-operation
   (case-lambda
     [(who handle path start gen)
@@ -1397,14 +2697,14 @@
        (lambda (ss status aux) (void)) #f)]
     [(who handle path start gen canceled-gen)
      (aio-fs-request-operation who handle path start gen canceled-gen #f)]
-    [(who handle path start gen canceled-gen serial-file)
+    [(who handle path start gen canceled-gen serial-resource)
      ;; Callbacks receive ss so all mutable state belongs to this perform.
      (let ([token (list 'fs-request-operation)])
        (make-operation
          (lambda (ss) #f)
          (lambda (ss deliver)
-           (when serial-file
-             (aio-check-file-scope! who serial-file))
+           (when serial-resource
+             (aio-check-serial-scope! who serial-resource))
            (let ([st-box (box #f)] [id-box (box #f)]
                  [started? (box #f)] [entry-box (box #f)]
                  [canceled? (box #f)])
@@ -1412,16 +2712,16 @@
                (vector st-box id-box started? entry-box canceled?))
              (letrec ([release!
                        (lambda ()
-                         (when serial-file
+                         (when serial-resource
                            (let ([next
-                                  (with-mutex (async-file-mutex serial-file)
-                                    (let ([q (async-file-queue serial-file)])
+                                  (with-mutex (aio-serial-mutex serial-resource)
+                                    (let ([q (aio-serial-queue serial-resource)])
                                       (if (null? q)
                                           (begin
-                                            (async-file-busy?-set! serial-file #f)
+                                            (aio-serial-busy?-set! serial-resource #f)
                                             #f)
                                           (let ([entry (car q)])
-                                            (async-file-queue-set! serial-file (cdr q))
+                                            (aio-serial-queue-set! serial-resource (cdr q))
                                             (set-box! (cadr entry) #t)
                                             (caddr entry)))))])
                              (when next (next)))))]
@@ -1430,8 +2730,8 @@
                          (dynamic-wind
                            (lambda () (void))
                            (lambda ()
-                             (if serial-file
-                                 (with-mutex (async-file-mutex serial-file)
+                             (if serial-resource
+                                 (with-mutex (aio-serial-mutex serial-resource)
                                    (gen ss status aux))
                                  (gen ss status aux)))
                            release!))]
@@ -1440,15 +2740,15 @@
                          (dynamic-wind
                            (lambda () (void))
                            (lambda ()
-                             (if serial-file
-                                 (with-mutex (async-file-mutex serial-file)
+                             (if serial-resource
+                                 (with-mutex (aio-serial-mutex serial-resource)
                                    (canceled-gen ss status aux))
                                  (canceled-gen ss status aux)))
                            release!))]
                       [submit
                      (lambda ()
-                       (let ([st (if serial-file
-                                     (async-file-state serial-file)
+                       (let ([st (if serial-resource
+                                     (aio-serial-state serial-resource)
                                      (aio-ensure-state! who))])
                        (define submit-native!
                          (lambda ()
@@ -1471,9 +2771,9 @@
                          (lambda ()
                            (let ([result
                                   (guard (c [else (cons 'exception c)])
-                                    (if serial-file
+                                    (if serial-resource
                                         (with-mutex
-                                          (async-file-mutex serial-file)
+                                          (aio-serial-mutex serial-resource)
                                           (if (or (aio-atomic-box-ref canceled?)
                                                   (aio-waiter-dead? ss))
                                               '(withdrawn)
@@ -1503,16 +2803,16 @@
                                  (cons 'raise
                                    (aio-io-condition who handle path 'closed)))
                                #f))))])
-             (if serial-file
+             (if serial-resource
                  (let ([entry (list ss started? submit)] [start-now? #f])
                    (set-box! entry-box entry)
-                   (with-mutex (async-file-mutex serial-file)
-                     (if (async-file-busy? serial-file)
-                         (async-file-queue-set! serial-file
-                           (append (async-file-queue serial-file)
+                   (with-mutex (aio-serial-mutex serial-resource)
+                     (if (aio-serial-busy? serial-resource)
+                         (aio-serial-queue-set! serial-resource
+                           (append (aio-serial-queue serial-resource)
                              (list entry)))
                          (begin
-                           (async-file-busy?-set! serial-file #t)
+                           (aio-serial-busy?-set! serial-resource #t)
                            (set-box! started? #t)
                            (set! start-now? #t))))
                    (when start-now? (submit))
@@ -1526,15 +2826,15 @@
                      [id-box (vector-ref attempt 1)]
                      [started? (vector-ref attempt 2)]
                      [entry-box (vector-ref attempt 3)]
-                     [nack-started? (not serial-file)])
+                     [nack-started? (not serial-resource)])
                  (aio-atomic-box-flag! (vector-ref attempt 4))
-                 (when serial-file
-                   (with-mutex (async-file-mutex serial-file)
+                 (when serial-resource
+                   (with-mutex (aio-serial-mutex serial-resource)
                      (if (unbox started?)
                          (set! nack-started? #t)
-                         (async-file-queue-set! serial-file
+                         (aio-serial-queue-set! serial-resource
                            (remq (unbox entry-box)
-                             (async-file-queue serial-file))))))
+                             (aio-serial-queue serial-resource))))))
                  (when nack-started?
                    (let ([st (aio-atomic-box-ref st-box)]
                          [id (aio-atomic-box-ref id-box)])
@@ -1839,9 +3139,463 @@
            (if (fx= status 0)
                (cons 'values (list (aio-stat-alist aux)))
                (cons 'raise
-                 (aio-io-condition 'stat target (async-file-path target) status)))))]
+                 (aio-io-condition 'stat target (async-file-path target) status))))
+         (lambda (ss status aux) (void))
+         target)]
       [else
        ($oops 'file-stat-operation "~s is not a path or async file" target)])))
+
+(define aio-check-path
+  (lambda (who path)
+    (unless (string? path) ($oops who "~s is not a string" path))))
+
+(define aio-check-mode
+  (lambda (who mode)
+    (unless (and (fixnum? mode) (fx>= mode 0) (fx<= mode #o7777))
+      ($oops who "~s is not a valid file mode" mode))))
+
+(define aio-fs-void-operation
+  (lambda (who handle path start . maybe-file)
+    (aio-fs-request-operation who handle path start
+      (lambda (ss status aux)
+        (if (fx>= status 0)
+            (cons 'values '())
+            (cons 'raise (aio-io-condition who handle path status))))
+      (lambda (ss status aux) (void))
+      (and (pair? maybe-file) (car maybe-file)))))
+
+(define aio-fs-result-cstring
+  (lambda (aux length copy who path)
+    (let ([n (length aux)])
+      (if (fx< n 0)
+          (raise (aio-io-condition who #f path n))
+          (let ([bv (make-bytevector (fx+ n 1))])
+            (let ([r (copy aux bv (fx+ n 1))])
+              (if (fx< r 0)
+                  (raise (aio-io-condition who #f path r))
+                  (bv->cstring bv))))))))
+
+(define %file-delete-operation
+  (lambda (path)
+    (aio-check-path 'file-delete-operation path)
+    (aio-fs-void-operation 'delete #f path
+      (lambda (ss st id) (aio-fs-unlink (aio-state-loop st) path id)))))
+
+(define %file-rename-operation
+  (lambda (old new)
+    (aio-check-path 'file-rename-operation old)
+    (aio-check-path 'file-rename-operation new)
+    (aio-fs-void-operation 'rename #f old
+      (lambda (ss st id)
+        (aio-fs-rename (aio-state-loop st) old new id)))))
+
+(define %directory-create-operation
+  (case-lambda
+    [(path) (%directory-create-operation path #o755)]
+    [(path mode)
+     (aio-check-path 'directory-create-operation path)
+     (aio-check-mode 'directory-create-operation mode)
+     (aio-fs-void-operation 'mkdir #f path
+       (lambda (ss st id)
+         (aio-fs-mkdir (aio-state-loop st) path mode id)))]))
+
+(define %directory-delete-operation
+  (lambda (path)
+    (aio-check-path 'directory-delete-operation path)
+    (aio-fs-void-operation 'rmdir #f path
+      (lambda (ss st id) (aio-fs-rmdir (aio-state-loop st) path id)))))
+
+(define aio-copy-flag-bits
+  (lambda (who flags)
+    (unless (and (list? flags) (for-all symbol? flags))
+      ($oops who "~s is not a list of copy flags" flags))
+    (fold-left
+      (lambda (bits flag)
+        (case flag
+          [(exclusive) (fxlogior bits 1)]
+          [(clone) (fxlogior bits 2)]
+          [(clone-force) (fxlogior bits 4)]
+          [else ($oops who "~s is not a copy flag" flag)]))
+      0 flags)))
+
+(define %file-copy-operation
+  (case-lambda
+    [(from to) (%file-copy-operation from to '())]
+    [(from to flags)
+     (aio-check-path 'file-copy-operation from)
+     (aio-check-path 'file-copy-operation to)
+     (let ([bits (aio-copy-flag-bits 'file-copy-operation flags)])
+       (aio-fs-void-operation 'copy #f from
+         (lambda (ss st id)
+           (aio-fs-copyfile (aio-state-loop st) from to bits id))))]))
+
+(define %temporary-directory-create-operation
+  (lambda (pattern)
+    (aio-check-path 'temporary-directory-create-operation pattern)
+    (aio-fs-request-operation 'mkdtemp #f pattern
+      (lambda (ss st id) (aio-fs-mkdtemp (aio-state-loop st) pattern id))
+      (lambda (ss status aux)
+        (if (fx= status 0)
+            (cons 'values
+              (list (aio-fs-result-cstring aux aio-fs-result-path-length
+                      aio-fs-result-path-copy 'mkdtemp pattern)))
+            (cons 'raise (aio-io-condition 'mkdtemp #f pattern status)))))))
+
+(define %temporary-file-open-operation
+  (lambda (pattern)
+    (aio-check-path 'temporary-file-open-operation pattern)
+    (let ([token (list 'temporary-file-open-operation)])
+      (aio-fs-request-operation 'mkstemp #f pattern
+        (lambda (ss st id)
+          ($async-sync-slot-set! ss token st)
+          (aio-fs-mkstemp (aio-state-loop st) pattern id))
+        (lambda (ss status aux)
+          (if (fx>= status 0)
+              (let* ([st ($async-sync-slot-ref ss token #f)]
+                     [path (aio-fs-result-cstring aux
+                             aio-fs-result-path-length aio-fs-result-path-copy
+                             'mkstemp pattern)]
+                     [f (make-async-file% status path st #f 0 #f
+                          (make-mutex) #f '())])
+                (cons 'values (list (aio-register-file! st f) path)))
+              (cons 'raise (aio-io-condition 'mkstemp #f pattern status))))
+        (lambda (ss status aux)
+          (when (fx>= status 0) (aio-fs-close-now status)))))))
+
+(define aio-dirent-type
+  (lambda (n)
+    (case n
+      [(1) 'unknown]
+      [(2) 'file]
+      [(3) 'directory]
+      [(4) 'link]
+      [(5) 'fifo]
+      [(6) 'socket]
+      [(7) 'character-device]
+      [(8) 'block-device]
+      [else 'unknown])))
+
+(define %directory-scan-operation
+  (lambda (path)
+    (aio-check-path 'directory-scan-operation path)
+    (aio-fs-request-operation 'scandir #f path
+      (lambda (ss st id) (aio-fs-scandir (aio-state-loop st) path id))
+      (lambda (ss status aux)
+        (if (fx>= status 0)
+            (let ([buf (make-bytevector 4097)])
+              (let loop ([entries '()])
+                (let ([type (aio-fs-scandir-next aux buf 4097)])
+                  (cond
+                    [(fx= type 0) (cons 'values (list (reverse entries)))]
+                    [(fx< type 0)
+                     (cons 'raise (aio-io-condition 'scandir #f path type))]
+                    [else
+                     (loop (cons (cons (bv->cstring buf)
+                                      (aio-dirent-type type))
+                                  entries))]))))
+            (cons 'raise (aio-io-condition 'scandir #f path status)))))))
+
+(define aio-check-directory/raw
+  (lambda (who directory)
+    (when (async-directory-closed? directory)
+      (raise
+        (aio-io-condition who directory (async-directory-path directory)
+          'closed)))))
+
+(define aio-check-directory
+  (lambda (who directory)
+    (unless (%async-directory? directory)
+      ($oops who "~s is not an async directory" directory))
+    (with-mutex (async-directory-mutex directory)
+      (aio-check-directory/raw who directory))))
+
+(define %directory-open-operation
+  (lambda (path)
+    (aio-check-path 'directory-open-operation path)
+    (let ([token (list 'directory-open-operation)])
+      (aio-fs-request-operation 'opendir #f path
+        (lambda (ss st id)
+          ($async-sync-slot-set! ss token st)
+          (aio-fs-opendir (aio-state-loop st) path id))
+        (lambda (ss status aux)
+          (if (fx>= status 0)
+              (let* ([st ($async-sync-slot-ref ss token #f)]
+                     [directory
+                      (make-async-directory% (aio-fs-result-ptr aux) path st
+                        #f (make-mutex) #f '())])
+                (cons 'values
+                  (list (aio-register-directory! st directory))))
+              (cons 'raise (aio-io-condition 'opendir #f path status))))
+        (lambda (ss status aux)
+          (when (fx>= status 0)
+            (aio-fs-closedir-now (aio-fs-result-ptr aux))))))))
+
+(define %directory-read-operation
+  (case-lambda
+    [(directory) (%directory-read-operation directory 64)]
+    [(directory count)
+     (aio-check-directory 'directory-read-operation directory)
+     (unless (and (fixnum? count) (fx> count 0))
+       ($oops 'directory-read-operation
+         "~s is not a positive entry count" count))
+     (aio-fs-request-operation 'readdir directory
+       (async-directory-path directory)
+       (lambda (ss st id)
+         (aio-check-directory/raw 'directory-read-operation directory)
+         (aio-fs-readdir (aio-state-loop st)
+           (async-directory-pointer directory) count id))
+       (lambda (ss status aux)
+         (if (fx>= status 0)
+             (let ([buf (make-bytevector 4097)])
+               (let loop ([i 0] [entries '()])
+                 (if (fx= i status)
+                     (cons 'values (list (reverse entries)))
+                     (let ([type (aio-fs-readdir-entry aux i buf 4097)])
+                       (if (fx< type 0)
+                           (cons 'raise
+                             (aio-io-condition 'readdir directory
+                               (async-directory-path directory) type))
+                           (loop (fx+ i 1)
+                             (cons (cons (bv->cstring buf)
+                                         (aio-dirent-type type))
+                                   entries)))))))
+             (cons 'raise
+               (aio-io-condition 'readdir directory
+                 (async-directory-path directory) status))))
+       (lambda (ss status aux) (void))
+       directory)]))
+
+(define aio-directory-close-complete!
+  (lambda (directory status)
+    (when (fx>= status 0)
+      (async-directory-closed?-set! directory #t)
+      (aio-unregister-directory! directory))))
+
+(define %directory-close-operation
+  (lambda (directory)
+    (aio-check-directory 'directory-close-operation directory)
+    (aio-fs-request-operation 'closedir directory
+      (async-directory-path directory)
+      (lambda (ss st id)
+        (aio-check-directory/raw 'directory-close-operation directory)
+        (aio-fs-closedir (aio-state-loop st)
+          (async-directory-pointer directory) id))
+      (lambda (ss status aux)
+        (aio-directory-close-complete! directory status)
+        (if (fx>= status 0)
+            (cons 'values (list (void)))
+            (cons 'raise
+              (aio-io-condition 'closedir directory
+                (async-directory-path directory) status))))
+      (lambda (ss status aux)
+        (aio-directory-close-complete! directory status))
+      directory)))
+
+(define %file-sync-operation
+  (lambda (f data-only?)
+    (aio-check-file-unowned (if data-only? 'file-data-sync-operation
+                                'file-sync-operation) f)
+    (let ([who (if data-only? 'fdatasync 'fsync)])
+      (aio-fs-void-operation who f (async-file-path f)
+        (lambda (ss st id)
+          ((if data-only? aio-fs-fdatasync aio-fs-fsync)
+           (aio-state-loop st) (async-file-fd f) id))
+        f))))
+
+(define %file-truncate-operation
+  (lambda (f length)
+    (aio-check-file-unowned 'file-truncate-operation f)
+    (unless (and (integer? length) (exact? length) (>= length 0))
+      ($oops 'file-truncate-operation "~s is not an exact nonnegative length"
+        length))
+    (aio-fs-void-operation 'truncate f (async-file-path f)
+      (lambda (ss st id)
+        (aio-fs-ftruncate (aio-state-loop st) (async-file-fd f) length id))
+      f)))
+
+(define %file-send-operation
+  (lambda (output input offset length)
+    (aio-check-file-unowned 'file-send-operation output)
+    (aio-check-file-unowned 'file-send-operation input)
+    (when (eq? output input)
+      ($oops 'file-send-operation "input and output files are the same"))
+    (unless (and (integer? offset) (exact? offset) (>= offset 0))
+      ($oops 'file-send-operation "~s is not a nonnegative offset" offset))
+    (unless (and (integer? length) (exact? length) (>= length 0))
+      ($oops 'file-send-operation "~s is not a nonnegative length" length))
+    (aio-fs-request-operation 'sendfile output (async-file-path input)
+      (lambda (ss st id)
+        (aio-check-file-scope! 'file-send-operation input)
+        (with-mutex (async-file-mutex input)
+          (aio-check-file-unowned/raw 'file-send-operation input)
+          (aio-fs-sendfile (aio-state-loop st)
+            (async-file-fd output) (async-file-fd input) offset length id)))
+      (lambda (ss status aux)
+        (if (fx>= status 0)
+            (begin
+              (aio-file-offset! output status)
+              (cons 'values (list status)))
+            (cons 'raise
+              (aio-io-condition 'sendfile output (async-file-path input)
+                status))))
+      (lambda (ss status aux) (void))
+      output)))
+
+(define aio-access-mode-bits
+  (lambda (who modes)
+    (unless (and (list? modes) (for-all symbol? modes))
+      ($oops who "~s is not a list of access modes" modes))
+    (fold-left
+      (lambda (bits mode)
+        (case mode
+          [(exists) bits]
+          [(read) (fxlogior bits 1)]
+          [(write) (fxlogior bits 2)]
+          [(execute) (fxlogior bits 4)]
+          [else ($oops who "~s is not an access mode" mode)]))
+      0 modes)))
+
+(define %file-access-operation
+  (lambda (path modes)
+    (aio-check-path 'file-access-operation path)
+    (let ([bits (aio-access-mode-bits 'file-access-operation modes)])
+      (aio-fs-request-operation 'access #f path
+        (lambda (ss st id)
+          (aio-fs-access (aio-state-loop st) path bits id))
+        (lambda (ss status aux) (cons 'values (list (fx= status 0))))))))
+
+(define %file-mode-set-operation
+  (lambda (target mode)
+    (aio-check-mode 'file-mode-set-operation mode)
+    (cond
+      [(string? target)
+       (aio-fs-void-operation 'chmod #f target
+         (lambda (ss st id)
+           (aio-fs-chmod (aio-state-loop st) target mode id)))]
+      [(%async-file? target)
+       (aio-check-file-unowned 'file-mode-set-operation target)
+       (aio-fs-void-operation 'fchmod target (async-file-path target)
+         (lambda (ss st id)
+           (aio-fs-fchmod (aio-state-loop st) (async-file-fd target) mode id))
+         target)]
+      [else ($oops 'file-mode-set-operation
+              "~s is not a path or async file" target)])))
+
+(define aio-check-time
+  (lambda (who value)
+    (unless (real? value) ($oops who "~s is not a real timestamp" value))
+    (if (inexact? value) value (exact->inexact value))))
+
+(define %file-times-set-operation
+  (case-lambda
+    [(target atime mtime) (%file-times-set-operation target atime mtime #t)]
+    [(target atime mtime follow?)
+     (let ([a (aio-check-time 'file-times-set-operation atime)]
+           [m (aio-check-time 'file-times-set-operation mtime)])
+       (cond
+         [(string? target)
+          (aio-fs-void-operation (if follow? 'utime 'lutime) #f target
+            (lambda (ss st id)
+              (aio-fs-utime (aio-state-loop st) target a m
+                (if follow? 1 0) id)))]
+         [(%async-file? target)
+          (aio-check-file-unowned 'file-times-set-operation target)
+          (aio-fs-void-operation 'futime target (async-file-path target)
+            (lambda (ss st id)
+              (aio-fs-futime (aio-state-loop st) (async-file-fd target)
+                a m id))
+            target)]
+         [else ($oops 'file-times-set-operation
+                 "~s is not a path or async file" target)]))]))
+
+(define %file-lstat-operation
+  (lambda (path)
+    (aio-check-path 'file-lstat-operation path)
+    (aio-fs-request-operation 'lstat #f path
+      (lambda (ss st id) (aio-fs-lstat (aio-state-loop st) path id))
+      (lambda (ss status aux)
+        (if (fx= status 0)
+            (cons 'values (list (aio-stat-alist aux)))
+            (cons 'raise (aio-io-condition 'lstat #f path status)))))))
+
+(define %file-link-operation
+  (lambda (from to symbolic? flags)
+    (aio-check-path 'file-link-operation from)
+    (aio-check-path 'file-link-operation to)
+    (let ([bits
+           (fold-left
+             (lambda (bits flag)
+               (case flag
+                 [(directory) (fxlogior bits 1)]
+                 [(junction) (fxlogior bits 2)]
+                 [else ($oops 'file-link-operation
+                         "~s is not a symbolic-link flag" flag)]))
+             0 flags)])
+      (aio-fs-void-operation (if symbolic? 'symlink 'link) #f from
+        (lambda (ss st id)
+          (aio-fs-link (aio-state-loop st) from to
+            (if symbolic? 1 0) bits id))))))
+
+(define %file-read-link-operation
+  (lambda (path realpath?)
+    (aio-check-path 'file-read-link-operation path)
+    (let ([who (if realpath? 'realpath 'readlink)])
+      (aio-fs-request-operation who #f path
+        (lambda (ss st id)
+          (aio-fs-readlink (aio-state-loop st) path
+            (if realpath? 1 0) id))
+        (lambda (ss status aux)
+          (if (fx= status 0)
+              (cons 'values
+                (list (aio-fs-result-cstring aux aio-fs-result-string-length
+                        aio-fs-result-string-copy who path)))
+              (cons 'raise (aio-io-condition who #f path status))))))))
+
+(define %file-owner-set-operation
+  (case-lambda
+    [(target uid gid) (%file-owner-set-operation target uid gid #t)]
+    [(target uid gid follow?)
+     (unless (and (integer? uid) (exact? uid) (>= uid 0))
+       ($oops 'file-owner-set-operation "~s is not a uid" uid))
+     (unless (and (integer? gid) (exact? gid) (>= gid 0))
+       ($oops 'file-owner-set-operation "~s is not a gid" gid))
+     (cond
+       [(string? target)
+        (aio-fs-void-operation (if follow? 'chown 'lchown) #f target
+          (lambda (ss st id)
+            (aio-fs-chown (aio-state-loop st) target -1 uid gid
+              (if follow? 0 2) id)))]
+       [(%async-file? target)
+        (aio-check-file-unowned 'file-owner-set-operation target)
+        (aio-fs-void-operation 'fchown target (async-file-path target)
+          (lambda (ss st id)
+            (aio-fs-chown (aio-state-loop st) "" (async-file-fd target)
+              uid gid 1 id))
+          target)]
+       [else ($oops 'file-owner-set-operation
+               "~s is not a path or async file" target)])]))
+
+(define aio-statfs-alist
+  (lambda (aux)
+    (define (field i) (aio-fs-statfs-field aux i))
+    (list (cons 'type (field 0))
+          (cons 'block-size (field 1))
+          (cons 'blocks (field 2))
+          (cons 'blocks-free (field 3))
+          (cons 'blocks-available (field 4))
+          (cons 'files (field 5))
+          (cons 'files-free (field 6))
+          (cons 'fragment-size (field 7)))))
+
+(define %file-system-stat-operation
+  (lambda (path)
+    (aio-check-path 'file-system-stat-operation path)
+    (aio-fs-request-operation 'statfs #f path
+      (lambda (ss st id) (aio-fs-statfs (aio-state-loop st) path id))
+      (lambda (ss status aux)
+        (if (fx= status 0)
+            (cons 'values (list (aio-statfs-alist aux)))
+            (cons 'raise (aio-io-condition 'statfs #f path status)))))))
 
 ;;; ------------------------------------------------------- public exports
 
@@ -1895,13 +3649,17 @@
   (lambda (x)
     (and (aio-handle? x)
          (or (eq? (aio-handle-kind x) 'tcp-stream)
-             (eq? (aio-handle-kind x) 'pipe-stream)))))
+             (eq? (aio-handle-kind x) 'pipe-stream)
+             (eq? (aio-handle-kind x) 'tty-stream)))))
 (set! tcp-stream?
   (lambda (x)
     (and (aio-handle? x) (eq? (aio-handle-kind x) 'tcp-stream))))
 (set! pipe-stream?
   (lambda (x)
     (and (aio-handle? x) (eq? (aio-handle-kind x) 'pipe-stream))))
+(set! tty-stream?
+  (lambda (x)
+    (and (aio-handle? x) (eq? (aio-handle-kind x) 'tty-stream))))
 (set-who! stream-close
   (lambda (s)
     (aio-check-stream-unowned who s)
@@ -1956,6 +3714,260 @@
   (case-lambda
     [(node) (perform-operation (%dns-lookup-operation node))]
     [(node service) (perform-operation (%dns-lookup-operation node service))]))
+(set! dns-reverse-operation %dns-reverse-operation)
+(set! dns-reverse
+  (case-lambda
+    [(host port) (perform-operation (%dns-reverse-operation host port))]
+    [(host port flags)
+     (perform-operation (%dns-reverse-operation host port flags))]))
+(set! random-bytevector-operation %random-bytevector-operation)
+(set-who! random-bytevector
+  (lambda (length)
+    (perform-operation (%random-bytevector-operation length))))
+(set! fd-poll-open %fd-poll-open)
+(set! fd-poll-handle?
+  (lambda (x) (and (aio-handle? x) (eq? (aio-handle-kind x) 'poll))))
+(set-who! fd-poll-close
+  (lambda (poll)
+    (unless (fd-poll-handle? poll)
+      ($oops who "~s is not an fd poll handle" poll))
+    (aio-close-owned-handle who poll)))
+(set! fd-poll-operation %fd-poll-operation)
+(set-who! fd-poll
+  (lambda (poll events)
+    (perform-operation (%fd-poll-operation poll events))))
+(set! process-spawn %process-spawn)
+(set! async-process?
+  (lambda (x) (and (aio-handle? x) (eq? (aio-handle-kind x) 'process))))
+(set-who! process-id
+  (lambda (process)
+    (unless (async-process? process)
+      ($oops who "~s is not an async process" process))
+    (aio-process-pid (aio-handle-handle process))))
+(set! process-wait-operation %process-wait-operation)
+(set-who! process-wait
+  (lambda (process)
+    (perform-operation (%process-wait-operation process))))
+(set-who! process-kill
+  (lambda (process signal)
+    (unless (async-process? process)
+      ($oops who "~s is not an async process" process))
+    (unless (fixnum? signal) ($oops who "~s is not a signal number" signal))
+    (aio-check-handle-scope! who process)
+    (let ([r (aio-process-kill (aio-handle-handle process) signal)])
+      (when (fx< r 0)
+        (raise (aio-io-condition 'process-kill process
+                 (aio-handle-path process) r))))
+    (void)))
+(set-who! process-id-kill
+  (lambda (pid signal)
+    (unless (and (integer? pid) (exact? pid))
+      ($oops who "~s is not a process id" pid))
+    (unless (fixnum? signal) ($oops who "~s is not a signal number" signal))
+    (let ([r (aio-kill pid signal)])
+      (when (fx< r 0)
+        (raise (aio-io-condition 'process-kill #f #f r))))
+    (void)))
+(set-who! process-close
+  (lambda (process)
+    (unless (async-process? process)
+      ($oops who "~s is not an async process" process))
+    (aio-close-owned-handle who process)))
+(set! signal-open %signal-open)
+(set! signal-watcher?
+  (lambda (x) (and (aio-handle? x) (eq? (aio-handle-kind x) 'signal))))
+(set! signal-receive-operation %signal-receive-operation)
+(set-who! signal-receive
+  (lambda (watcher)
+    (perform-operation (%signal-receive-operation watcher))))
+(set-who! signal-close
+  (lambda (watcher)
+    (aio-check-watcher who watcher 'signal)
+    (aio-close-owned-handle who watcher)))
+(set! fs-event-open %fs-event-open)
+(set! fs-event-watcher?
+  (lambda (x) (and (aio-handle? x) (eq? (aio-handle-kind x) 'fs-event))))
+(set! fs-event-receive-operation %fs-event-receive-operation)
+(set-who! fs-event-receive
+  (lambda (watcher)
+    (perform-operation (%fs-event-receive-operation watcher))))
+(set-who! fs-event-close
+  (lambda (watcher)
+    (aio-check-watcher who watcher 'fs-event)
+    (aio-close-owned-handle who watcher)))
+(set! fs-poll-open %fs-poll-open)
+(set! fs-poll-watcher?
+  (lambda (x) (and (aio-handle? x) (eq? (aio-handle-kind x) 'fs-poll))))
+(set! fs-poll-receive-operation %fs-poll-receive-operation)
+(set-who! fs-poll-receive
+  (lambda (watcher)
+    (perform-operation (%fs-poll-receive-operation watcher))))
+(set-who! fs-poll-close
+  (lambda (watcher)
+    (aio-check-watcher who watcher 'fs-poll)
+    (aio-close-owned-handle who watcher)))
+(set! tty-open %tty-open)
+(set-who! tty-mode-set!
+  (lambda (tty mode)
+    (unless (tty-stream? tty) ($oops who "~s is not a TTY stream" tty))
+    (let ([value (case mode [(normal) 0] [(raw) 1] [(io) 2]
+                   [else ($oops who "~s is not a TTY mode" mode)])])
+      (aio-check-handle-scope! who tty)
+      (let ([r (aio-tty-set-mode (aio-handle-handle tty) value)])
+        (when (fx< r 0)
+          (raise (aio-io-condition who tty (aio-handle-path tty) r))))
+      (void))))
+(set-who! tty-window-size
+  (lambda (tty)
+    (unless (tty-stream? tty) ($oops who "~s is not a TTY stream" tty))
+    (aio-check-handle-scope! who tty)
+    (let ([width (aio-tty-winsize (aio-handle-handle tty) 0)]
+          [height (aio-tty-winsize (aio-handle-handle tty) 1)])
+      (when (fx< width 0)
+        (raise (aio-io-condition who tty (aio-handle-path tty) width)))
+      (when (fx< height 0)
+        (raise (aio-io-condition who tty (aio-handle-path tty) height)))
+      (values width height))))
+(set-who! tty-virtual-terminal-state
+  (lambda ()
+    (aio-resolve-kernel!)
+    (let ([r (aio-tty-get-vterm-state)])
+      (if (fx< r 0)
+          (raise (aio-io-condition who #f #f r))
+          (if (fx= r 0) 'unsupported 'supported)))))
+(set-who! tty-virtual-terminal-state-set!
+  (lambda (state)
+    (unless (memq state '(supported unsupported))
+      ($oops who "~s is not a virtual terminal state" state))
+    (aio-resolve-kernel!)
+    (aio-tty-set-vterm-state (if (eq? state 'supported) 1 0))
+    (void)))
+(set-who! tty-reset-mode!
+  (lambda ()
+    (aio-resolve-kernel!)
+    (aio-tty-reset-mode)
+    (void)))
+(set-who! system-high-resolution-time
+  (lambda () (aio-resolve-kernel!) (aio-system-u64 0)))
+(set-who! system-memory-info
+  (lambda ()
+    (aio-resolve-kernel!)
+    (list (cons 'total (aio-system-u64 1))
+          (cons 'free (aio-system-u64 2))
+          (cons 'constrained (aio-system-u64 3))
+          (cons 'available (aio-system-u64 4))
+          (cons 'resident-set (aio-system-u64 5)))))
+(set-who! system-uptime
+  (lambda () (aio-resolve-kernel!) (aio-system-double 0)))
+(set-who! system-load-average
+  (lambda ()
+    (aio-resolve-kernel!)
+    (list (aio-system-double 1) (aio-system-double 2)
+          (aio-system-double 3))))
+(set-who! system-process-info
+  (lambda ()
+    (aio-resolve-kernel!)
+    (list (cons 'pid (aio-system-u64 6))
+          (cons 'parent-pid (aio-system-u64 7))
+          (cons 'available-parallelism (aio-system-u64 8)))))
+(set-who! system-path-info
+  (lambda ()
+    (list (cons 'executable (aio-system-cstring who aio-system-string 0))
+          (cons 'current-directory
+            (aio-system-cstring who aio-system-string 1))
+          (cons 'home-directory
+            (aio-system-cstring who aio-system-string 2))
+          (cons 'temporary-directory
+            (aio-system-cstring who aio-system-string 3))
+          (cons 'hostname (aio-system-cstring who aio-system-string 4)))))
+(set-who! system-uname
+  (lambda ()
+    (list (cons 'system (aio-system-cstring who aio-uname-string 0))
+          (cons 'release (aio-system-cstring who aio-uname-string 1))
+          (cons 'version (aio-system-cstring who aio-uname-string 2))
+          (cons 'machine (aio-system-cstring who aio-uname-string 3)))))
+(set-who! system-cpu-info (lambda () (%system-cpu-info)))
+(set-who! system-interface-info (lambda () (%system-interface-info)))
+(set-who! system-resource-usage (lambda () (%system-resource-usage)))
+(set-who! async-loop-metrics (lambda () (%async-loop-metrics)))
+
+(set! udp-open %udp-open)
+(set! udp-socket?
+  (lambda (x) (and (aio-handle? x) (eq? (aio-handle-kind x) 'udp))))
+(set-who! udp-close
+  (lambda (socket)
+    (aio-check-udp who socket)
+    (aio-close-owned-handle who socket)))
+(set! udp-send-operation %udp-send-operation)
+(set! udp-send
+  (case-lambda
+    [(socket bv) (perform-operation (%udp-send-operation socket bv))]
+    [(socket bv host port)
+     (perform-operation (%udp-send-operation socket bv host port))]))
+(set! udp-receive-operation %udp-receive-operation)
+(set-who! udp-receive
+  (lambda (socket) (perform-operation (%udp-receive-operation socket))))
+(set! udp-bind!
+  (case-lambda
+    [(socket host port) (udp-bind! socket host port '())]
+    [(socket host port flags)
+     (aio-check-host-port 'udp-bind! host port)
+     (aio-udp-control 'udp-bind socket
+       (lambda ()
+         (aio-udp-bind (aio-handle-handle socket) host port
+           (aio-udp-bind-flag-bits 'udp-bind! flags))))
+     (void)]))
+(set-who! udp-connect!
+  (lambda (socket host port)
+    (aio-check-host-port who host port)
+    (aio-udp-control 'udp-connect socket
+      (lambda ()
+        (aio-udp-connect (aio-handle-handle socket) host port)))
+    (void)))
+(set-who! udp-disconnect!
+  (lambda (socket)
+    (aio-udp-control 'udp-disconnect socket
+      (lambda () (aio-udp-connect (aio-handle-handle socket) "" 0)))
+    (void)))
+(set-who! udp-local-address
+  (lambda (socket) (apply values (aio-udp-address-list who socket #f))))
+(set-who! udp-peer-address
+  (lambda (socket) (apply values (aio-udp-address-list who socket #t))))
+(set-who! udp-membership-set!
+  (lambda (socket multicast interface source action)
+    (unless (string? multicast) ($oops who "~s is not a string" multicast))
+    (unless (string? interface) ($oops who "~s is not a string" interface))
+    (unless (string? source) ($oops who "~s is not a string" source))
+    (unless (memq action '(join leave))
+      ($oops who "~s is not a membership action" action))
+    (aio-udp-control who socket
+      (lambda ()
+        (aio-udp-set-membership (aio-handle-handle socket)
+          multicast interface source (if (eq? action 'join) 1 0))))
+    (void)))
+(set-who! udp-multicast-interface-set!
+  (lambda (socket interface)
+    (unless (string? interface) ($oops who "~s is not a string" interface))
+    (aio-udp-control who socket
+      (lambda ()
+        (aio-udp-set-multicast-interface (aio-handle-handle socket)
+          interface)))
+    (void)))
+(set-who! udp-option-set!
+  (lambda (socket option value)
+    (let ([index
+           (case option
+             [(multicast-loop) 0]
+             [(multicast-ttl) 1]
+             [(broadcast) 3]
+             [(ttl) 4]
+             [else ($oops who "~s is not a UDP option" option)])])
+      (unless (and (integer? value) (exact? value))
+        ($oops who "~s is not an exact integer" value))
+      (aio-udp-control who socket
+        (lambda ()
+          (aio-udp-set-option (aio-handle-handle socket) index value)))
+      (void))))
 
 (set! async-file? %async-file?)
 (set! file-open
@@ -2010,40 +4022,109 @@
     (perform-operation (%file-stat-operation target))))
 (set-who! file-delete
   (lambda (path)
-    (unless (string? path) ($oops who "~s is not a string" path))
-    (perform-operation
-      (aio-fs-request-operation 'delete #f path
-        (lambda (ss st id) (aio-fs-unlink (aio-state-loop st) path id))
-        (lambda (ss status aux)
-          (if (fx= status 0)
-              (cons 'values '())
-              (cons 'raise (aio-io-condition 'delete #f path status))))))
+    (perform-operation (%file-delete-operation path))
     (void)))
 (set-who! file-rename
   (lambda (old new)
-    (unless (string? old) ($oops who "~s is not a string" old))
-    (unless (string? new) ($oops who "~s is not a string" new))
-    (perform-operation
-      (aio-fs-request-operation 'rename #f old
-        (lambda (ss st id) (aio-fs-rename (aio-state-loop st) old new id))
-        (lambda (ss status aux)
-          (if (fx= status 0)
-              (cons 'values '())
-              (cons 'raise (aio-io-condition 'rename #f old status))))))
+    (perform-operation (%file-rename-operation old new))
     (void)))
 (set-who! directory-create
   (case-lambda
     [(path) (directory-create path #o755)]
     [(path mode)
-     (unless (string? path) ($oops who "~s is not a string" path))
-     (perform-operation
-       (aio-fs-request-operation 'mkdir #f path
-         (lambda (ss st id) (aio-fs-mkdir (aio-state-loop st) path mode id))
-         (lambda (ss status aux)
-           (if (fx= status 0)
-               (cons 'values '())
-               (cons 'raise (aio-io-condition 'mkdir #f path status))))))
+     (perform-operation (%directory-create-operation path mode))
      (void)]))
+(set-who! directory-delete
+  (lambda (path)
+    (perform-operation (%directory-delete-operation path))
+    (void)))
+(set! file-copy
+  (case-lambda
+    [(from to) (perform-operation (%file-copy-operation from to))]
+    [(from to flags)
+     (perform-operation (%file-copy-operation from to flags))]
+    ))
+(set-who! temporary-directory-create
+  (lambda (pattern)
+    (perform-operation (%temporary-directory-create-operation pattern))))
+(set-who! temporary-file-open
+  (lambda (pattern)
+    (perform-operation (%temporary-file-open-operation pattern))))
+(set-who! directory-scan
+  (lambda (path) (perform-operation (%directory-scan-operation path))))
+(set! async-directory? %async-directory?)
+(set-who! directory-open
+  (lambda (path) (perform-operation (%directory-open-operation path))))
+(set! directory-read
+  (case-lambda
+    [(directory) (perform-operation (%directory-read-operation directory))]
+    [(directory count)
+     (perform-operation (%directory-read-operation directory count))]))
+(set-who! directory-close
+  (lambda (directory)
+    (perform-operation (%directory-close-operation directory))
+    (void)))
+(set-who! file-sync
+  (lambda (f)
+    (perform-operation (%file-sync-operation f #f))
+    (void)))
+(set-who! file-data-sync
+  (lambda (f)
+    (perform-operation (%file-sync-operation f #t))
+    (void)))
+(set-who! file-truncate
+  (lambda (f length)
+    (perform-operation (%file-truncate-operation f length))
+    (void)))
+(set! file-send-operation %file-send-operation)
+(set-who! file-send
+  (lambda (output input offset length)
+    (perform-operation (%file-send-operation output input offset length))))
+(set-who! file-access?
+  (lambda (path modes)
+    (perform-operation (%file-access-operation path modes))))
+(set-who! file-mode-set!
+  (lambda (target mode)
+    (perform-operation (%file-mode-set-operation target mode))
+    (void)))
+(set! file-times-set!
+  (case-lambda
+    [(target atime mtime)
+     (perform-operation (%file-times-set-operation target atime mtime))
+     (void)]
+    [(target atime mtime follow?)
+     (perform-operation
+       (%file-times-set-operation target atime mtime follow?))
+     (void)]))
+(set-who! file-lstat
+  (lambda (path) (perform-operation (%file-lstat-operation path))))
+(set-who! file-link
+  (lambda (from to)
+    (perform-operation (%file-link-operation from to #f '()))
+    (void)))
+(set! file-symbolic-link
+  (case-lambda
+    [(from to) (file-symbolic-link from to '())]
+    [(from to flags)
+     (perform-operation (%file-link-operation from to #t flags))
+     (void)]))
+(set-who! file-read-link
+  (lambda (path)
+    (perform-operation (%file-read-link-operation path #f))))
+(set-who! file-real-path
+  (lambda (path)
+    (perform-operation (%file-read-link-operation path #t))))
+(set! file-owner-set!
+  (case-lambda
+    [(target uid gid)
+     (perform-operation (%file-owner-set-operation target uid gid))
+     (void)]
+    [(target uid gid follow?)
+     (perform-operation (%file-owner-set-operation target uid gid follow?))
+     (void)]))
+(set-who! file-system-stat
+  (lambda (path)
+    (perform-operation (%file-system-stat-operation path))))
 
 (set! tcp-listen %tcp-listen)
 (set! tcp-accept-operation %tcp-accept-operation)
@@ -2060,6 +4141,7 @@
     (%stream-write-operation s bv)))
 (set! dns-lookup-operation %dns-lookup-operation)
 (set! file-open-operation %file-open-operation)
+(set! file-close-operation %file-close-operation)
 (set-who! file-read-operation
   (lambda (f len)
     (aio-check-file-unowned who f)
@@ -2073,6 +4155,39 @@
     (when (%async-file? target)
       (aio-check-file-unowned who target))
     (%file-stat-operation target)))
+(set! file-delete-operation %file-delete-operation)
+(set! file-rename-operation %file-rename-operation)
+(set! directory-create-operation %directory-create-operation)
+(set! directory-delete-operation %directory-delete-operation)
+(set! file-copy-operation %file-copy-operation)
+(set! temporary-directory-create-operation
+  %temporary-directory-create-operation)
+(set! temporary-file-open-operation %temporary-file-open-operation)
+(set! directory-scan-operation %directory-scan-operation)
+(set! directory-open-operation %directory-open-operation)
+(set! directory-read-operation %directory-read-operation)
+(set! directory-close-operation %directory-close-operation)
+(set-who! file-sync-operation
+  (lambda (f) (%file-sync-operation f #f)))
+(set-who! file-data-sync-operation
+  (lambda (f) (%file-sync-operation f #t)))
+(set! file-truncate-operation %file-truncate-operation)
+(set! file-access-operation %file-access-operation)
+(set! file-mode-set-operation %file-mode-set-operation)
+(set! file-times-set-operation %file-times-set-operation)
+(set! file-lstat-operation %file-lstat-operation)
+(set-who! file-link-operation
+  (lambda (from to) (%file-link-operation from to #f '())))
+(set! file-symbolic-link-operation
+  (case-lambda
+    [(from to) (%file-link-operation from to #t '())]
+    [(from to flags) (%file-link-operation from to #t flags)]))
+(set-who! file-read-link-operation
+  (lambda (path) (%file-read-link-operation path #f)))
+(set-who! file-real-path-operation
+  (lambda (path) (%file-read-link-operation path #t)))
+(set! file-owner-set-operation %file-owner-set-operation)
+(set! file-system-stat-operation %file-system-stat-operation)
 
 ;;; the scheduler calls this when run-async exits
 (set! $async-io-shutdown aio-io-shutdown)
