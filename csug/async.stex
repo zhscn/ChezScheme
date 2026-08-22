@@ -20,7 +20,7 @@
 This chapter describes {\ChezScheme}'s asynchronous programming subsystem.
 The asynchronous libraries provide lightweight cooperative tasks
 (fibers), structured task groups, hierarchical cancellation contexts,
-composable wait operations, bounded channels, and high-performance
+composable wait operations, bounded channels, fiber-aware mutexes, and high-performance
 nonblocking input/output (I/O) facilities.
 
 Tasks are fibers scheduled cooperatively within a \emph{scheduler group}.
@@ -44,13 +44,14 @@ transformed, dynamically selected, and combined using combinators such as
 \scheme{choice-operation} and \scheme{wrap-operation} in the style of
 Concurrent ML (CML).
 
-The core asynchronous subsystem is organized into five primary libraries:
+The core asynchronous subsystem is organized into six primary libraries:
 
 \schemedisplay
 (chezscheme async)
 (chezscheme async context)
 (chezscheme async operations)
 (chezscheme async channels)
+(chezscheme async sync)
 (chezscheme async syntax)
 \endschemedisplay
 
@@ -785,13 +786,104 @@ channel.
 \endschemedisplay
 
 
+\section{Fiber-Aware Mutexes\label{SECTASYNCMUTEXES}}
+
+\index{mutexes!asynchronous}%
+\index{synchronization!fibers}%
+The \scheme{(chezscheme async sync)} library provides mutual exclusion for
+asynchronous tasks.  Waiting for an async mutex suspends the calling task
+instead of blocking its scheduler thread.  Ownership belongs to the task and
+is retained when the task yields, waits, is preempted, or migrates to another
+scheduler in the same group.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-async-mutex}{\categoryprocedure}{(make-async-mutex)}
+\returns a new async mutex
+\listlibraries
+\endentryheader
+
+The new mutex is initially unowned.  Async mutexes are nonrecursive.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-mutex?}{\categoryprocedure}{(async-mutex? \var{obj})}
+\returns \scheme{#t} if \var{obj} is an async mutex, \scheme{#f} otherwise
+\listlibraries
+\endentryheader
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-mutex-acquire-operation}{\categoryprocedure}{(async-mutex-acquire-operation \var{mutex})}
+\formdef{async-mutex-acquire}{\categoryprocedure}{(async-mutex-acquire \var{mutex})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{async-mutex-acquire-operation} constructs an operation that acquires
+\var{mutex}.  It composes with choice, timeout, and context operations; a
+canceled or losing acquisition is removed from the wait queue.
+\scheme{async-mutex-acquire} performs that operation and returns an
+unspecified value after ownership is transferred to the current task.
+Contended waiters acquire ownership in FIFO registration order.  Attempting
+to acquire a mutex already owned by the current task is an error.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-mutex-release!}{\categoryprocedure}{(async-mutex-release! \var{mutex})}
+\returns unspecified
+\listlibraries
+\endentryheader
+
+The current task must own \var{mutex}.  Ownership is transferred directly to
+the first live waiter before that task is resumed.  Releasing an unowned mutex
+or one owned by another task is an error.
+When a task terminates, any mutexes still owned by that task are released
+before its terminal state is published to joiners.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{call-with-async-mutex}{\categoryprocedure}{(call-with-async-mutex \var{mutex} \var{thunk})}
+\returns the values returned by \var{thunk}
+\listlibraries
+\endentryheader
+
+\scheme{call-with-async-mutex} acquires \var{mutex}, invokes \var{thunk}, and
+releases the mutex after a normal return or an exception, including task
+cancellation.  Suspension and timed preemption during \var{thunk} retain
+ownership.
+
+\schemedisplay
+(import (chezscheme)
+        (chezscheme async)
+        (chezscheme async sync))
+
+(run-async
+  (lambda ()
+    (let ([mutex (make-async-mutex)] [counter 0])
+      (let ([workers
+             (map
+               (lambda (id)
+                 (spawn-task
+                   (lambda ()
+                     (do ([i 0 (+ i 1)]) ((= i 100))
+                       (call-with-async-mutex mutex
+                         (lambda () (set! counter (+ counter 1))))))
+                   'migratable? #t))
+               '(0 1 2 3))])
+        (for-each task-join workers)
+        counter)))
+  'parallelism 4) ;=> 400
+\endschemedisplay
+
+
 \section{Asynchronous Syntax\label{SECTASYNCSYNTAX}}
 
 \index{asynchronous syntax}%
 \index{tasks!syntactic forms}%
 \index{channels!iteration}%
 The \scheme{(chezscheme async syntax)} library provides hygienic,
-expression-oriented forms over the task, context, operation, and channel
+expression-oriented forms over the task, context, operation, channel, and sync
 libraries.  The forms preserve all values produced by their bodies and do not
 intercept exceptions or cancellation conditions.
 
@@ -885,6 +977,18 @@ value to \var{value}, and evaluates the body until the channel is closed and
 empty.  Buffered values are drained before iteration terminates.  The form
 does not close the channel or cancel its producer.
 
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{with-async-mutex}{\categorysyntax}{(with-async-mutex \var{mutex-expr} \var{body_1} \var{body_2} \dots)}
+\returns the values produced by the body
+\listlibraries
+\endentryheader
+
+The \var{mutex-expr} expression is evaluated once.  The body runs through
+\scheme{call-with-async-mutex}.  The mutex is released after a normal return
+or an exception, including cancellation, and remains owned across asynchronous
+suspension and timed preemption.
+
 The following examples provide a quick reference for the syntax library.
 The task forms accept the same option names as their procedural counterparts
 while making migratable child tasks the default:
@@ -895,6 +999,7 @@ while making migratable child tasks the default:
         (chezscheme async channels)
         (chezscheme async context)
         (chezscheme async operations)
+        (chezscheme async sync)
         (chezscheme async syntax))
 
 (async/options
@@ -909,6 +1014,25 @@ while making migratable child tasks the default:
            (values 'answer 42))])
     ;; await preserves every value returned by the task.
     (call-with-values (lambda () (await worker)) list))) ;=> (answer 42)
+\endschemedisplay
+
+\scheme{with-async-mutex} protects state shared by migratable tasks without
+blocking a scheduler thread.  The body may suspend while retaining ownership:
+
+\schemedisplay
+(async/options ([parallelism 2])
+  (let ([mutex (make-async-mutex)] [total 0])
+    (let ([workers
+           (map
+             (lambda (amount)
+               (go
+                 (with-async-mutex mutex
+                   ;; The lock remains owned while this task yields.
+                   (task-yield)
+                   (set! total (+ total amount)))))
+             '(10 20 12))])
+      (for-each (lambda (worker) (await worker)) workers)
+      total))) ;=> 42
 \endschemedisplay
 
 \scheme{select} supports general operations as well as channel and timer

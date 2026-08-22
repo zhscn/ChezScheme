@@ -19,7 +19,7 @@ The design supports:
 - structured task lifetime, joining, cancellation, and exception propagation;
 - hierarchical cancellation contexts with deadlines and reasons;
 - asynchronous timers, networking, name resolution, and file operations;
-- composable wait operations and channels;
+- composable wait operations, channels, and fiber-aware mutexes;
 - an optional scheduler group spanning multiple operating-system threads; and
 - optional timed preemption built on Chez Scheme engines.
 
@@ -65,6 +65,7 @@ The library boundaries are:
 (chezscheme async context)
 (chezscheme async operations)
 (chezscheme async channels)
+(chezscheme async sync)
 (chezscheme async syntax)
 
 (chezscheme async io errors)
@@ -358,11 +359,29 @@ Queue cleanup is incremental. Completed or canceled waiter records are
 removed during ordinary queue operations, with occasional bounded pruning to
 avoid retaining dead resumptions.
 
+## Fiber-aware mutexes
+
+The `(chezscheme async sync)` library provides mutexes whose contended
+acquisition suspends the current task. Mutex ownership is attached to the task
+rather than its scheduler thread, so a task retains ownership while it yields,
+waits for an operation, is preempted, or migrates within its scheduler group.
+
+Waiters receive ownership in FIFO registration order. Ownership is published
+before a selected waiter can resume on another scheduler. Cancellation or a
+losing choice removes its waiter through the operation nack protocol. Mutexes
+are nonrecursive, and release requires the current task to be the owner.
+
+The scoped procedure and `with-async-mutex` syntax release ownership after a
+normal return or an exception, including task cancellation. They preserve all
+values returned by the protected body. Task termination releases any remaining
+unscoped acquisitions before publishing the task's terminal state.
+
 ## Syntax layer
 
 The `(chezscheme async syntax)` library is a hygienic, expression-oriented
-layer over tasks, operations, contexts, and channels. It does not introduce a
-second scheduler abstraction. `async` delimits scheduler execution, `go`
+layer over tasks, operations, contexts, channels, and synchronization. It does
+not introduce a second scheduler abstraction. `async` delimits scheduler
+execution, `go`
 spawns a migratable structured child, and `await` joins a task while preserving
 all result values.
 
@@ -380,7 +399,8 @@ Dynamic scope forms install timeout and explicit cancellation contexts.
 child context on scope exit, bounding the tasks and operations created in that
 extent. `channel-for` implements the two-value channel receive protocol as an
 iteration: it drains buffered values, stops after closed-and-empty, and leaves
-channel ownership with the producer.
+channel ownership with the producer. `with-async-mutex` evaluates a body while
+the current task owns a fiber-aware mutex.
 
 ## Cancellation
 
@@ -580,7 +600,8 @@ separate Chez Scheme thread or a parallel scheduler task.
 Fiber-aware synchronization uses channels, operations, futures, or async
 mutexes. Holding an operating-system mutex across a suspension is invalid
 because another fiber on the same thread cannot make progress through that
-mutex.
+mutex. Internal operating-system mutex sections disable timer interrupts so
+engine expiration cannot suspend a task while it owns a scheduler lock.
 
 ## Resource finalization
 

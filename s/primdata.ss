@@ -543,6 +543,7 @@
   ((async-syntax: with-async-context) [flags])
   ((async-syntax: with-cancel-scope) [flags])
   ((async-syntax: channel-for) [flags])
+  ((async-syntax: with-async-mutex) [flags])
 )
 
 (define-symbol-flags* ([libraries (chezscheme async context)] [flags system proc])
@@ -591,6 +592,15 @@
   (channel-put [flags])
   (channel-get [flags])
   (channel-receive [flags])
+)
+
+(define-symbol-flags* ([libraries (chezscheme async sync)] [flags system proc])
+  (make-async-mutex [flags])
+  (async-mutex? [flags])
+  (async-mutex-acquire-operation [flags])
+  (async-mutex-acquire [flags])
+  (async-mutex-release! [flags])
+  (call-with-async-mutex [flags])
 )
 
 (define-symbol-flags* ([libraries (chezscheme async io errors)]
@@ -2980,8 +2990,11 @@
   ($rnrs-unicode [flags library-uid])
   ($chezscheme-control [flags library-uid])
   ($chezscheme-async [flags library-uid])
+  ($chezscheme-async-syntax [flags library-uid])
+  ($chezscheme-async-context [flags library-uid])
   ($chezscheme-async-operations [flags library-uid])
   ($chezscheme-async-channels [flags library-uid])
+  ($chezscheme-async-sync [flags library-uid])
   ($chezscheme-async-io-errors [flags library-uid])
   ($chezscheme-async-io-stream [flags library-uid])
   ($chezscheme-async-io-dns [flags library-uid])

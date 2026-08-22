@@ -5,6 +5,7 @@
 (import (chezscheme async operations))
 (import (chezscheme async channels))
 (import (chezscheme async context))
+(import (chezscheme async sync))
 (import (chezscheme async io fs))
 
 (define environment-positive-integer
@@ -161,6 +162,30 @@
              'parallelism 4)])
       (check (fx= value iteration) 'channel-rendezvous iteration value))))
 
+(define stress-async-mutex
+  (lambda (iteration)
+    (let ([value
+           (run-async
+             (lambda ()
+               (let ([mutex (make-async-mutex)] [counter 0] [tasks '()])
+                 (do ([i 0 (fx+ i 1)]) ((fx= i 8))
+                   (set! tasks
+                     (cons
+                       (spawn-task
+                         (lambda ()
+                           (do ([j 0 (fx+ j 1)]) ((fx= j 25))
+                             (call-with-async-mutex mutex
+                               (lambda ()
+                                 (let ([old counter])
+                                   (task-yield)
+                                   (set! counter (fx+ old 1)))))))
+                         'migratable? #t)
+                       tasks)))
+                 (for-each task-join tasks)
+                 counter))
+             'parallelism 4)])
+      (check (fx= value 200) 'async-mutex iteration value))))
+
 (define stress-channel-close-race
   (lambda (iteration)
     (let ([value
@@ -303,6 +328,9 @@
       (stress-channel-rendezvous i)
       (atomic-box-set! stress-location (list i 'channel-close-race))
       (stress-channel-close-race i))
+    (when (stress-scenario? "mutex")
+      (atomic-box-set! stress-location (list i 'async-mutex))
+      (stress-async-mutex i))
     (when (and stress-io? (stress-scenario? "io"))
       (atomic-box-set! stress-location (list i 'file-owner-routing))
       (stress-file-owner-routing i))

@@ -16,6 +16,7 @@
 (import (chezscheme async operations))
 (import (chezscheme async channels))
 (import (chezscheme async context))
+(import (chezscheme async sync))
 (import (chezscheme async syntax))
 (import (chezscheme control))
 
@@ -1423,6 +1424,243 @@
           (set! values (cons value values)))
         (list (reverse values) (channel-closed? channel))))
     '((1 2) #t))
+
+  ;; ---- async mutexes
+
+  (and (async-mutex? (make-async-mutex))
+       (not (async-mutex? 'not-a-mutex)))
+  (error? (async-mutex-acquire (make-async-mutex)))
+  (error? (async-mutex-release! (make-async-mutex)))
+  (error? (async-mutex-acquire-operation 'not-a-mutex))
+  (error? (call-with-async-mutex (make-async-mutex) 'not-a-procedure))
+
+  ;; Scoped locking preserves multiple values and releases on normal return.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-mutex)])
+          (let ([first
+                 (call-with-values
+                   (lambda () (with-async-mutex mutex (values 1 2 3)))
+                   list)])
+            (async-mutex-acquire mutex)
+            (async-mutex-release! mutex)
+            first))))
+    '(1 2 3))
+
+  ;; A mutex is nonrecursive and can only be released by its owning task.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-mutex)])
+          (async-mutex-acquire mutex)
+          (let ([recursive?
+                 (guard (c [else #t])
+                   (async-mutex-acquire mutex)
+                   #f)]
+                [foreign?
+                 (task-join
+                   (spawn-task
+                     (lambda ()
+                       (guard (c [else #t])
+                         (async-mutex-release! mutex)
+                         #f))))])
+            (async-mutex-release! mutex)
+            (list recursive? foreign?)))))
+    '(#t #t))
+
+  ;; Contended acquisitions are granted in registration order.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-mutex)] [order '()] [tasks '()])
+          (async-mutex-acquire mutex)
+          (do ([i 0 (fx+ i 1)]) ((fx= i 4))
+            (let ([started (make-future)])
+              (set! tasks
+                (append tasks
+                  (list
+                    (spawn-task
+                      (let ([i i])
+                        (lambda ()
+                          (future-fulfil! started #t)
+                          (with-async-mutex mutex
+                            (set! order (append order (list i))))))))))
+              (future-get started)))
+          (async-mutex-release! mutex)
+          (for-each task-join tasks)
+          order)))
+    '(0 1 2 3))
+
+  ;; Canceling a blocked acquisition removes it from the wait queue.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-mutex)] [started (make-future)])
+          (async-mutex-acquire mutex)
+          (let ([waiter
+                 (spawn-task
+                   (lambda ()
+                     (future-fulfil! started #t)
+                     (async-mutex-acquire mutex)
+                     'unexpected))])
+            (future-get started)
+            (task-cancel! waiter 'stop)
+            (let ([result
+                   (guard (c [(async-cancellation-condition? c) 'canceled])
+                     (task-join waiter))])
+              (async-mutex-release! mutex)
+              (with-async-mutex mutex (list result 'reacquired)))))))
+    '(canceled reacquired))
+
+  ;; A losing acquisition operation withdraws its registered waiter.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-mutex)]
+              [started (make-future)]
+              [ready (make-future)])
+          (async-mutex-acquire mutex)
+          (let ([waiter
+                 (spawn-task
+                   (lambda ()
+                     (future-fulfil! started #t)
+                     (perform-operation
+                       (choice-operation
+                         (wrap-operation
+                           (async-mutex-acquire-operation mutex)
+                           (lambda () 'acquired))
+                         (future-operation ready)))))])
+            (future-get started)
+            (future-fulfil! ready 'other)
+            (let ([result (task-join waiter)])
+              (async-mutex-release! mutex)
+              (with-async-mutex mutex (list result 'reacquired)))))))
+    '(other reacquired))
+
+  ;; Exceptions release the mutex.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-mutex)])
+          (guard (c [else (void)])
+            (with-async-mutex mutex
+              (raise (make-message-condition "leave"))))
+          (with-async-mutex mutex 'reacquired))))
+    'reacquired)
+
+  ;; Cancellation unwinds a scoped lock before the task terminates.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-mutex)] [entered (make-future)])
+          (let ([holder
+                 (spawn-task
+                   (lambda ()
+                     (with-async-mutex mutex
+                       (future-fulfil! entered #t)
+                       (async-sleep 100))))])
+            (future-get entered)
+            (task-cancel! holder 'stop)
+            (guard (c [(async-cancellation-condition? c) (void)])
+              (task-join holder))
+            (with-async-mutex mutex 'reacquired)))))
+    'reacquired)
+
+  ;; Task termination releases an unscoped acquisition as a final backstop.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-mutex)])
+          (task-join
+            (spawn-task
+              (lambda ()
+                (async-mutex-acquire mutex)
+                'finished)))
+          (with-async-mutex mutex 'reacquired))))
+    'reacquired)
+
+  ;; Suspension and scheduler migration retain ownership until scope exit.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-mutex)]
+              [entered (make-future)]
+              [release (make-future)]
+              [order '()])
+          (let ([holder
+                 (spawn-task
+                   (lambda ()
+                     (with-async-mutex mutex
+                       (set! order (cons 'holder-enter order))
+                       (future-fulfil! entered #t)
+                       (future-get release)
+                       (set! order (cons 'holder-exit order))))
+                   'migratable? #t)])
+            (future-get entered)
+            (let ([waiter
+                   (spawn-task
+                     (lambda ()
+                       (with-async-mutex mutex
+                         (set! order (cons 'waiter order))))
+                     'migratable? #t)])
+              (task-yield)
+              (future-fulfil! release #t)
+              (task-join holder)
+              (task-join waiter)
+              (reverse order)))))
+      'parallelism 3)
+    '(holder-enter holder-exit waiter))
+
+  ;; Engine preemption does not expose a held mutex to another worker.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-mutex)]
+              [entered (make-future)]
+              [inside? #f])
+          (let ([holder
+                 (spawn-task
+                   (lambda ()
+                     (with-async-mutex mutex
+                       (set! inside? #t)
+                       (future-fulfil! entered #t)
+                       (async-test-burn 100000)
+                       (set! inside? #f)))
+                   'migratable? #t)])
+            (future-get entered)
+            (let ([waiter
+                   (spawn-task
+                     (lambda ()
+                       (with-async-mutex mutex inside?))
+                     'migratable? #t)])
+              (task-join holder)
+              (task-join waiter)))))
+      'parallelism 3
+      'preemption-ticks 10)
+    #f)
+
+  ;; The mutex serializes migratable tasks across worker schedulers.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-mutex)] [counter 0] [tasks '()])
+          (do ([i 0 (fx+ i 1)]) ((fx= i 8))
+            (set! tasks
+              (cons
+                (spawn-task
+                  (lambda ()
+                    (do ([j 0 (fx+ j 1)]) ((fx= j 40))
+                      (with-async-mutex mutex
+                        (let ([old counter])
+                          (task-yield)
+                          (set! counter (fx+ old 1))))))
+                  'migratable? #t)
+                tasks)))
+          (for-each task-join tasks)
+          counter))
+      'parallelism 4)
+    320)
 
   ;; ---- observability
 

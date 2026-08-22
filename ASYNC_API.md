@@ -3,7 +3,8 @@
 ## Overview
 
 The asynchronous API provides fiber scheduling, cancellation contexts,
-composable wait operations, channels, and libuv-backed I/O. The scheduler and
+composable wait operations, channels, fiber-aware mutexes, and libuv-backed
+I/O. The scheduler and
 operation contracts are described in [ASYNC.md](ASYNC.md). This document
 specifies the public Scheme libraries, procedure signatures, options, and
 result formats.
@@ -415,12 +416,67 @@ Close a producer-owned channel and consume its remaining values:
 ;; => (1 2)
 ```
 
+## `(chezscheme async sync)`
+
+```scheme
+(make-async-mutex) -> async-mutex
+(async-mutex? object) -> boolean
+(async-mutex-acquire-operation mutex) -> operation
+(async-mutex-acquire mutex) -> void
+(async-mutex-release! mutex) -> void
+(call-with-async-mutex mutex thunk) -> values ...
+```
+
+An async mutex is nonrecursive and owned by an async task. A contended
+acquisition suspends only the current task. Waiters acquire the mutex in FIFO
+registration order, including when they run on different schedulers. A task
+retains ownership across operation waits, explicit yields, timed preemption,
+and migration.
+
+`async-mutex-acquire-operation` constructs a first-class acquisition
+operation. Cancellation and losing a `choice-operation` withdraw the waiter.
+`async-mutex-acquire` performs that operation. `async-mutex-release!` requires
+the current task to own the mutex; releasing an unowned mutex, releasing from
+another task, and recursive acquisition are errors.
+
+Task termination releases any mutexes still owned by that task before joiners
+observe its terminal state. This covers cancellation that races with ownership
+transfer and prevents an abandoned raw acquisition from blocking other tasks.
+
+`call-with-async-mutex` acquires the mutex, invokes `thunk`, and releases the
+mutex after a normal return or an exception, including cancellation. It
+preserves all values returned by `thunk`.
+
+```scheme
+(import (chezscheme)
+        (chezscheme async)
+        (chezscheme async sync))
+
+(run-async
+  (lambda ()
+    (let ([mutex (make-async-mutex)] [counter 0])
+      (let ([workers
+             (map
+               (lambda (worker-id)
+                 (spawn-task
+                   (lambda ()
+                     (do ([i 0 (+ i 1)]) ((= i 100))
+                       (call-with-async-mutex mutex
+                         (lambda () (set! counter (+ counter 1))))))
+                   'migratable? #t))
+               '(0 1 2 3))])
+        (for-each task-join workers)
+        counter)))
+  'parallelism 4)
+;; => 400
+```
+
 ## `(chezscheme async syntax)`
 
 This library provides hygienic expression-oriented forms over the task,
-context, operation, and channel APIs. It introduces no separate scheduler or
-runtime state. Forms preserve all values produced by their bodies and do not
-intercept exceptions or cancellation conditions.
+context, operation, channel, and synchronization APIs. It introduces no
+separate scheduler or runtime state. Forms preserve all values produced by
+their bodies and do not intercept exceptions or cancellation conditions.
 
 ```scheme
 (async body ...) -> values ...
@@ -472,6 +528,7 @@ cancellation context.
 (with-timeout seconds-expression body ...) -> values ...
 (with-async-context context-expression body ...) -> values ...
 (with-cancel-scope (cancel!) body ...) -> values ...
+(with-async-mutex mutex-expression body ...) -> values ...
 ```
 
 `with-timeout` installs a timeout context for the body.
@@ -480,6 +537,10 @@ cancellation context.
 `cancel!` as a procedure accepting zero or one cancellation-reason argument.
 The scope context is canceled with `scope-exited` when control leaves the
 body, which also bounds descendants created in the scope.
+
+`with-async-mutex` evaluates its mutex expression once and delegates scoped
+ownership to `call-with-async-mutex`. It preserves every value produced by the
+body and releases the mutex when the body raises, including cancellation.
 
 ```scheme
 (channel-for (value-variable channel-expression) body ...) -> void

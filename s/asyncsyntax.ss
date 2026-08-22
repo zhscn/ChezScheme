@@ -217,3 +217,8 @@
                (when open?
                  body1 body2 ...
                  (loop)))))])))
+
+(define-syntax async-syntax:with-async-mutex
+  (syntax-rules ()
+    [(_ mutex body1 body2 ...)
+     (call-with-async-mutex mutex (lambda () body1 body2 ...))]))
