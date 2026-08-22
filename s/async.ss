@@ -37,6 +37,37 @@
 (define make-async-mutex
   (lambda () (if-feature pthreads (make-mutex) #f)))
 
+(define async-debug-invariants?
+  (let ([v (getenv "CHEZ_ASYNC_CHECK_INVARIANTS")])
+    (and v (not (member v '("" "0" "false" "no"))))))
+
+(define async-debug-runnable-mutex (make-async-mutex))
+(define async-debug-runnable (make-eq-hashtable))
+
+(define async-invariant
+  (lambda (ok? message object)
+    (when (and async-debug-invariants? (not ok?))
+      ($oops 'async-invariant "~a: ~s" message object))))
+
+(define async-debug-queue-claim!
+  (lambda (task location)
+    (when async-debug-invariants?
+      (with-async-mutex async-debug-runnable-mutex
+        (async-invariant
+          (not (hashtable-ref async-debug-runnable task #f))
+          "task is present in more than one runnable queue" task)
+        (async-invariant (eq? (async-task-state task) 'ready)
+          "queued task is not ready" task)
+        (hashtable-set! async-debug-runnable task location)))))
+
+(define async-debug-queue-release!
+  (lambda (task)
+    (when async-debug-invariants?
+      (with-async-mutex async-debug-runnable-mutex
+        (async-invariant (hashtable-ref async-debug-runnable task #f)
+          "dequeued task was not registered as runnable" task)
+        (hashtable-delete! async-debug-runnable task)))))
+
 (define-record-type (async-fifo make-async-fifo async-fifo?)
   (nongenerative)
   (sealed #t)
@@ -398,19 +429,14 @@
     (let ([config (async-parameter-config-ref group)])
       (if (fx= (car config) (async-dynamic-state-version state))
           state
-          ;; Allocation publishes while holding this mutex inside the runtime's
-          ;; thread-context mutex.  Taking it for a missed version makes the
-          ;; parameter-vector initialization visible on this worker.
-          (with-async-mutex (async-scheduler-group-mutex group)
-            (async-apply-parameter-config state
-              (async-parameter-config-ref group)))))))
+          (async-apply-parameter-config state config)))))
 
 (define async-normalize-and-install-dynamic-state!
   (lambda (group state)
     (if-feature pthreads
-      ;; Parameter allocation takes the thread-context mutex before publishing
-      ;; the group configuration.  Use the same lock order so normalization
-      ;; and installation cannot straddle an allocation.
+      ;; Parameter allocation and parameter-vector access are serialized by
+      ;; the runtime's thread-context mutex.  Configuration publication itself
+      ;; is atomic and never takes a Scheme mutex while this mutex is held.
       (with-tc-mutex
         (let ([state (async-normalize-dynamic-state group state)])
           (async-install-dynamic-state/raw! state)
@@ -427,29 +453,26 @@
         (let ([group ($async-scheduler-group sched)])
           ;; This hook runs inside the runtime's thread-context mutex, after
           ;; the new slot has been initialized in every live thread context.
-          (let ([version
-                 (with-async-mutex (async-scheduler-group-mutex group)
-                   (let* ([config-box
-                           (async-scheduler-group-parameter-config group)]
-                          [config (async-parameter-config-ref group)]
-                          [version (fx+ 1 (car config))])
-                     (let ([next
-                            (cons version
-                              (cons (list version index initval size)
-                                (cdr config)))])
-                       (let publish ()
-                         (unless (box-cas! config-box config next)
-                           (publish)))
-                       ;; The allocating task is already running with the new
-                       ;; slot initialized by the runtime.  Record the version
-                       ;; on that task; other snapshots advance lazily when
-                       ;; their task is installed.
-                       (let ([task (async-scheduler-current-task sched)])
-                         (when task
-                           (async-task-dynamic-state-set! task
-                             (async-apply-parameter-config
-                               (async-task-dynamic-state task) next))))
-                       version)))])
+          ;; Allocations are serialized by that mutex.  Publishing through the
+          ;; atomic box avoids a lock inversion with Scheme mutex bookkeeping,
+          ;; which can itself acquire the thread-context mutex.
+          (let* ([config-box (async-scheduler-group-parameter-config group)]
+                 [config (async-parameter-config-ref group)]
+                 [version (fx+ 1 (car config))]
+                 [next
+                  (cons version
+                    (cons (list version index initval size) (cdr config)))])
+            (unless (box-cas! config-box config next)
+              ($oops 'make-thread-parameter
+                "concurrent parameter publication under the thread-context mutex"))
+            ;; The allocating task is already running with the new slot
+            ;; initialized by the runtime.  Record the version on that task;
+            ;; other snapshots advance lazily when their task is installed.
+            (let ([task (async-scheduler-current-task sched)])
+              (when task
+                (async-task-dynamic-state-set! task
+                  (async-apply-parameter-config
+                    (async-task-dynamic-state task) next))))
             ;; The allocating thread has already installed this slot.
             (async-scheduler-active-dynamic-version-set! sched version)))))))
 
@@ -570,7 +593,11 @@
       (unless (hashtable-ref tasks id #f)
         (hashtable-set! tasks id task)
         (async-scheduler-group-task-count-set! group
-          (fx+ 1 (async-scheduler-group-task-count group)))))))
+          (fx+ 1 (async-scheduler-group-task-count group))))
+      (async-invariant
+        (fx= (async-scheduler-group-task-count group)
+             (hashtable-size tasks))
+        "task registry count does not match registry size" group))))
 
 (define sched-registry-remove/raw!
   (lambda (sched task)
@@ -580,7 +607,11 @@
       (when (hashtable-ref tasks id #f)
         (hashtable-delete! tasks id)
         (async-scheduler-group-task-count-set! group
-          (fx- (async-scheduler-group-task-count group) 1))))))
+          (fx- (async-scheduler-group-task-count group) 1)))
+      (async-invariant
+        (fx= (async-scheduler-group-task-count group)
+             (hashtable-size tasks))
+        "task registry count does not match registry size" group))))
 
 (define sched-registry-add!
   (lambda (sched task)
@@ -598,6 +629,38 @@
   (lambda (group)
     (fx> (vector-length (async-scheduler-group-schedulers group)) 1)))
 
+(define async-debug-check-owner!
+  (lambda (sched)
+    (when async-debug-invariants?
+      (async-invariant (eq? ($async-scheduler) sched)
+        "scheduler is running with a different current scheduler" sched)
+      (async-invariant (eq? (async-scheduler-status sched) 'running)
+        "scheduler owner operation ran outside the running state" sched)
+      (async-invariant
+        (and (async-scheduler-owner-thread sched)
+             (fx= (async-scheduler-owner-thread sched) (get-thread-id)))
+        "scheduler owner operation ran on a foreign thread" sched))))
+
+(define async-debug-check-group-quiescent!
+  (lambda (group)
+    (when async-debug-invariants?
+      (with-async-mutex (async-scheduler-group-mutex group)
+        (async-invariant
+          (and (fx= (async-scheduler-group-task-count group) 0)
+               (fx= (hashtable-size (async-scheduler-group-tasks group)) 0))
+          "scheduler group retained terminal tasks" group)
+        (async-invariant (fx= (async-scheduler-group-work-count group) 0)
+          "scheduler group retained stealable work" group))
+      (with-async-mutex async-debug-runnable-mutex
+        (let-values ([(tasks locations)
+                      (hashtable-entries async-debug-runnable)])
+          (vector-for-each
+            (lambda (task)
+              (async-invariant
+                (not (eq? (async-task-scheduler-group task) group))
+                "scheduler group retained a runnable task" task))
+            tasks))))))
+
 (define async-group-next-wake-target!
   (lambda (group)
     (with-async-mutex (async-scheduler-group-mutex group)
@@ -611,6 +674,7 @@
 (define async-work-push!
   (lambda (sched task)
     (with-async-mutex (async-scheduler-work-mutex sched)
+      (async-debug-queue-claim! task 'work)
       (async-scheduler-work-deque-set! sched
         (cons task (async-scheduler-work-deque sched)))
       ;; Publish the count before releasing the deque lock, so a thief cannot
@@ -624,7 +688,9 @@
   (lambda (group)
     (with-async-mutex (async-scheduler-group-mutex group)
       (async-scheduler-group-work-count-set! group
-        (fx- (async-scheduler-group-work-count group) 1)))))
+        (fx- (async-scheduler-group-work-count group) 1))
+      (async-invariant (fx>= (async-scheduler-group-work-count group) 0)
+        "scheduler group work count became negative" group))))
 
 (define async-work-pop!
   (lambda (sched)
@@ -634,6 +700,7 @@
                (and (pair? work)
                     (begin
                       (async-scheduler-work-deque-set! sched (cdr work))
+                      (async-debug-queue-release! (car work))
                       (car work)))))])
       (when task
         (async-work-count-down! ($async-scheduler-group sched)))
@@ -656,6 +723,7 @@
                    (let-values ([(task remaining)
                                  (async-list-take-last work)])
                      (async-scheduler-work-deque-set! victim remaining)
+                     (async-debug-queue-release! task)
                      task))))])
       (when task
         (async-work-count-down! ($async-scheduler-group victim)))
@@ -714,6 +782,7 @@
     (let ([group (async-task-scheduler-group task)])
       (let ([target
              (with-async-mutex (async-scheduler-group-mutex group)
+               (async-debug-queue-claim! task 'group-ready)
                (async-queue-push! (async-scheduler-group-ready-queue group) task)
                (let* ([schedulers (async-scheduler-group-schedulers group)]
                       [n (vector-length schedulers)]
@@ -733,6 +802,7 @@
               [(async-queue-empty? q) #f]
               [else
                (let ([task (async-queue-pop! q)])
+                 (async-debug-queue-release! task)
                  (if (and (eq? (async-task-state task) 'ready)
                           (async-task-group-runnable? task))
                      (let ([old (async-task-scheduler task)])
@@ -762,7 +832,10 @@
         (if (and (async-scheduler-owner-thread completion-sched)
                  (fx= (async-scheduler-owner-thread completion-sched)
                       (get-thread-id)))
-            (async-queue-push! (async-scheduler-next-queue completion-sched) task)
+            (begin
+              (async-debug-queue-claim! task 'next)
+              (async-queue-push!
+                (async-scheduler-next-queue completion-sched) task))
             (async-remote-submit completion-sched task)))))
 
 ;;; Deliver a payload to a suspended task.  May run on a foreign thread.  A
@@ -826,6 +899,7 @@
 (define async-remote-submit
   (lambda (sched task)
     (with-async-mutex (async-scheduler-remote-mutex sched)
+      (async-debug-queue-claim! task 'remote)
       (async-queue-push! (async-scheduler-remote-queue sched) task))
     (async-wake-scheduler sched)))
 
@@ -1261,7 +1335,9 @@
       (let loop ()
         (unless (async-queue-empty? (async-scheduler-remote-queue sched))
           (let ([task (async-queue-pop! (async-scheduler-remote-queue sched))])
+            (async-debug-queue-release! task)
             (when (eq? (async-task-state task) 'ready)
+              (async-debug-queue-claim! task 'next)
               (async-queue-push! (async-scheduler-next-queue sched) task))
             (loop)))))))
 
@@ -1390,6 +1466,22 @@
 
 (define async-run-task-once
   (lambda (sched task)
+    (async-debug-check-owner! sched)
+    (async-invariant (not (async-scheduler-current-task sched))
+      "scheduler already has a running task" sched)
+    (async-invariant (eq? (async-task-state task) 'ready)
+      "scheduler selected a task that is not ready" task)
+    (async-invariant (eq? (async-task-scheduler-group task)
+                          ($async-scheduler-group sched))
+      "scheduler selected a task from another group" task)
+    (with-async-mutex (async-scheduler-group-mutex
+                        ($async-scheduler-group sched))
+      (async-invariant
+        (eq? (hashtable-ref
+               (async-scheduler-group-tasks ($async-scheduler-group sched))
+               (async-task-id task) #f)
+             task)
+        "scheduler selected a task missing from the registry" task))
     (async-scheduler-exec-count-set! sched (fx+ 1 (async-scheduler-exec-count sched)))
     (let ([wait-owner (async-task-wait-scheduler task)])
       (if (and wait-owner
@@ -1447,6 +1539,7 @@
                      (async-task-state-set! task 'ready)
                      (async-scheduler-preemption-count-set! sched
                        (fx+ 1 (async-scheduler-preemption-count sched)))
+                     (async-debug-queue-claim! task 'next)
                      (async-queue-push!
                        (async-scheduler-next-queue sched)
                        task)
@@ -1472,13 +1565,16 @@
     (let ([current (async-scheduler-current-queue sched)]
           [next (async-scheduler-next-queue sched)])
       (let loop ()
+        (async-debug-check-owner! sched)
         (async-drain-remote! sched)
         (when (async-group-parallel? ($async-scheduler-group sched))
           (let ([task (async-take-work! sched)])
             (when task
               (if (and (eq? (async-task-state task) 'ready)
                        (async-task-group-runnable? task))
-                  (async-queue-push! (async-scheduler-next-queue sched) task)
+                  (begin
+                    (async-debug-queue-claim! task 'next)
+                    (async-queue-push! (async-scheduler-next-queue sched) task))
                   (async-remote-submit (async-task-scheduler task) task)))))
         (async-fire-due-timers! sched)
         (let ([poll (async-scheduler-poll-proc sched)])
@@ -1502,6 +1598,7 @@
               (let turn-loop ()
                 (unless (async-queue-empty? current)
                   (let ([task (async-queue-pop! current)])
+                    (async-debug-queue-release! task)
                     (when (eq? (async-task-state task) 'ready)
                       (let ([handoff (async-run-task-once sched task)])
                         (when handoff
@@ -2008,7 +2105,9 @@
             (if (and migratable?
                      (async-group-parallel? ($async-scheduler-group sched)))
                 (async-work-submit! task sched)
-                (async-queue-push! (async-scheduler-next-queue sched) task))
+                (begin
+                  (async-debug-queue-claim! task 'next)
+                  (async-queue-push! (async-scheduler-next-queue sched) task)))
             task))))))
 
 (set-who! task-join
@@ -2123,6 +2222,7 @@
         (async-scheduler-group-root-task-set! group root)
         (async-task-child-group-set! root root-group)
         (sched-registry-add! sched root)
+        (async-debug-queue-claim! root 'next)
         (async-queue-push! (async-scheduler-next-queue sched) root)
         (let ([workers
                (if-feature pthreads
@@ -2153,6 +2253,7 @@
           (if-feature pthreads
             (for-each thread-join workers)
             (void)))
+        (async-debug-check-group-quiescent! group)
         (when (async-scheduler-group-failure group)
           (raise (async-scheduler-group-failure group)))
         (case (async-task-state root)
@@ -2219,6 +2320,11 @@
 
 (set! $async-scheduler-group-token
   (lambda (sched) ($async-scheduler-group sched)))
+
+(set! $async-scheduler-owner-thread?
+  (lambda (sched)
+    (and (async-scheduler-owner-thread sched)
+         (fx= (async-scheduler-owner-thread sched) (get-thread-id)))))
 
 (set! $async-scheduler-poll-proc-set!
   (lambda (sched v) (async-scheduler-poll-proc-set! sched v)))

@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+source_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+scheme=${SCHEME:-"$source_root/ta6le/bin/ta6le/scheme"}
+iterations=${CHEZ_ASYNC_STRESS_ITERATIONS:-100}
+timeout_seconds=${CHEZ_ASYNC_STRESS_TIMEOUT:-120}
+
+case "$iterations" in
+  ''|*[!0-9]*|0) echo "invalid CHEZ_ASYNC_STRESS_ITERATIONS: $iterations" >&2; exit 2 ;;
+esac
+case "$timeout_seconds" in
+  ''|*[!0-9]*|0) echo "invalid CHEZ_ASYNC_STRESS_TIMEOUT: $timeout_seconds" >&2; exit 2 ;;
+esac
+
+outer_timeout_seconds=$((timeout_seconds + 10))
+
+exec timeout --signal=TERM --kill-after=5 "$outer_timeout_seconds" \
+  env CHEZ_ASYNC_CHECK_INVARIANTS="${CHEZ_ASYNC_CHECK_INVARIANTS:-1}" \
+      CHEZ_ASYNC_STRESS_ITERATIONS="$iterations" \
+      CHEZ_ASYNC_STRESS_TIMEOUT="$timeout_seconds" \
+      CHEZ_ASYNC_STRESS_IO="${CHEZ_ASYNC_STRESS_IO:-1}" \
+      CHEZ_ASYNC_STRESS_SCENARIO="${CHEZ_ASYNC_STRESS_SCENARIO:-all}" \
+      "$scheme" --script "$script_dir/async-stress.ss"

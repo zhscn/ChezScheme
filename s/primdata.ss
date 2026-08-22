@@ -2043,6 +2043,7 @@
   ($async-scheduler-io-state [flags])
   ($async-scheduler-io-state-set! [flags])
   ($async-scheduler-group-token [flags])
+  ($async-scheduler-owner-thread? [flags])
   ($async-scheduler-poll-proc-set! [flags])
   ($async-scheduler-timers [flags])
   ($async-scheduler-virtual? [flags])

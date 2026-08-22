@@ -343,39 +343,40 @@
                  (lambda ()
                    (let* ([listener (pipe-listen path)]
                           [owner (current-async-scheduler)]
-                          [n 4]
-                          [infos (make-vector n)]
-                          [gates (make-vector n)]
-                          [tasks (make-vector n)]
-                          [servers (make-vector n)])
-                     (do ([i 0 (fx+ i 1)]) ((fx= i n))
-                       (let ([info (make-future)] [gate (make-future)])
-                         (vector-set! infos i info)
-                         (vector-set! gates i gate)
-                         (vector-set! tasks i
+                          [client (pipe-connect path)]
+                          [server (tcp-accept listener)]
+                          [mutex (make-mutex)]
+                          [condition (make-condition)]
+                          [started? #f]
+                          [writer
                            (spawn-task
                              (lambda ()
-                               (let ([stream (pipe-connect path)])
-                                 (future-fulfil! info
-                                   (current-async-scheduler) stream)
-                                 (future-get gate)
-                                 (stream-close stream)))
-                             'migratable? #t))))
-                     (do ([i 0 (fx+ i 1)]) ((fx= i n))
-                       (vector-set! servers i (tcp-accept listener)))
-                     (let ([foreign 0])
-                       (do ([i 0 (fx+ i 1)]) ((fx= i n))
-                         (let-values ([(sched stream)
-                                      (future-get (vector-ref infos i))])
-                           (unless (eq? sched owner)
-                             (set! foreign (fx+ foreign 1))
-                             (stream-write stream (bytevector 1)))))
-                       (do ([i 0 (fx+ i 1)]) ((fx= i n))
-                         (future-fulfil! (vector-ref gates i))
-                         (task-join (vector-ref tasks i))
-                         (stream-close (vector-ref servers i)))
+                               (let ([foreign?
+                                      (not (eq? (current-async-scheduler)
+                                                owner))])
+                                 (with-mutex mutex
+                                   (set! started? #t)
+                                   (condition-broadcast condition))
+                                 (stream-write client (bytevector 1))
+                                 foreign?))
+                             'migratable? #t)]
+                          [nudge
+                           (spawn-task (lambda () (void)) 'migratable? #t)])
+                     ;; Blocking the owner thread here forces the writer onto
+                     ;; the other scheduler.  Joining it then releases the
+                     ;; owner loop to process the routed stream request.
+                     (with-mutex mutex
+                       (let loop ()
+                         (unless started?
+                           (condition-wait condition mutex)
+                           (loop))))
+                     (let ([foreign? (task-join writer)]
+                           [data (stream-read server)])
+                       (task-join nudge)
+                       (stream-close client)
+                       (stream-close server)
                        (tcp-listener-close listener)
-                       (fx> foreign 0))))
+                       (and foreign? (= (bytevector-length data) 1)))))
                  'parallelism 2)])
           (asyncio-delete-if-present path)
           result)))

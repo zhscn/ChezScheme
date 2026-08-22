@@ -248,6 +248,15 @@
 (define aio-loop-registry (make-eq-hashtable))
 (define aio-loop-registry-mutex (make-mutex))
 
+(define aio-debug-invariants?
+  (let ([v (getenv "CHEZ_ASYNC_CHECK_INVARIANTS")])
+    (and v (not (member v '("" "0" "false" "no"))))))
+
+(define aio-invariant
+  (lambda (ok? message object)
+    (when (and aio-debug-invariants? (not ok?))
+      ($oops 'async-io-invariant "~a: ~s" message object))))
+
 ;;; Runs inside uv_run on the scheduler thread.  Enqueues the completion and
 ;;; nothing more; a condition is swallowed rather than escaping through C.
 (define aio-notify-trampoline
@@ -270,6 +279,7 @@
 
 (define aio-next-id
   (lambda (st)
+    (aio-debug-check-owner! st)
     (let ([id (aio-state-next-id st)])
       (aio-state-next-id-set! st (fx+ id 1))
       id)))
@@ -285,6 +295,15 @@
   (lambda (operation handle)
     (make-async-io-condition% operation handle (aio-handle-path handle) 'closed)))
 
+(define aio-debug-check-owner!
+  (lambda (st)
+    (when aio-debug-invariants?
+      (let ([owner (aio-state-owner st)])
+        (aio-invariant (eq? (current-async-scheduler) owner)
+          "libuv loop operation ran under a foreign scheduler" st)
+        (aio-invariant ($async-scheduler-owner-thread? owner)
+          "libuv loop operation ran on a foreign thread" st)))))
+
 (define bv->cstring
   (lambda (bv)
     (let* ([n (bytevector-length bv)]
@@ -298,17 +317,30 @@
 
 (define aio-register-handle!
   (lambda (st w)
+    (aio-debug-check-owner! st)
+    (aio-invariant (eq? (aio-handle-state w) st)
+      "handle registered with a foreign loop" w)
+    (aio-invariant
+      (not (hashtable-ref (aio-state-handles st) (aio-handle-id w) #f))
+      "handle id was registered twice" w)
     (hashtable-set! (aio-state-handles st) (aio-handle-id w) (weak-cons w #t))
     ((aio-state-guardian st) w)))
 
 (define aio-register-file!
   (lambda (st f)
+    (aio-debug-check-owner! st)
+    (aio-invariant (eq? (async-file-state f) st)
+      "file registered with a foreign loop" f)
+    (aio-invariant
+      (not (hashtable-ref (aio-state-files st) (async-file-fd f) #f))
+      "file descriptor was registered twice" f)
     (hashtable-set! (aio-state-files st) (async-file-fd f) (weak-cons f #t))
     ((aio-state-file-guardian st) f)
     f))
 
 (define aio-unregister-file!
   (lambda (f)
+    (aio-debug-check-owner! (async-file-state f))
     (hashtable-delete! (aio-state-files (async-file-state f))
       (async-file-fd f))))
 
@@ -323,7 +355,17 @@
 ;;; not, and returns a payload to deliver or #f to stay silent
 (define aio-register-request!
   (lambda (st id req)
+    (aio-debug-check-owner! st)
     (with-mutex (aio-state-requests-mutex st)
+      (aio-invariant (not (hashtable-ref (aio-state-requests st) id #f))
+        "native request id was registered twice" id)
+      (let ([handle (aio-req-handle req)])
+        (when (aio-handle? handle)
+          (aio-invariant (eq? (aio-handle-state handle) st)
+            "native request uses a handle from another loop" req))
+        (when (%async-file? handle)
+          (aio-invariant (eq? (async-file-state handle) st)
+            "native request uses a file from another loop" req)))
       (hashtable-set! (aio-state-requests st) id req))))
 
 ;;; Native libuv objects are touched only by their loop owner.  Foreign
@@ -345,6 +387,7 @@
 
 (define aio-drain-commands!
   (lambda (st)
+    (aio-debug-check-owner! st)
     (let ([commands
            (with-mutex (aio-state-command-mutex st)
              (let ([commands (reverse (aio-state-commands st))])
@@ -355,7 +398,10 @@
 (define aio-run-on-owner!
   (lambda (st command)
     (if (eq? (current-async-scheduler) (aio-state-owner st))
-        (begin (command) #t)
+        (begin
+          (aio-debug-check-owner! st)
+          (command)
+          #t)
         (aio-submit-command! st command))))
 
 (define aio-atomic-box-ref
@@ -434,6 +480,7 @@
 
 (define aio-dispatch-event
   (lambda (st id kind status aux)
+    (aio-debug-check-owner! st)
     (cond
       [(fx= kind AIO-EV-READ) (aio-on-read st id status aux)]
       [(fx= kind AIO-EV-ACCEPT) (aio-on-accept st id status)]
@@ -447,6 +494,7 @@
              (let ([req (hashtable-ref (aio-state-requests st) id #f)])
                (when req (hashtable-delete! (aio-state-requests st) id))
                req))])
+      (aio-invariant req "completion referenced an unknown request id" id)
       (when req
         (let* ([canceled? (or (aio-req-canceled? req) (aio-state-closing? st))]
                [payload ((aio-req-finish req) canceled? status aux)])
@@ -631,19 +679,28 @@
 
 ;;; ------------------------------------------------------- poll and wake
 
+(define AIO-IDLE-RECHECK-MS 100)
+
 (define aio-arm-bridge
   (lambda (st sched)
     (let ([ts ($async-scheduler-timers sched)])
-      (when (pair? ts)
-        (let* ([deadline ($async-timer-deadline (car ts))]
-               [delta (max 0 (- deadline ($async-monotonic-us)))])
-          (aio-bridge-start (aio-state-loop st)
-            (quotient (+ delta 999) 1000)))))))
+      ;; Cross-thread notifications remain the fast path.  The bounded bridge
+      ;; interval guarantees that a coalesced native wakeup cannot leave
+      ;; Scheme-side work behind a permanently blocking UV_RUN_ONCE.
+      (let ([timeout-ms
+             (if (pair? ts)
+                 (let* ([deadline ($async-timer-deadline (car ts))]
+                        [delta (max 0 (- deadline ($async-monotonic-us)))])
+                   (min AIO-IDLE-RECHECK-MS
+                     (quotient (+ delta 999) 1000)))
+                 AIO-IDLE-RECHECK-MS)])
+        (aio-bridge-start (aio-state-loop st) timeout-ms)))))
 
 (define aio-poll
   (lambda (sched block?)
     (let ([st ($async-scheduler-io-state sched)])
       (when (and st (not (aio-state-closing? st)))
+        (aio-debug-check-owner! st)
         (aio-drain-guardian! st)
         (aio-drain-file-guardian! st)
         (aio-drain-commands! st)
@@ -664,6 +721,7 @@
   (lambda (sched)
     (let ([st ($async-scheduler-io-state sched)])
       (when (and st (not (aio-state-closing? st)))
+        (aio-debug-check-owner! st)
         (with-mutex (aio-state-command-mutex st)
           (aio-state-closing?-set! st #t))
         (aio-drain-commands! st)
@@ -710,6 +768,12 @@
                 (unless (bwp-object? f)
                   (aio-finalize-file! f))))
             files))
+        (aio-invariant (fx= (hashtable-size (aio-state-requests st)) 0)
+          "loop shutdown retained native requests" st)
+        (aio-invariant (fx= (hashtable-size (aio-state-handles st)) 0)
+          "loop shutdown retained native handles" st)
+        (aio-invariant (fx= (hashtable-size (aio-state-files st)) 0)
+          "loop shutdown retained native files" st)
         (aio-loop-destroy (aio-state-loop st))
         (with-mutex aio-loop-registry-mutex
           (hashtable-delete! aio-loop-registry (aio-state-loop st)))))))
@@ -785,6 +849,7 @@
 
 (define aio-close-handle
   (lambda (w operation)
+    (aio-debug-check-owner! (aio-handle-state w))
     (let-values ([(close? waiters)
                   (with-mutex (aio-handle-mutex w)
                     (if (aio-handle-closing? w)
