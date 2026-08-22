@@ -1,0 +1,1716 @@
+% Copyright 2026 Cisco Systems, Inc.
+%
+% Licensed under the Apache License, Version 2.0 (the "License");
+% you may not use this file except in compliance with the License.
+% You may obtain a copy of the License at
+%
+% http://www.apache.org/licenses/LICENSE-2.0
+%
+% Unless required by applicable law or agreed to in writing, software
+% distributed under the License is distributed on an "AS IS" BASIS,
+% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+% See the License for the specific language governing permissions and
+% limitations under the License.
+
+\chapter{Asynchronous Programming\label{CHPTASYNC}}
+
+\index{asynchronous programming}%
+\index{fibers}%
+\index{tasks}%
+This chapter describes {\ChezScheme}'s asynchronous programming subsystem.
+The asynchronous libraries provide lightweight cooperative tasks
+(fibers), structured task groups, hierarchical cancellation contexts,
+composable wait operations, bounded channels, and high-performance
+nonblocking input/output (I/O) facilities.
+
+Tasks are fibers scheduled cooperatively within a \emph{scheduler group}.
+A scheduler group manages one or more schedulers, each executing on an
+underlying operating-system thread with an integrated event loop powered by
+libuv.  Tasks marked as migratable may be automatically transferred among
+schedulers in the same group via work stealing, enabling scalable
+multicore concurrency without requiring low-level thread synchronization by
+the programmer.
+
+The asynchronous scheduler is entered by invoking \scheme{run-async}.
+Procedures described as blocking in this chapter suspend only the calling
+asynchronous task, allowing other tasks on the same scheduler to continue
+execution.  Such procedures must be invoked from within the dynamic extent
+of a call to \scheme{run-async}.
+
+Waitable actions are represented by first-class \emph{operations}, whose
+constructors have names ending in \scheme{-operation}.  An operation describes
+a wait condition without immediately performing it.  Operations can be
+transformed, dynamically selected, and combined using combinators such as
+\scheme{choice-operation} and \scheme{wrap-operation} in the style of
+Concurrent ML (CML).
+
+The core asynchronous subsystem is organized into four primary libraries:
+
+\schemedisplay
+(chezscheme async)
+(chezscheme async context)
+(chezscheme async operations)
+(chezscheme async channels)
+\endschemedisplay
+
+In addition, modular I/O domain libraries provide nonblocking networking,
+filesystem operations, subprocess management, signal handling, event
+watching, and system diagnostics:
+
+\schemedisplay
+(chezscheme async io errors)
+(chezscheme async io stream)
+(chezscheme async io dns)
+(chezscheme async io udp)
+(chezscheme async io fs)
+(chezscheme async io poll)
+(chezscheme async io process)
+(chezscheme async io signal)
+(chezscheme async io watch)
+(chezscheme async io tty)
+(chezscheme async io system)
+\endschemedisplay
+
+The underlying libuv implementation is statically linked into the
+{\ChezScheme} runtime kernel and does not require external shared
+libraries.  Port adapters are provided to allow asynchronous streams and files
+to be used seamlessly with standard {\ChezScheme} binary port procedures.
+
+
+\section{Schedulers and Tasks\label{SECTASYNCTASKS}}
+
+\index{schedulers}%
+\index{tasks}%
+An asynchronous scheduler manages the cooperative execution of tasks and
+dispatches I/O events.  The entry point to the scheduler is
+\scheme{run-async}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{run-async}{\categoryprocedure}{(run-async \var{thunk} \var{option} \var{value} \dots)}
+\returns the values returned by \var{thunk}
+\listlibraries
+\endentryheader
+
+\var{thunk} must be a procedure that accepts zero arguments.
+\scheme{run-async} establishes an asynchronous scheduler group, creates a
+root task that executes \var{thunk}, and runs the scheduler until the root
+task's structured task group terminates.
+
+Optional configuration settings may be supplied as alternating
+\var{option} and \var{value} pairs.  The supported options are:
+
+\begin{description}
+\item[\scheme{clock}] specifies the scheduler clock and must be either the
+  symbol \scheme{real} (the default) or \scheme{virtual}.  A virtual clock
+  advances immediately to the next scheduled timer whenever no tasks are
+  ready to run, which is useful for deterministic simulation and testing.
+\item[\scheme{parallelism}] must be a positive fixnum specifying the number
+  of worker operating-system threads in the scheduler group (defaults to 1).
+  A value greater than 1 requires a threaded build of {\ChezScheme} and a
+  \scheme{real} clock.
+\item[\scheme{preemption-ticks}] must be either \scheme{#f} (the default) or
+  a positive fixnum.  When specified as a positive fixnum, time-sliced
+  preemptive scheduling is enabled for pure Scheme computations using
+  engine ticks.  A scheduler with preemption enabled cannot be nested
+  inside an active engine.
+\end{description}
+
+\scheme{run-async} returns the values returned by \var{thunk}.  If the root
+task terminates due to an unhandled exception or cancellation condition,
+that condition is re-raised by \scheme{run-async}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{spawn-task}{\categoryprocedure}{(spawn-task \var{thunk} \var{option} \var{value} \dots)}
+\returns a task object
+\listlibraries
+\endentryheader
+
+\var{thunk} must be a procedure that accepts zero arguments.
+\scheme{spawn-task} creates and schedules a new concurrent task that invokes
+\var{thunk}.
+
+Optional settings may be supplied as alternating \var{option} and
+\var{value} pairs:
+
+\begin{description}
+\item[\scheme{name}] specifies an application-defined identifier for the
+  task (typically a symbol or string) or \scheme{#f} (the default).
+\item[\scheme{group}] specifies the explicit task group to which the new
+  task belongs.  If omitted, the task belongs to the ambient task group.
+\item[\scheme{context}] specifies an explicit parent cancellation context
+  for the task.  If omitted, the task inherits a child of its task group's
+  context or the ambient dynamic context.
+\item[\scheme{migratable?}] must be a boolean specifying whether the task
+  is eligible for work stealing across worker threads in a multi-threaded
+  scheduler group (defaults to \scheme{#f}).
+\end{description}
+
+Each task automatically receives and owns a fresh child cancellation
+context.  When the task terminates, its owned context is automatically
+canceled so that descendant operations do not outlive the task.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{task?}{\categoryprocedure}{(task? \var{obj})}
+\formdef{task-id}{\categoryprocedure}{(task-id \var{task})}
+\formdef{task-name}{\categoryprocedure}{(task-name \var{task})}
+\formdef{task-state}{\categoryprocedure}{(task-state \var{task})}
+\formdef{task-scheduler}{\categoryprocedure}{(task-scheduler \var{task})}
+\formdef{task-current-wait}{\categoryprocedure}{(task-current-wait \var{task})}
+\formdef{task-context}{\categoryprocedure}{(task-context \var{task})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{task?} returns \scheme{#t} if \var{obj} is a task object and
+\scheme{#f} otherwise.
+\scheme{task-id} returns a unique exact integer assigned to \var{task}.
+\scheme{task-name} returns the name supplied when \var{task} was spawned,
+or \scheme{#f} if none was provided.
+\scheme{task-state} returns a symbol representing the current lifecycle state
+of \var{task}, which is one of \scheme{created}, \scheme{ready},
+\scheme{running}, \scheme{waiting}, \scheme{completed}, \scheme{failed}, or
+\scheme{canceled}.
+\scheme{task-scheduler} returns the scheduler instance that currently hosts
+\var{task}.
+\scheme{task-current-wait} returns diagnostic data describing the operation
+on which \var{task} is currently suspended, or \scheme{#f} if the task is
+not waiting.
+\scheme{task-context} returns the cancellation context owned by \var{task}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{current-async-task}{\categoryprocedure}{(current-async-task)}
+\formdef{current-async-scheduler}{\categoryprocedure}{(current-async-scheduler)}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{current-async-task} returns the task currently executing on the
+calling thread, or \scheme{#f} if called outside an asynchronous task.
+\scheme{current-async-scheduler} returns the scheduler instance hosting the
+calling thread, or \scheme{#f} if called outside an asynchronous scheduler.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{task-join}{\categoryprocedure}{(task-join \var{task})}
+\returns the values returned by \var{task}
+\listlibraries
+\endentryheader
+
+\var{task} must be a task object.
+\scheme{task-join} suspends the calling task until \var{task} terminates.
+If \var{task} completes successfully, \scheme{task-join} returns all values
+produced by \var{task}.  If \var{task} terminated with an uncaught exception
+or cancellation condition, that condition is re-raised in the calling task.
+An exception is raised if a task attempts to join itself.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{task-cancel!}{\categoryprocedure}{(task-cancel! \var{task})}
+\formdef{task-cancel!}{\categoryprocedure}{(task-cancel! \var{task} \var{reason})}
+\returns unspecified
+\listlibraries
+\endentryheader
+
+\var{task} must be a task object.
+\scheme{task-cancel!} cancels the cancellation context owned by \var{task}.
+If \var{reason} is supplied, it becomes the cancellation reason; otherwise,
+the default reason is used.  Cancellation is idempotent: subsequent calls to
+\scheme{task-cancel!} have no effect, and the first cancellation reason is
+preserved and propagated to all descendant contexts.  Cancellation takes
+effect at the next asynchronous cancellation checkpoint.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{task-yield}{\categoryprocedure}{(task-yield)}
+\returns a boolean
+\listlibraries
+\endentryheader
+
+\scheme{task-yield} cooperatively yields execution of the current task,
+placing it at the end of the scheduler's ready queue and allowing other
+runnable tasks to execute.  It returns \scheme{#t} when called from within an
+asynchronous task, and \scheme{#f} when called outside an asynchronous task.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-sleep}{\categoryprocedure}{(async-sleep \var{seconds})}
+\returns unspecified
+\listlibraries
+\endentryheader
+
+\var{seconds} must be a nonnegative real number.
+\scheme{async-sleep} suspends the calling task for at least \var{seconds}
+without blocking the underlying operating-system thread.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-dynamic-wind}{\categoryprocedure}{(async-dynamic-wind \var{before} \var{thunk} \var{after})}
+\returns the values returned by \var{thunk}
+\listlibraries
+\endentryheader
+
+\var{before}, \var{thunk}, and \var{after} must be procedures that accept zero
+arguments.
+\scheme{async-dynamic-wind} establishes dynamic-extent cleanup guards
+tailored for asynchronous tasks.  The \var{before} and \var{after} guards run
+upon normal entry and exit, non-local jumps via continuations, uncaught
+exception unwinding, and cancellation cleanup.  Unlike standard
+\scheme{dynamic-wind}, the guards are \emph{not} invoked during internal
+scheduler task switches (such as task suspension, resumption, cooperative
+yielding, or preemption).
+
+
+\section{Task Groups\label{SECTASYNCTASKGROUPS}}
+
+\index{task groups}%
+\index{structured concurrency}%
+Task groups provide structured concurrency by establishing lifetime boundaries
+for sets of related tasks.  A task group ensures that child tasks do not
+outlive their parent scope and aggregates unobserved child failures.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-task-group}{\categoryprocedure}{(make-task-group)}
+\returns a new task group
+\listlibraries
+\endentryheader
+
+\scheme{make-task-group} creates a fresh task group that captures the ambient
+cancellation context.  Tasks spawned into the group inherit a child of that
+captured context unless an explicit \scheme{context} option is given.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{task-group?}{\categoryprocedure}{(task-group? \var{obj})}
+\returns \scheme{#t} if \var{obj} is a task group, \scheme{#f} otherwise
+\listlibraries
+\endentryheader
+
+\scheme{task-group?} is the type predicate for task groups.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{task-group-wait}{\categoryprocedure}{(task-group-wait \var{task-group})}
+\returns unspecified
+\listlibraries
+\endentryheader
+
+\var{task-group} must be a task group object.
+\scheme{task-group-wait} suspends the calling task until all child tasks
+belonging to \var{task-group} have terminated.  If any child task terminated
+with an unhandled exception or failure, \scheme{task-group-wait} re-raises the
+failure condition.
+
+
+\section{Cancellation Conditions\label{SECTASYNCCANCELLATIONCONDITIONS}}
+
+\index{cancellation conditions}%
+\index{conditions!cancellation}%
+Cancellation conditions are raised when an asynchronous task, context, or
+operation is aborted due to explicit cancellation, a timeout, or a deadline.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-async-cancellation-condition}{\categoryprocedure}{(make-async-cancellation-condition)}
+\formdef{make-async-cancellation-condition}{\categoryprocedure}{(make-async-cancellation-condition \var{reason})}
+\formdef{async-cancellation-condition?}{\categoryprocedure}{(async-cancellation-condition? \var{obj})}
+\formdef{async-cancellation-reason}{\categoryprocedure}{(async-cancellation-reason \var{condition})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{make-async-cancellation-condition} constructs a new cancellation
+condition carrying the specified \var{reason}, or \scheme{#f} if omitted.
+\scheme{async-cancellation-condition?} returns \scheme{#t} if \var{obj} is an
+asynchronous cancellation condition and \scheme{#f} otherwise.
+\scheme{async-cancellation-reason} returns the reason object stored within
+\var{condition}.
+
+
+\section{Scheduler Information and Metrics\label{SECTASYNCSCHEDULERINFO}}
+
+\index{scheduler metrics}%
+\index{diagnostics}%
+The following procedures inspect scheduler state and execution metrics.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-scheduler?}{\categoryprocedure}{(async-scheduler? \var{obj})}
+\formdef{async-scheduler-task-count}{\categoryprocedure}{(async-scheduler-task-count \var{scheduler})}
+\formdef{async-scheduler-turn-count}{\categoryprocedure}{(async-scheduler-turn-count \var{scheduler})}
+\formdef{async-scheduler-suspension-count}{\categoryprocedure}{(async-scheduler-suspension-count \var{scheduler})}
+\formdef{async-scheduler-wakeup-count}{\categoryprocedure}{(async-scheduler-wakeup-count \var{scheduler})}
+\returns see below
+\listlibraries
+\endentryheader
+
+The predicate \scheme{async-scheduler?} recognizes scheduler objects.
+The remaining procedures return, respectively, the total active task count
+for the scheduler group, the number of event-loop turns for \var{scheduler},
+the number of task suspensions, and the number of task resumptions.
+
+The following example demonstrates spawning a migratable worker task across a
+two-thread scheduler group, joining the task, and receiving its return values:
+
+\schemedisplay
+(import (chezscheme) (chezscheme async))
+
+(run-async
+  (lambda ()
+    (let ([worker
+           (spawn-task
+             (lambda () (values 'answer 42))
+             'name 'worker
+             'migratable? #t)])
+      (let-values ([(label value) (task-join worker)])
+        (list label value))))
+  'parallelism 2) ;=> (answer 42)
+\endschemedisplay
+
+
+\section{Cancellation Contexts\label{SECTASYNCCONTEXTS}}
+
+\index{cancellation contexts}%
+\index{timeouts}%
+\index{deadlines}%
+The \scheme{(chezscheme async context)} library provides hierarchical
+cancellation contexts with support for timeouts, deadlines, and propagation.
+Cancellation flows downward from parent contexts to all descendants, but does
+not affect parent or sibling contexts.  All context inspection and
+cancellation procedures are thread-safe.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-async-context}{\categoryprocedure}{(make-async-context)}
+\formdef{make-async-context}{\categoryprocedure}{(make-async-context \var{parent})}
+\returns an asynchronous context object
+\listlibraries
+\endentryheader
+
+\scheme{make-async-context} creates a fresh asynchronous context.  If
+\var{parent} is omitted, the ambient asynchronous context is used as the
+parent when one exists.  Passing \scheme{#f} for \var{parent} creates an
+independent root context.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-context?}{\categoryprocedure}{(async-context? \var{obj})}
+\formdef{async-context-canceled?}{\categoryprocedure}{(async-context-canceled? \var{context})}
+\formdef{async-context-reason}{\categoryprocedure}{(async-context-reason \var{context})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{async-context?} returns \scheme{#t} if \var{obj} is an
+asynchronous context, and \scheme{#f} otherwise.
+
+\scheme{async-context-canceled?} returns \scheme{#t} if \var{context} has
+been canceled, and \scheme{#f} otherwise.
+
+\scheme{async-context-reason} returns the cancellation reason of
+\var{context}, or \scheme{#f} if it has not been canceled.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-context-cancel!}{\categoryprocedure}{(async-context-cancel! \var{context})}
+\formdef{async-context-cancel!}{\categoryprocedure}{(async-context-cancel! \var{context} \var{reason})}
+\returns unspecified
+\listlibraries
+\endentryheader
+
+\var{context} must be an asynchronous context.
+\scheme{async-context-cancel!} cancels \var{context} and all of its
+descendants.  Cancellation is idempotent; the first supplied \var{reason} is
+retained and propagated throughout the tree.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-context-done-operation}{\categoryprocedure}{(async-context-done-operation \var{context})}
+\returns an operation
+\listlibraries
+\endentryheader
+
+\var{context} must be an asynchronous context.
+\scheme{async-context-done-operation} returns an operation that completes
+with zero values as soon as \var{context} is canceled.  It can be combined
+with other operations using \scheme{choice-operation} to interrupt waits.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{perform-operation/context}{\categoryprocedure}{(perform-operation/context \var{context} \var{operation})}
+\returns the values produced by \var{operation}
+\listlibraries
+\endentryheader
+
+\var{context} must be an asynchronous context, and \var{operation} must be an
+operation.
+This procedure performs \var{operation} while racing it against the
+cancellation of \var{context}.  If \var{context} is canceled before the
+operation completes, the operation is withdrawn (nacked) and an asynchronous
+cancellation condition carrying the context's cancellation reason is raised.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{current-async-context}{\categoryprocedure}{(current-async-context)}
+\returns the ambient context or \scheme{#f}
+\formdef{call-with-async-context}{\categoryprocedure}{(call-with-async-context \var{context} \var{thunk})}
+\returns the values returned by \var{thunk}
+\listlibraries
+\endentryheader
+
+\scheme{current-async-context} returns the ambient fiber-local cancellation
+context, or \scheme{#f} if none is active.
+\scheme{call-with-async-context} installs \var{context} as the ambient
+cancellation context for the dynamic extent of \var{thunk}.  Tasks spawned
+within that extent inherit child contexts of \var{context}, and operations
+performed by the current task are bounded by \var{context}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-context-with-timeout}{\categoryprocedure}{(async-context-with-timeout \var{parent} \var{seconds})}
+\formdef{async-context-with-deadline}{\categoryprocedure}{(async-context-with-deadline \var{parent} \var{monotonic-time})}
+\returns an asynchronous context
+\listlibraries
+\endentryheader
+
+These procedures create child contexts that are automatically canceled with
+the reason \scheme{deadline-exceeded} upon expiration.
+\scheme{async-context-with-timeout} accepts a relative duration \var{seconds}
+as a nonnegative real number and operates under both real and virtual
+scheduler clocks.
+\scheme{async-context-with-deadline} accepts an absolute \scheme{time-monotonic}
+time object and requires a real scheduler clock.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{call-with-async-timeout}{\categoryprocedure}{(call-with-async-timeout \var{seconds} \var{thunk})}
+\returns the values returned by \var{thunk}
+\listlibraries
+\endentryheader
+
+\var{seconds} must be a nonnegative real number, and \var{thunk} must be a
+procedure that accepts zero arguments.
+\scheme{call-with-async-timeout} creates a child context with the specified
+relative timeout, installs it as the ambient context for the dynamic extent of
+\var{thunk}, and cancels the timer upon normal or exceptional exit.
+
+\schemedisplay
+(import (chezscheme)
+        (chezscheme async)
+        (chezscheme async context))
+
+(run-async
+  (lambda ()
+    (guard (c [(async-cancellation-condition? c)
+               (async-cancellation-reason c)])
+      (call-with-async-timeout 0.1
+        (lambda ()
+          (async-sleep 10)
+          'completed))))) ;=> deadline-exceeded
+\endschemedisplay
+
+
+\section{Composable Operations\label{SECTASYNCOPERATIONS}}
+
+\index{operations}%
+\index{Concurrent ML}%
+\index{futures}%
+The \scheme{(chezscheme async operations)} library provides first-class,
+composable waitable operations based on the Concurrent ML model.  An
+operation can be performed immediately, wrapped to transform its result, or
+combined with other operations in a non-deterministic choice.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{operation?}{\categoryprocedure}{(operation? \var{obj})}
+\returns \scheme{#t} if \var{obj} is an operation, \scheme{#f} otherwise
+\listlibraries
+\endentryheader
+
+\scheme{operation?} is the type predicate for operations.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{perform-operation}{\categoryprocedure}{(perform-operation \var{operation})}
+\returns the values produced by \var{operation}
+\listlibraries
+\endentryheader
+
+\var{operation} must be an operation.
+\scheme{perform-operation} executes \var{operation}.  If the operation cannot
+complete immediately, the calling task is suspended until the operation is
+ready or the task's cancellation context is triggered.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-operation}{\categoryprocedure}{(make-operation \var{try} \var{block})}
+\formdef{make-operation}{\categoryprocedure}{(make-operation \var{try} \var{block} \var{wrap})}
+\formdef{make-operation}{\categoryprocedure}{(make-operation \var{try} \var{block} \var{wrap} \var{nack})}
+\returns an operation
+\listlibraries
+\endentryheader
+
+\scheme{make-operation} is the low-level constructor for custom operations.
+\var{try} is invoked with a synchronization state and must return
+\scheme{#f} if the operation must suspend, a pair \scheme{(values . \var{list})}
+to succeed immediately with \var{list} as return values, or a pair
+\scheme{(raise . \var{condition})} to immediately raise an exception.
+\var{block} is invoked when the operation must suspend, receiving the
+synchronization state and a one-shot delivery procedure.  The optional
+\var{wrap} procedure transforms successful return values.  The optional
+\var{nack} procedure is invoked if another arm of a \scheme{choice-operation}
+succeeds, withdrawing any registered waiter.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{always-operation}{\categoryprocedure}{(always-operation \var{value} \dots)}
+\formdef{never-operation}{\categoryprocedure}{(never-operation)}
+\formdef{sleep-operation}{\categoryprocedure}{(sleep-operation \var{seconds})}
+\returns an operation
+\listlibraries
+\endentryheader
+
+\scheme{always-operation} returns an operation that completes immediately,
+producing \var{value} \dots.
+\scheme{never-operation} returns an operation that never completes.
+\scheme{sleep-operation} returns an operation that completes with zero values
+after \var{seconds} have elapsed.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{wrap-operation}{\categoryprocedure}{(wrap-operation \var{operation} \var{procedure})}
+\returns an operation
+\listlibraries
+\endentryheader
+
+\var{operation} must be an operation, and \var{procedure} must be a procedure.
+\scheme{wrap-operation} returns an operation that, upon successful completion
+of \var{operation}, applies \var{procedure} to the produced values and returns
+the results of that call.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{choice-operation}{\categoryprocedure}{(choice-operation \var{operation} \dots)}
+\returns an operation
+\listlibraries
+\endentryheader
+
+\scheme{choice-operation} combines multiple operations into a single choice.
+When performed, exactly one ready child operation commits, while the others
+are aborted (nacked).  To ensure fairness, the order in which child operations
+are attempted alternates between successive executions.  If no child operations
+are provided, \scheme{choice-operation} behaves like \scheme{never-operation}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-future}{\categoryprocedure}{(make-future)}
+\formdef{future?}{\categoryprocedure}{(future? \var{obj})}
+\formdef{future-fulfil!}{\categoryprocedure}{(future-fulfil! \var{future} \var{value} \dots)}
+\formdef{future-fail!}{\categoryprocedure}{(future-fail! \var{future} \var{condition})}
+\formdef{future-operation}{\categoryprocedure}{(future-operation \var{future})}
+\formdef{future-get}{\categoryprocedure}{(future-get \var{future})}
+\returns see below
+\listlibraries
+\endentryheader
+
+A \emph{future} is a single-assignment asynchronous value container.
+\scheme{make-future} creates an unfulfilled future.
+\scheme{future?} returns \scheme{#t} if \var{obj} is a future and \scheme{#f} otherwise.
+\scheme{future-fulfil!} resolves \var{future} with \var{value} \dots.
+\scheme{future-fail!} rejects \var{future} with \var{condition}.
+Attempting to fulfill or fail a future more than once raises an exception.
+\scheme{future-operation} returns an operation that produces the future's
+values or re-raises its failure condition.
+\scheme{future-get} performs \scheme{future-operation} directly, suspending
+the calling task until the future is resolved.
+
+The following example uses \scheme{choice-operation} and \scheme{wrap-operation}
+to race a channel read against a timer:
+
+\schemedisplay
+(import (chezscheme)
+        (chezscheme async)
+        (chezscheme async operations)
+        (chezscheme async channels))
+
+(run-async
+  (lambda ()
+    (let ([input (make-channel)])
+      (spawn-task
+        (lambda ()
+          (async-sleep 0.01)
+          (channel-put input "ready")))
+      (perform-operation
+        (choice-operation
+          (channel-get-operation input)
+          (wrap-operation (sleep-operation 1)
+            (lambda () "timed out"))))))) ;=> "ready"
+\endschemedisplay
+
+
+\section{Channels\label{SECTASYNCCHANNELS}}
+
+\index{channels}%
+\index{message passing}%
+The \scheme{(chezscheme async channels)} library implements typed, thread-safe
+communication channels.  Channels support unbuffered rendezvous
+synchronization as well as bounded FIFO buffering, and can be safely shared
+across tasks, schedulers, and operating-system threads.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-channel}{\categoryprocedure}{(make-channel)}
+\formdef{make-channel}{\categoryprocedure}{(make-channel \var{capacity})}
+\returns a new channel
+\listlibraries
+\endentryheader
+
+\scheme{make-channel} creates a new channel.  The optional \var{capacity}
+must be an exact nonnegative integer (defaulting to 0).  A capacity of 0
+creates an unbuffered \emph{rendezvous} channel where senders and receivers
+synchronize directly.  A positive capacity creates a bounded FIFO queue.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{channel?}{\categoryprocedure}{(channel? \var{obj})}
+\returns \scheme{#t} if \var{obj} is a channel, \scheme{#f} otherwise
+\listlibraries
+\endentryheader
+
+\scheme{channel?} is the type predicate for channels.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{channel-close!}{\categoryprocedure}{(channel-close! \var{channel})}
+\formdef{channel-close!}{\categoryprocedure}{(channel-close! \var{channel} \var{reason})}
+\formdef{channel-closed?}{\categoryprocedure}{(channel-closed? \var{channel})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\var{channel} must be a channel.
+\scheme{channel-close!} closes \var{channel}.  Closing is idempotent, and the
+first supplied \var{reason} is retained.  Values already buffered in
+\var{channel} remain readable in FIFO order until drained.  Subsequent or
+blocked put operations fail immediately with a channel-closed condition.
+\scheme{channel-closed?} returns \scheme{#t} if \var{channel} has been closed
+and \scheme{#f} otherwise.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-channel-closed-condition}{\categoryprocedure}{(make-channel-closed-condition)}
+\formdef{make-channel-closed-condition}{\categoryprocedure}{(make-channel-closed-condition \var{reason})}
+\formdef{channel-closed-condition?}{\categoryprocedure}{(channel-closed-condition? \var{obj})}
+\formdef{channel-closed-reason}{\categoryprocedure}{(channel-closed-reason \var{condition})}
+\returns see below
+\listlibraries
+\endentryheader
+
+These procedures construct, recognize, and inspect the condition raised when
+attempting to write to a closed channel, or when reading from an empty closed
+channel via \scheme{channel-get}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{channel-put-operation}{\categoryprocedure}{(channel-put-operation \var{channel} \var{value})}
+\formdef{channel-get-operation}{\categoryprocedure}{(channel-get-operation \var{channel})}
+\formdef{channel-receive-operation}{\categoryprocedure}{(channel-receive-operation \var{channel})}
+\returns an operation
+\listlibraries
+\endentryheader
+
+\scheme{channel-put-operation} returns an operation that sends \var{value}
+over \var{channel}, completing once the value is placed in the buffer or
+accepted by a receiver.
+\scheme{channel-get-operation} returns an operation that produces the next
+value from \var{channel}, or raises a channel-closed condition if the channel
+is closed and drained.
+\scheme{channel-receive-operation} returns an operation that produces two
+values: \scheme{\var{value} #t} when an item is received, or \scheme{#f #f}
+when the channel is closed and drained.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{channel-put}{\categoryprocedure}{(channel-put \var{channel} \var{value})}
+\formdef{channel-get}{\categoryprocedure}{(channel-get \var{channel})}
+\formdef{channel-receive}{\categoryprocedure}{(channel-receive \var{channel})}
+\returns see below
+\listlibraries
+\endentryheader
+
+These procedures directly perform their corresponding channel operations.
+\scheme{channel-put} transmits \var{value} and returns an unspecified value.
+\scheme{channel-get} returns the next value, raising a channel-closed condition
+if drained.
+\scheme{channel-receive} returns two values: \var{value} and a boolean
+\var{open?}, distinguishing a transmitted \scheme{#f} value from a drained
+channel.
+
+\schemedisplay
+(import (chezscheme)
+        (chezscheme async)
+        (chezscheme async channels))
+
+(run-async
+  (lambda ()
+    (let ([values (make-channel 2)])
+      (spawn-task
+        (lambda ()
+          (channel-put values 1)
+          (channel-put values 2)
+          (channel-close! values)))
+      (let loop ([items '()])
+        (let-values ([(value open?) (channel-receive values)])
+          (if open?
+              (loop (cons value items))
+              (reverse items))))))) ;=> (1 2)
+\endschemedisplay
+
+
+\section{Asynchronous I/O Subsystem\label{SECTASYNCIO}}
+
+\index{libuv}%
+\index{I/O!asynchronous}%
+The asynchronous I/O libraries integrate {\ChezScheme} with an internal libuv
+event loop hosted by each scheduler.  When an I/O operation cannot complete
+immediately, the initiating task is suspended and resumed automatically when
+the corresponding I/O event is triggered by the operating system.
+
+For every direct blocking I/O procedure, a corresponding \scheme{-operation}
+constructor exists that returns a composable operation accepting identical
+arguments and producing equivalent results unless otherwise specified.
+
+Explicit closing of handles and streams via their respective close procedures
+is the primary mechanism for managing system resources.  In addition,
+{\ChezScheme}'s storage management guardians and scheduler shutdown routines
+automatically reclaim abandoned native handles.
+
+Native handles are bound to the scheduler group in which they are created.
+A task executing on any scheduler within that group may interact with a handle;
+the runtime automatically routes the request to the handle's owning event loop.
+Handles cannot be shared across different scheduler groups.  Closing a port
+created by an asynchronous port adapter automatically closes the underlying
+native handle.
+
+
+\section{I/O Conditions and Errors\label{SECTASYNCIOERRORS}}
+
+\index{I/O conditions}%
+\index{conditions!I/O}%
+The \scheme{(chezscheme async io errors)} library defines condition types and
+diagnostics for asynchronous I/O errors.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-async-io-condition}{\categoryprocedure}{(make-async-io-condition \var{operation} \var{handle} \var{path} \var{code})}
+\formdef{async-io-condition?}{\categoryprocedure}{(async-io-condition? \var{obj})}
+\formdef{async-io-condition-operation}{\categoryprocedure}{(async-io-condition-operation \var{condition})}
+\formdef{async-io-condition-handle}{\categoryprocedure}{(async-io-condition-handle \var{condition})}
+\formdef{async-io-condition-path}{\categoryprocedure}{(async-io-condition-path \var{condition})}
+\formdef{async-io-condition-code}{\categoryprocedure}{(async-io-condition-code \var{condition})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{make-async-io-condition} constructs an asynchronous I/O condition.
+\scheme{async-io-condition?} returns \scheme{#t} if \var{obj} is an
+asynchronous I/O condition and \scheme{#f} otherwise.
+The accessors extract the operation name, the associated native handle (or
+\scheme{#f}), the target filesystem path (or \scheme{#f}), and the native
+libuv integer error code or logical failure symbol (such as \scheme{closed} or
+\scheme{busy}).
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-io-error-name}{\categoryprocedure}{(async-io-error-name \var{code})}
+\formdef{async-io-error-message}{\categoryprocedure}{(async-io-error-message \var{code})}
+\returns a string
+\listlibraries
+\endentryheader
+
+These procedures accept a native libuv integer error code \var{code} and
+return libuv's standard symbolic error name (such as \scheme{"ENOENT"}) and
+explanatory descriptive message, respectively.
+
+
+\section{Streams and Listeners\label{SECTASYNCSTREAMS}}
+
+\index{TCP streams}%
+\index{pipe streams}%
+\index{listeners}%
+The \scheme{(chezscheme async io stream)} library provides nonblocking TCP
+network streams, local-domain (Unix domain socket or named pipe) streams, and
+port adapters.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{tcp-listen}{\categoryprocedure}{(tcp-listen \var{host} \var{port})}
+\formdef{tcp-listen}{\categoryprocedure}{(tcp-listen \var{host} \var{port} \var{backlog})}
+\formdef{pipe-listen}{\categoryprocedure}{(pipe-listen \var{path})}
+\formdef{pipe-listen}{\categoryprocedure}{(pipe-listen \var{path} \var{backlog})}
+\returns a listener object
+\listlibraries
+\endentryheader
+
+\scheme{tcp-listen} creates a TCP listener bound to \var{host} (an IPv4 or
+IPv6 address string) and \var{port} (an exact integer from 0 to 65535).
+\scheme{pipe-listen} creates a local-domain stream listener bound to the
+filesystem path \var{path}.  The optional \var{backlog} parameter specifies the
+connection queue size (defaulting to 128).
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{tcp-listener?}{\categoryprocedure}{(tcp-listener? \var{obj})}
+\formdef{tcp-listener-close}{\categoryprocedure}{(tcp-listener-close \var{listener})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{tcp-listener?} returns \scheme{#t} if \var{obj} is a TCP or local pipe
+listener and \scheme{#f} otherwise.
+\scheme{tcp-listener-close} closes \var{listener}, waking any blocked
+accept operations, and returns an unspecified value.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{tcp-accept-operation}{\categoryprocedure}{(tcp-accept-operation \var{listener})}
+\formdef{tcp-connect-operation}{\categoryprocedure}{(tcp-connect-operation \var{host} \var{port})}
+\formdef{pipe-connect-operation}{\categoryprocedure}{(pipe-connect-operation \var{path})}
+\formdef{tcp-accept}{\categoryprocedure}{(tcp-accept \var{listener})}
+\formdef{tcp-connect}{\categoryprocedure}{(tcp-connect \var{host} \var{port})}
+\formdef{pipe-connect}{\categoryprocedure}{(pipe-connect \var{path})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{tcp-accept-operation} and \scheme{tcp-accept} await and accept an
+incoming connection on \var{listener}, returning an asynchronous stream.
+\scheme{tcp-connect-operation} and \scheme{tcp-connect} establish a TCP
+connection to \var{host} on \var{port}.
+\scheme{pipe-connect-operation} and \scheme{pipe-connect} establish a
+connection to a local-domain pipe at \var{path}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-stream?}{\categoryprocedure}{(async-stream? \var{obj})}
+\formdef{tcp-stream?}{\categoryprocedure}{(tcp-stream? \var{obj})}
+\formdef{pipe-stream?}{\categoryprocedure}{(pipe-stream? \var{obj})}
+\formdef{stream-closed?}{\categoryprocedure}{(stream-closed? \var{stream})}
+\returns \scheme{#t} if \var{obj} is a matching stream, \scheme{#f} otherwise
+\listlibraries
+\endentryheader
+
+These predicates test for asynchronous streams, TCP streams, local pipe
+streams, and closed streams, respectively.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{stream-read-operation}{\categoryprocedure}{(stream-read-operation \var{stream})}
+\formdef{stream-write-operation}{\categoryprocedure}{(stream-write-operation \var{stream} \var{bytevector})}
+\formdef{stream-read}{\categoryprocedure}{(stream-read \var{stream})}
+\formdef{stream-write}{\categoryprocedure}{(stream-write \var{stream} \var{bytevector})}
+\formdef{stream-shutdown}{\categoryprocedure}{(stream-shutdown \var{stream})}
+\formdef{stream-close}{\categoryprocedure}{(stream-close \var{stream})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{stream-read-operation} and \scheme{stream-read} read the next available
+chunk of data from \var{stream}, returning a non-empty bytevector, or the
+end-of-file object if the remote peer has closed its end.
+\scheme{stream-write-operation} returns an operation that produces the number
+of bytes written.  \scheme{stream-write} transmits the contents of
+\var{bytevector} directly and returns an unspecified value.
+\scheme{stream-shutdown} closes the outbound writing channel after all pending
+writes have completed.
+\scheme{stream-close} immediately closes both read and write channels of
+\var{stream} and frees the underlying handle.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-stream->binary-input-port}{\categoryprocedure}{(async-stream->binary-input-port \var{stream})}
+\formdef{async-stream->binary-output-port}{\categoryprocedure}{(async-stream->binary-output-port \var{stream})}
+\formdef{async-stream->binary-input/output-port}{\categoryprocedure}{(async-stream->binary-input/output-port \var{stream})}
+\returns a binary port
+\listlibraries
+\endentryheader
+
+These procedures construct standard {\ChezScheme} binary ports backed by
+\var{stream}.  Calling an adapter transfers ownership of \var{stream} to the
+new port; subsequent direct calls to stream procedures on \var{stream} are
+disallowed.  Closing the returned port automatically closes \var{stream}.
+Stream ports do not support position or seeking operations.
+
+The following example implements an asynchronous TCP ping-pong exchange:
+
+\schemedisplay
+(import (chezscheme)
+        (chezscheme async)
+        (chezscheme async io stream))
+
+(run-async
+  (lambda ()
+    (let* ([listener (tcp-listen "127.0.0.1" 9000)]
+           [server
+            (spawn-task
+              (lambda ()
+                (let ([stream (tcp-accept listener)])
+                  (let ([request (utf8->string (stream-read stream))])
+                    (stream-write stream (string->utf8 "pong"))
+                    (stream-close stream)
+                    request))))]
+           [client (tcp-connect "127.0.0.1" 9000)])
+      (stream-write client (string->utf8 "ping"))
+      (let ([reply (utf8->string (stream-read client))])
+        (stream-close client)
+        (tcp-listener-close listener)
+        (list (task-join server) reply))))) ;=> ("ping" "pong")
+\endschemedisplay
+
+
+\section{Domain Name Resolution\label{SECTASYNCDNS}}
+
+\index{DNS}%
+\index{name resolution}%
+The \scheme{(chezscheme async io dns)} library provides nonblocking forward and
+reverse DNS resolution.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{dns-lookup-operation}{\categoryprocedure}{(dns-lookup-operation \var{node})}
+\formdef{dns-lookup-operation}{\categoryprocedure}{(dns-lookup-operation \var{node} \var{service})}
+\formdef{dns-lookup}{\categoryprocedure}{(dns-lookup \var{node})}
+\formdef{dns-lookup}{\categoryprocedure}{(dns-lookup \var{node} \var{service})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\var{node} is a host name string, and \var{service} is an optional port number
+string or service name (or \scheme{#f}).
+\scheme{dns-lookup} resolves \var{node} and returns a list of address entries
+of the form \scheme{(\var{host} \var{port} \var{family})}, where \var{host} is
+a numeric IP string, \var{port} is an exact integer, and \var{family} is
+\scheme{4} for IPv4 or \scheme{6} for IPv6.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{dns-reverse-operation}{\categoryprocedure}{(dns-reverse-operation \var{host} \var{port})}
+\formdef{dns-reverse-operation}{\categoryprocedure}{(dns-reverse-operation \var{host} \var{port} \var{flags})}
+\formdef{dns-reverse}{\categoryprocedure}{(dns-reverse \var{host} \var{port})}
+\formdef{dns-reverse}{\categoryprocedure}{(dns-reverse \var{host} \var{port} \var{flags})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\var{host} is an IP address string, \var{port} is an integer, and \var{flags}
+is an optional list containing any of \scheme{name-required},
+\scheme{numeric-host}, or \scheme{numeric-service}.
+\scheme{dns-reverse} performs a reverse DNS lookup and returns two values: the
+resolved host name and service name as strings.
+
+
+\section{UDP Sockets\label{SECTASYNCUDP}}
+
+\index{UDP}%
+\index{sockets!UDP}%
+\index{datagrams}%
+The \scheme{(chezscheme async io udp)} library provides nonblocking UDP socket
+operations, datagram I/O, and multicast management.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{udp-open}{\categoryprocedure}{(udp-open)}
+\formdef{udp-open}{\categoryprocedure}{(udp-open \var{host} \var{port})}
+\formdef{udp-open}{\categoryprocedure}{(udp-open \var{host} \var{port} \var{bind-flags})}
+\returns a UDP socket
+\listlibraries
+\endentryheader
+
+\scheme{udp-open} creates an asynchronous UDP socket.  When \var{host} and
+\var{port} are supplied, the socket is immediately bound to the specified
+local address.  \var{bind-flags} is an optional list that may contain
+\scheme{ipv6-only} or \scheme{reuse-address}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{udp-socket?}{\categoryprocedure}{(udp-socket? \var{obj})}
+\formdef{udp-close}{\categoryprocedure}{(udp-close \var{socket})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{udp-socket?} returns \scheme{#t} if \var{obj} is a UDP socket and
+\scheme{#f} otherwise.
+\scheme{udp-close} closes \var{socket}, waking any blocked receive
+operations, and returns an unspecified value.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{udp-bind!}{\categoryprocedure}{(udp-bind! \var{socket} \var{host} \var{port})}
+\formdef{udp-bind!}{\categoryprocedure}{(udp-bind! \var{socket} \var{host} \var{port} \var{bind-flags})}
+\formdef{udp-connect!}{\categoryprocedure}{(udp-connect! \var{socket} \var{host} \var{port})}
+\formdef{udp-disconnect!}{\categoryprocedure}{(udp-disconnect! \var{socket})}
+\returns unspecified
+\listlibraries
+\endentryheader
+
+\scheme{udp-bind!} binds \var{socket} to a local \var{host} and \var{port}.
+\scheme{udp-connect!} establishes a default remote peer address for
+\var{socket}, enabling connection-oriented two-argument send operations.
+\scheme{udp-disconnect!} clears the default remote peer.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{udp-send-operation}{\categoryprocedure}{(udp-send-operation \var{socket} \var{bytevector})}
+\formdef{udp-send-operation}{\categoryprocedure}{(udp-send-operation \var{socket} \var{bytevector} \var{host} \var{port})}
+\formdef{udp-send}{\categoryprocedure}{(udp-send \var{socket} \var{bytevector})}
+\formdef{udp-send}{\categoryprocedure}{(udp-send \var{socket} \var{bytevector} \var{host} \var{port})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{udp-send} transmits \var{bytevector} over \var{socket}.  The
+two-argument forms require a connected socket.  The four-argument forms send
+the datagram to the explicitly specified remote \var{host} and \var{port}.
+The direct procedures return the number of bytes sent as an exact integer.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{udp-receive-operation}{\categoryprocedure}{(udp-receive-operation \var{socket})}
+\formdef{udp-receive}{\categoryprocedure}{(udp-receive \var{socket})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{udp-receive} receives a datagram from \var{socket}, returning four
+values: the received payload as a \var{bytevector}, the sender's IP address
+string \var{host}, the sender's \var{port} as an exact integer, and the
+address \var{family} (\scheme{4} for IPv4 or \scheme{6} for IPv6).
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{udp-local-address}{\categoryprocedure}{(udp-local-address \var{socket})}
+\formdef{udp-peer-address}{\categoryprocedure}{(udp-peer-address \var{socket})}
+\returns three values: \var{host}, \var{port}, and \var{family}
+\listlibraries
+\endentryheader
+
+These procedures return the local bound address and the connected peer
+address of \var{socket}, respectively, as three values: \var{host},
+\var{port}, and \var{family}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{udp-membership-set!}{\categoryprocedure}{(udp-membership-set! \var{socket} \var{multicast} \var{interface} \var{source} \var{action})}
+\formdef{udp-multicast-interface-set!}{\categoryprocedure}{(udp-multicast-interface-set! \var{socket} \var{interface})}
+\formdef{udp-option-set!}{\categoryprocedure}{(udp-option-set! \var{socket} \var{option} \var{value})}
+\returns unspecified
+\listlibraries
+\endentryheader
+
+\scheme{udp-membership-set!} joins or leaves a multicast group.  \var{action}
+must be \scheme{join} or \scheme{leave}.  \var{source} is an empty string for
+standard multicast, or a specific source address for source-specific
+multicast.
+\scheme{udp-multicast-interface-set!} sets the default outbound multicast
+interface.
+\scheme{udp-option-set!} configures socket options; \var{option} must be one
+of \scheme{multicast-loop}, \scheme{multicast-ttl}, \scheme{broadcast}, or
+\scheme{ttl}.
+
+
+\section{Files and Directories\label{SECTASYNCFS}}
+
+\index{files!asynchronous}%
+\index{directories!asynchronous}%
+\index{filesystem operations}%
+The \scheme{(chezscheme async io fs)} library provides nonblocking file and
+directory I/O, metadata queries, filesystem manipulation, and temporary file
+management.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-file?}{\categoryprocedure}{(async-file? \var{obj})}
+\formdef{file-open-operation}{\categoryprocedure}{(file-open-operation \var{path} \var{flags})}
+\formdef{file-open-operation}{\categoryprocedure}{(file-open-operation \var{path} \var{flags} \var{mode})}
+\formdef{file-open}{\categoryprocedure}{(file-open \var{path} \var{flags})}
+\formdef{file-open}{\categoryprocedure}{(file-open \var{path} \var{flags} \var{mode})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{async-file?} returns \scheme{#t} if \var{obj} is an asynchronous file
+handle and \scheme{#f} otherwise.
+\scheme{file-open} opens the file at \var{path}, returning an asynchronous
+file handle.  \var{flags} must be a list containing any of \scheme{read},
+\scheme{write}, \scheme{create}, \scheme{truncate}, \scheme{append}, or
+\scheme{exclusive}.  The optional \var{mode} specifies file permissions when
+creating a new file (defaults to \scheme{#o666}).
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{file-read-operation}{\categoryprocedure}{(file-read-operation \var{file} \var{length})}
+\formdef{file-read}{\categoryprocedure}{(file-read \var{file} \var{length})}
+\formdef{file-write-operation}{\categoryprocedure}{(file-write-operation \var{file} \var{bytevector})}
+\formdef{file-write}{\categoryprocedure}{(file-write \var{file} \var{bytevector})}
+\formdef{file-close-operation}{\categoryprocedure}{(file-close-operation \var{file})}
+\formdef{file-close}{\categoryprocedure}{(file-close \var{file})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{file-read} reads up to \var{length} bytes from \var{file}, advancing
+the file position.  It returns a bytevector, or the end-of-file object if the
+end of file is reached.  \var{length} must be a positive integer.
+\scheme{file-write} writes \var{bytevector} to \var{file} and returns the
+number of bytes written as an exact integer.  Operations that manipulate a
+file's implicit offset are automatically serialized.
+\scheme{file-close} closes \var{file}, releases the underlying handle, and
+returns an unspecified value.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-file->binary-input-port}{\categoryprocedure}{(async-file->binary-input-port \var{file})}
+\formdef{async-file->binary-output-port}{\categoryprocedure}{(async-file->binary-output-port \var{file})}
+\formdef{async-file->binary-input/output-port}{\categoryprocedure}{(async-file->binary-input/output-port \var{file})}
+\returns a binary port
+\listlibraries
+\endentryheader
+
+These adapters construct binary ports backed by \var{file}, transferring
+ownership of \var{file} to the port.  Files opened without \scheme{append}
+support standard port positioning operations; append-mode files do not.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{file-stat-operation}{\categoryprocedure}{(file-stat-operation \var{path-or-file})}
+\formdef{file-stat}{\categoryprocedure}{(file-stat \var{path-or-file})}
+\formdef{file-lstat-operation}{\categoryprocedure}{(file-lstat-operation \var{path})}
+\formdef{file-lstat}{\categoryprocedure}{(file-lstat \var{path})}
+\formdef{file-system-stat-operation}{\categoryprocedure}{(file-system-stat-operation \var{path})}
+\formdef{file-system-stat}{\categoryprocedure}{(file-system-stat \var{path})}
+\returns an alist
+\listlibraries
+\endentryheader
+
+\scheme{file-stat} retrieves metadata for \var{path-or-file} (following
+symbolic links).
+\scheme{file-lstat} queries the link itself rather than the target.
+Both procedures return an alist containing the fields \scheme{dev},
+\scheme{mode}, \scheme{nlink}, \scheme{uid}, \scheme{gid}, \scheme{rdev},
+\scheme{ino}, \scheme{size}, \scheme{blksize}, \scheme{blocks}, \scheme{atime},
+\scheme{mtime}, and \scheme{ctime}.  Timestamps are represented as
+\scheme{(\var{seconds} . \var{nanoseconds})} pairs.
+\scheme{file-system-stat} queries filesystem metrics for \var{path}, returning
+an alist with \scheme{type}, \scheme{block-size}, \scheme{blocks},
+\scheme{blocks-free}, \scheme{blocks-available}, \scheme{files},
+\scheme{files-free}, and \scheme{fragment-size}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{file-delete-operation}{\categoryprocedure}{(file-delete-operation \var{path})}
+\formdef{file-delete}{\categoryprocedure}{(file-delete \var{path})}
+\formdef{file-rename-operation}{\categoryprocedure}{(file-rename-operation \var{old-path} \var{new-path})}
+\formdef{file-rename}{\categoryprocedure}{(file-rename \var{old-path} \var{new-path})}
+\formdef{file-copy-operation}{\categoryprocedure}{(file-copy-operation \var{source} \var{target})}
+\formdef{file-copy-operation}{\categoryprocedure}{(file-copy-operation \var{source} \var{target} \var{flags})}
+\formdef{file-copy}{\categoryprocedure}{(file-copy \var{source} \var{target})}
+\formdef{file-copy}{\categoryprocedure}{(file-copy \var{source} \var{target} \var{flags})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{file-delete} removes the file at \var{path}.
+\scheme{file-rename} atomically moves or renames \var{old-path} to \var{new-path}.
+\scheme{file-copy} copies \var{source} to \var{target}.  \var{flags} is an
+optional list containing any of \scheme{exclusive}, \scheme{clone}, or
+\scheme{clone-force}.  The direct procedures return an unspecified value.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{file-sync-operation}{\categoryprocedure}{(file-sync-operation \var{file})}
+\formdef{file-sync}{\categoryprocedure}{(file-sync \var{file})}
+\formdef{file-data-sync-operation}{\categoryprocedure}{(file-data-sync-operation \var{file})}
+\formdef{file-data-sync}{\categoryprocedure}{(file-data-sync \var{file})}
+\formdef{file-truncate-operation}{\categoryprocedure}{(file-truncate-operation \var{file} \var{length})}
+\formdef{file-truncate}{\categoryprocedure}{(file-truncate \var{file} \var{length})}
+\formdef{file-send-operation}{\categoryprocedure}{(file-send-operation \var{output} \var{input} \var{offset} \var{length})}
+\formdef{file-send}{\categoryprocedure}{(file-send \var{output} \var{input} \var{offset} \var{length})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{file-sync} flushes all file metadata and data to disk.
+\scheme{file-data-sync} flushes only file data to disk.
+\scheme{file-truncate} truncates \var{file} to \var{length} bytes.
+\scheme{file-send} transfers up to \var{length} bytes from \var{input} starting
+at \var{offset} to \var{output} using zero-copy OS mechanisms where available,
+returning the number of bytes transferred.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{file-access-operation}{\categoryprocedure}{(file-access-operation \var{path} \var{modes})}
+\formdef{file-access?}{\categoryprocedure}{(file-access? \var{path} \var{modes})}
+\formdef{file-mode-set-operation}{\categoryprocedure}{(file-mode-set-operation \var{path-or-file} \var{mode})}
+\formdef{file-mode-set!}{\categoryprocedure}{(file-mode-set! \var{path-or-file} \var{mode})}
+\formdef{file-times-set-operation}{\categoryprocedure}{(file-times-set-operation \var{path-or-file} \var{atime} \var{mtime})}
+\formdef{file-times-set-operation}{\categoryprocedure}{(file-times-set-operation \var{path-or-file} \var{atime} \var{mtime} \var{follow?})}
+\formdef{file-times-set!}{\categoryprocedure}{(file-times-set! \var{path-or-file} \var{atime} \var{mtime})}
+\formdef{file-times-set!}{\categoryprocedure}{(file-times-set! \var{path-or-file} \var{atime} \var{mtime} \var{follow?})}
+\formdef{file-owner-set-operation}{\categoryprocedure}{(file-owner-set-operation \var{path-or-file} \var{uid} \var{gid})}
+\formdef{file-owner-set-operation}{\categoryprocedure}{(file-owner-set-operation \var{path-or-file} \var{uid} \var{gid} \var{follow?})}
+\formdef{file-owner-set!}{\categoryprocedure}{(file-owner-set! \var{path-or-file} \var{uid} \var{gid})}
+\formdef{file-owner-set!}{\categoryprocedure}{(file-owner-set! \var{path-or-file} \var{uid} \var{gid} \var{follow?})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{file-access?} checks permissions for \var{path}; \var{modes} is a list
+containing \scheme{exists}, \scheme{read}, \scheme{write}, or \scheme{execute}.
+It returns \scheme{#t} if permissions are granted and \scheme{#f} otherwise.
+\scheme{file-mode-set!} changes file permissions to the integer \var{mode}.
+\scheme{file-times-set!} sets access and modification times (expressed in
+seconds as real numbers).  \var{follow?} defaults to \scheme{#t}.
+\scheme{file-owner-set!} sets the numeric user ID \var{uid} and group ID \var{gid}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{file-link-operation}{\categoryprocedure}{(file-link-operation \var{source} \var{target})}
+\formdef{file-link}{\categoryprocedure}{(file-link \var{source} \var{target})}
+\formdef{file-symbolic-link-operation}{\categoryprocedure}{(file-symbolic-link-operation \var{source} \var{target})}
+\formdef{file-symbolic-link-operation}{\categoryprocedure}{(file-symbolic-link-operation \var{source} \var{target} \var{flags})}
+\formdef{file-symbolic-link}{\categoryprocedure}{(file-symbolic-link \var{source} \var{target})}
+\formdef{file-symbolic-link}{\categoryprocedure}{(file-symbolic-link \var{source} \var{target} \var{flags})}
+\formdef{file-read-link-operation}{\categoryprocedure}{(file-read-link-operation \var{path})}
+\formdef{file-read-link}{\categoryprocedure}{(file-read-link \var{path})}
+\formdef{file-real-path-operation}{\categoryprocedure}{(file-real-path-operation \var{path})}
+\formdef{file-real-path}{\categoryprocedure}{(file-real-path \var{path})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{file-link} creates a hard link from \var{source} to \var{target}.
+\scheme{file-symbolic-link} creates a symbolic link; \var{flags} may contain
+\scheme{directory} or \scheme{junction} on supported platforms.
+\scheme{file-read-link} returns the destination path stored in a symbolic link as a string.
+\scheme{file-real-path} canonicalizes \var{path}, resolving all symbolic links
+and relative segments to return an absolute path string.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{directory-create-operation}{\categoryprocedure}{(directory-create-operation \var{path})}
+\formdef{directory-create-operation}{\categoryprocedure}{(directory-create-operation \var{path} \var{mode})}
+\formdef{directory-create}{\categoryprocedure}{(directory-create \var{path})}
+\formdef{directory-create}{\categoryprocedure}{(directory-create \var{path} \var{mode})}
+\formdef{directory-delete-operation}{\categoryprocedure}{(directory-delete-operation \var{path})}
+\formdef{directory-delete}{\categoryprocedure}{(directory-delete \var{path})}
+\formdef{directory-scan-operation}{\categoryprocedure}{(directory-scan-operation \var{path})}
+\formdef{directory-scan}{\categoryprocedure}{(directory-scan \var{path})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{directory-create} creates a directory at \var{path} with permissions
+\var{mode} (defaulting to \scheme{#o755}).
+\scheme{directory-delete} removes the empty directory at \var{path}.
+\scheme{directory-scan} reads all entries in the directory at \var{path},
+returning a list of \scheme{(\var{name} . \var{type})} pairs.  \var{type} is
+one of the symbols \scheme{file}, \scheme{directory}, \scheme{link},
+\scheme{fifo}, \scheme{socket}, \scheme{character-device},
+\scheme{block-device}, or \scheme{unknown}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-directory?}{\categoryprocedure}{(async-directory? \var{obj})}
+\formdef{directory-open-operation}{\categoryprocedure}{(directory-open-operation \var{path})}
+\formdef{directory-open}{\categoryprocedure}{(directory-open \var{path})}
+\formdef{directory-read-operation}{\categoryprocedure}{(directory-read-operation \var{directory})}
+\formdef{directory-read-operation}{\categoryprocedure}{(directory-read-operation \var{directory} \var{count})}
+\formdef{directory-read}{\categoryprocedure}{(directory-read \var{directory})}
+\formdef{directory-read}{\categoryprocedure}{(directory-read \var{directory} \var{count})}
+\formdef{directory-close-operation}{\categoryprocedure}{(directory-close-operation \var{directory})}
+\formdef{directory-close}{\categoryprocedure}{(directory-close \var{directory})}
+\returns see below
+\listlibraries
+\endentryheader
+
+These procedures support streaming directory iteration.
+\scheme{async-directory?} returns \scheme{#t} if \var{obj} is an asynchronous
+directory stream and \scheme{#f} otherwise.
+\scheme{directory-open} opens a directory stream.
+\scheme{directory-read} reads up to \var{count} entries (defaulting to 64),
+returning an empty list when all entries have been read.
+\scheme{directory-close} closes the directory stream.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{temporary-directory-create-operation}{\categoryprocedure}{(temporary-directory-create-operation \var{pattern})}
+\formdef{temporary-directory-create}{\categoryprocedure}{(temporary-directory-create \var{pattern})}
+\formdef{temporary-file-open-operation}{\categoryprocedure}{(temporary-file-open-operation \var{pattern})}
+\formdef{temporary-file-open}{\categoryprocedure}{(temporary-file-open \var{pattern})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\var{pattern} must be a template path string ending in six \scheme{X}
+characters (for example, \scheme{"/tmp/chez-XXXXXX"}).
+\scheme{temporary-directory-create} creates a uniquely named temporary
+directory and returns its path string.
+\scheme{temporary-file-open} creates and opens a temporary file exclusively,
+returning the open asynchronous file handle and its path string.
+
+The following example creates a temporary file, accesses it through a
+seekable binary port, and cleans up the file:
+
+\schemedisplay
+(import (chezscheme)
+        (chezscheme async)
+        (chezscheme async io fs))
+
+(run-async
+  (lambda ()
+    (let-values ([(file path)
+                  (temporary-file-open "/tmp/chez-example-XXXXXX")])
+      (let ([port (async-file->binary-input/output-port file)])
+        (put-bytevector port (string->utf8 "hello"))
+        (flush-output-port port)
+        (set-port-position! port 0)
+        (let ([text (utf8->string (get-bytevector-n port 5))])
+          (close-port port)
+          (file-delete path)
+          text))))) ;=> "hello"
+\endschemedisplay
+
+
+\section{File-Descriptor Polling\label{SECTASYNCPOLL}}
+
+\index{polling}%
+\index{file descriptor polling}%
+The \scheme{(chezscheme async io poll)} library allows asynchronous monitoring
+of native file descriptors (such as third-party sockets or device handles)
+without taking ownership of the descriptor.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{fd-poll-open}{\categoryprocedure}{(fd-poll-open \var{fd})}
+\formdef{fd-poll-handle?}{\categoryprocedure}{(fd-poll-handle? \var{obj})}
+\formdef{fd-poll-operation}{\categoryprocedure}{(fd-poll-operation \var{poll-handle} \var{events})}
+\formdef{fd-poll}{\categoryprocedure}{(fd-poll \var{poll-handle} \var{events})}
+\formdef{fd-poll-close}{\categoryprocedure}{(fd-poll-close \var{poll-handle})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\var{fd} is a native integer file descriptor or socket handle.
+\scheme{fd-poll-open} creates a poll handle.  A poll handle permits one active
+waiter at a time and does not close \var{fd} when released.
+\scheme{fd-poll-handle?} returns \scheme{#t} if \var{obj} is a poll handle and
+\scheme{#f} otherwise.
+\scheme{fd-poll} monitors \var{poll-handle} for the events in \var{events},
+which is a list containing any of \scheme{readable}, \scheme{writable},
+\scheme{disconnect}, or \scheme{prioritized}.  It returns the subset of events
+that have become active.
+\scheme{fd-poll-close} frees the poll handle and returns an unspecified value.
+
+
+\section{Processes\label{SECTASYNCPROCESS}}
+
+\index{subprocesses}%
+\index{process management}%
+The \scheme{(chezscheme async io process)} library manages nonblocking child
+subprocesses and their standard I/O streams.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{process-spawn}{\categoryprocedure}{(process-spawn \var{file} \var{arguments})}
+\formdef{process-spawn}{\categoryprocedure}{(process-spawn \var{file} \var{arguments} \var{options})}
+\returns four values: \var{process}, \var{stdin}, \var{stdout}, and \var{stderr}
+\listlibraries
+\endentryheader
+
+\var{file} is an executable path string, and \var{arguments} is a list of
+argument strings.  The optional \var{options} parameter is an alist supporting
+the following keys:
+
+\begin{description}
+\item[\scheme{cwd}] specifies the child working directory as a string.
+\item[\scheme{environment}] is an alist of string key/value environment pairs,
+  or \scheme{#f} to inherit the parent process's environment.
+\item[\scheme{flags}] is a list of process flags: \scheme{detached},
+  \scheme{windows-hide}, or \scheme{windows-verbatim-arguments}.
+\item[\scheme{stdin}, \scheme{stdout}, \scheme{stderr}] configure standard
+  streams and must be \scheme{pipe} (the default), \scheme{ignore},
+  \scheme{inherit}, or an integer file descriptor.
+\end{description}
+
+\scheme{process-spawn} returns four values: the process handle \var{process},
+and three stream objects \var{stdin}, \var{stdout}, and \var{stderr} (or
+\scheme{#f} for non-pipe descriptors).
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-process?}{\categoryprocedure}{(async-process? \var{obj})}
+\formdef{process-id}{\categoryprocedure}{(process-id \var{process})}
+\formdef{process-wait-operation}{\categoryprocedure}{(process-wait-operation \var{process})}
+\formdef{process-wait}{\categoryprocedure}{(process-wait \var{process})}
+\formdef{process-kill}{\categoryprocedure}{(process-kill \var{process} \var{signal})}
+\formdef{process-id-kill}{\categoryprocedure}{(process-id-kill \var{pid} \var{signal})}
+\formdef{process-close}{\categoryprocedure}{(process-close \var{process})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{async-process?} returns \scheme{#t} if \var{obj} is an asynchronous process
+handle and \scheme{#f} otherwise.
+\scheme{process-id} returns the operating-system PID of \var{process} as an exact integer.
+\scheme{process-wait} suspends until the child process terminates, returning
+its integer \var{exit-status} and \var{termination-signal}.
+\scheme{process-kill} and \scheme{process-id-kill} send the integer signal
+\var{signal} to \var{process} or \var{pid}.
+\scheme{process-close} closes the process handle; it does not terminate the
+child process.
+
+\schemedisplay
+(import (chezscheme)
+        (chezscheme async)
+        (chezscheme async io process)
+        (chezscheme async io stream))
+
+(run-async
+  (lambda ()
+    (let-values ([(child stdin stdout stderr)
+                  (process-spawn "/bin/sh" '("-c" "printf hello"))])
+      (stream-close stdin)
+      (let ([text (utf8->string (stream-read stdout))])
+        (let-values ([(status signal) (process-wait child)])
+          (stream-close stdout)
+          (stream-close stderr)
+          (process-close child)
+          (list text status signal)))))) ;=> ("hello" 0 0)
+\endschemedisplay
+
+
+\section{Signals\label{SECTASYNCSIGNAL}}
+
+\index{signals}%
+\index{signal handling}%
+The \scheme{(chezscheme async io signal)} library provides nonblocking operating-system
+signal watchers.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{signal-open}{\categoryprocedure}{(signal-open \var{signum})}
+\formdef{signal-watcher?}{\categoryprocedure}{(signal-watcher? \var{obj})}
+\formdef{signal-receive-operation}{\categoryprocedure}{(signal-receive-operation \var{watcher})}
+\formdef{signal-receive}{\categoryprocedure}{(signal-receive \var{watcher})}
+\formdef{signal-close}{\categoryprocedure}{(signal-close \var{watcher})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{signal-open} creates a watcher for the integer signal number
+\var{signum}.
+\scheme{signal-watcher?} returns \scheme{#t} if \var{obj} is a signal watcher
+and \scheme{#f} otherwise.
+\scheme{signal-receive} performs a one-shot wait for the next occurrence of
+the signal, returning the received signal number as an exact integer.
+\scheme{signal-close} deactivates and frees the signal watcher, returning an
+unspecified value.
+
+
+\section{Filesystem Watching\label{SECTASYNCWATCH}}
+
+\index{filesystem watching}%
+\index{file events}%
+The \scheme{(chezscheme async io watch)} library monitors filesystem trees for
+file modifications, creations, renames, and deletions using native OS event
+notifications or periodic polling.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{fs-event-open}{\categoryprocedure}{(fs-event-open \var{path})}
+\formdef{fs-event-open}{\categoryprocedure}{(fs-event-open \var{path} \var{flags})}
+\formdef{fs-event-watcher?}{\categoryprocedure}{(fs-event-watcher? \var{obj})}
+\formdef{fs-event-receive-operation}{\categoryprocedure}{(fs-event-receive-operation \var{watcher})}
+\formdef{fs-event-receive}{\categoryprocedure}{(fs-event-receive \var{watcher})}
+\formdef{fs-event-close}{\categoryprocedure}{(fs-event-close \var{watcher})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{fs-event-open} creates a watcher using native OS notifications for
+\var{path}.  \var{flags} may contain \scheme{watch-entry}, \scheme{stat}, or
+\scheme{recursive}.
+\scheme{fs-event-watcher?} returns \scheme{#t} if \var{obj} is an event watcher
+and \scheme{#f} otherwise.
+\scheme{fs-event-receive} waits for the next event, returning the affected
+filename \var{name} and a list \var{events} containing \scheme{rename} or
+\scheme{change}.
+\scheme{fs-event-close} closes the watcher and returns an unspecified value.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{fs-poll-open}{\categoryprocedure}{(fs-poll-open \var{path} \var{interval-ms})}
+\formdef{fs-poll-watcher?}{\categoryprocedure}{(fs-poll-watcher? \var{obj})}
+\formdef{fs-poll-receive-operation}{\categoryprocedure}{(fs-poll-receive-operation \var{watcher})}
+\formdef{fs-poll-receive}{\categoryprocedure}{(fs-poll-receive \var{watcher})}
+\formdef{fs-poll-close}{\categoryprocedure}{(fs-poll-close \var{watcher})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{fs-poll-open} creates a stat-based polling watcher checking \var{path}
+every \var{interval-ms} milliseconds.
+\scheme{fs-poll-watcher?} returns \scheme{#t} if \var{obj} is a poll watcher
+and \scheme{#f} otherwise.
+\scheme{fs-poll-receive} waits for an observed change, returning the previous
+and current file-stat alists (Section~\ref{SECTASYNCFS}).
+\scheme{fs-poll-close} closes the watcher and returns an unspecified value.
+
+
+\section{Terminal I/O\label{SECTASYNCTTY}}
+
+\index{terminal I/O}%
+\index{TTY}%
+The \scheme{(chezscheme async io tty)} library provides terminal stream
+manipulation, raw mode control, and window size querying.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{tty-open}{\categoryprocedure}{(tty-open \var{fd})}
+\formdef{tty-stream?}{\categoryprocedure}{(tty-stream? \var{obj})}
+\formdef{tty-mode-set!}{\categoryprocedure}{(tty-mode-set! \var{tty} \var{mode})}
+\formdef{tty-window-size}{\categoryprocedure}{(tty-window-size \var{tty})}
+\formdef{tty-virtual-terminal-state}{\categoryprocedure}{(tty-virtual-terminal-state)}
+\formdef{tty-virtual-terminal-state-set!}{\categoryprocedure}{(tty-virtual-terminal-state-set! \var{state})}
+\formdef{tty-reset-mode!}{\categoryprocedure}{(tty-reset-mode!)}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{tty-open} opens a TTY stream on the integer file descriptor \var{fd}.
+A TTY stream satisfies \scheme{async-stream?} and can be used with all stream
+I/O and port adapter procedures.
+\scheme{tty-stream?} returns \scheme{#t} if \var{obj} is a TTY stream and
+\scheme{#f} otherwise.
+\scheme{tty-mode-set!} configures the terminal mode; \var{mode} must be
+\scheme{normal}, \scheme{raw}, or \scheme{io}.
+\scheme{tty-window-size} returns the terminal dimensions in characters as two
+exact integers: \var{width} and \var{height}.
+\scheme{tty-virtual-terminal-state} queries whether virtual terminal (ANSI
+escape) processing is supported, returning \scheme{supported} or \scheme{unsupported}.
+\scheme{tty-virtual-terminal-state-set!} updates this state.
+\scheme{tty-reset-mode!} restores the terminal modes saved at process startup.
+
+
+\section{System Information and Random Data\label{SECTASYNCSYSTEM}}
+
+\index{system information}%
+\index{random bytevectors}%
+\index{loop metrics}%
+The \scheme{(chezscheme async io system)} library provides cryptographically
+secure random byte generation, high-resolution timers, hardware and operating
+system information, and event loop performance metrics.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{random-bytevector-operation}{\categoryprocedure}{(random-bytevector-operation \var{length})}
+\formdef{random-bytevector}{\categoryprocedure}{(random-bytevector \var{length})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\var{length} must be an exact nonnegative integer.
+\scheme{random-bytevector} returns a bytevector of length \var{length} filled
+with cryptographically secure random bytes generated by the operating system.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{system-high-resolution-time}{\categoryprocedure}{(system-high-resolution-time)}
+\formdef{system-uptime}{\categoryprocedure}{(system-uptime)}
+\formdef{system-load-average}{\categoryprocedure}{(system-load-average)}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{system-high-resolution-time} returns the current value of a monotonic
+clock in nanoseconds as an exact nonnegative integer.
+\scheme{system-uptime} returns the system uptime in seconds as a real number.
+\scheme{system-load-average} returns the 1-, 5-, and 15-minute system load
+averages as a list of three real numbers.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{system-memory-info}{\categoryprocedure}{(system-memory-info)}
+\formdef{system-process-info}{\categoryprocedure}{(system-process-info)}
+\formdef{system-path-info}{\categoryprocedure}{(system-path-info)}
+\formdef{system-uname}{\categoryprocedure}{(system-uname)}
+\formdef{system-cpu-info}{\categoryprocedure}{(system-cpu-info)}
+\formdef{system-interface-info}{\categoryprocedure}{(system-interface-info)}
+\formdef{system-resource-usage}{\categoryprocedure}{(system-resource-usage)}
+\returns an alist or list of alists
+\listlibraries
+\endentryheader
+
+These procedures query operating system and hardware diagnostics:
+
+\scheme{system-memory-info} returns an alist of memory statistics with byte counts
+for \scheme{total}, \scheme{free}, \scheme{constrained}, \scheme{available}, and
+\scheme{resident-set}.
+
+\scheme{system-process-info} returns an alist of process information with
+\scheme{pid}, \scheme{parent-pid}, and \scheme{available-parallelism}.
+
+\scheme{system-path-info} returns an alist of system paths containing
+\scheme{executable}, \scheme{current-directory}, \scheme{home-directory},
+\scheme{temporary-directory}, and \scheme{hostname}.
+
+\scheme{system-uname} returns an alist with \scheme{system}, \scheme{release},
+\scheme{version}, and \scheme{machine}.
+
+\scheme{system-cpu-info} returns a list of alists, one per CPU core, with
+entries for \scheme{model}, \scheme{speed}, \scheme{user}, \scheme{nice},
+\scheme{system}, \scheme{idle}, and \scheme{irq}.
+
+\scheme{system-interface-info} returns a list of alists for each network
+interface, containing \scheme{name}, \scheme{address}, \scheme{netmask},
+\scheme{family}, \scheme{internal?}, and \scheme{physical-address}.
+
+\scheme{system-resource-usage} returns an alist of process resource metrics.
+The entries \scheme{user-time} and \scheme{system-time} are pairs of
+\scheme{(\var{seconds} . \var{microseconds})}.  The remaining entries are
+\scheme{maximum-resident-set-size}, \scheme{minor-page-faults},
+\scheme{major-page-faults}, \scheme{swaps}, \scheme{input-blocks},
+\scheme{output-blocks}, \scheme{signals}, \scheme{voluntary-context-switches},
+and \scheme{involuntary-context-switches}.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-loop-metrics}{\categoryprocedure}{(async-loop-metrics)}
+\returns an alist of loop metrics
+\listlibraries
+\endentryheader
+
+\scheme{async-loop-metrics} must be called from within an active asynchronous
+scheduler.  It returns an alist of performance metrics for the calling
+scheduler's libuv loop: \scheme{now} (loop timestamp in milliseconds),
+\scheme{idle-time} (idle time in nanoseconds), \scheme{backend-timeout}
+(in milliseconds), \scheme{backend-fd}, \scheme{alive?}, \scheme{loop-count},
+\scheme{events}, and \scheme{events-waiting}.
+
+\schemedisplay
+(import (chezscheme)
+        (chezscheme async)
+        (chezscheme async io system))
+
+(run-async
+  (lambda ()
+    (let ([token (random-bytevector 32)]
+          [metrics (async-loop-metrics)])
+      (list (bytevector-length token)
+            (cdr (assq 'loop-count metrics)))))) ;=> (32 loop-count)
+\endschemedisplay

@@ -78,8 +78,13 @@
 \xdef\answer#1{\raw{\answer}{#1}{\anslab}}
 
 \schemeinit
-(module (list-libraries)
+(module (list-libraries record-libraries)
   (define libht (make-eq-hashtable))
+  (define (record-libraries)
+    (when (null? names) (errorf 'record-libraries "name list is empty"))
+    (with-output-to-file "libslisted"
+      (lambda () (for-each (lambda (x) (printf "~a\n" x)) names))
+      'append))
   (define (list-libraries)
     (define (getlibs x)
       (or (hashtable-ref libht (string->symbol x) #f)
@@ -91,9 +96,7 @@
           (unless (equal? (getlibs name) libs)
             (errorf 'list-libraries "libs ~s for ~a don't match libs ~s for ~a" libs (car names) (getlibs name) name)))
         (cdr names))
-      (with-output-to-file "libslisted"
-        (lambda () (for-each (lambda (x) (printf "~a\n" x)) names))
-        'append)
+      (record-libraries)
       (let f ([libs libs] [sep " "])
         (unless (null? libs)
           (printf "~a\\scheme{~a}" sep (car libs))
@@ -127,5 +130,9 @@
 }
 \xdef\nolistlibraries{\generated
 (set! names '())(set! listlibraries-seen? true)
+\endgenerated
+}
+\xdef\manuallibraries{\generated
+(record-libraries)(set! names '())(set! listlibraries-seen? true)
 \endgenerated
 }

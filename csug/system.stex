@@ -398,11 +398,16 @@ with this tag is installed at the root of each thread's continuation.
 %----------------------------------------------------------------------------
 \entryheader
 \formdef{reset}{\categorysyntax}{(reset \var{body_1} \var{body_2} \dots)}
+\libraries \scheme{(chezscheme control)}
+\manuallibraries
+\endentryheader
+
+%----------------------------------------------------------------------------
+\entryheader
 \formdef{reset-at}{\categorysyntax}{(reset-at \var{tag} \var{body_1} \var{body_2} \dots)}
 \formdef{reset0}{\categorysyntax}{(reset0 \var{body_1} \var{body_2} \dots)}
 \formdef{reset0-at}{\categorysyntax}{(reset0-at \var{tag} \var{body_1} \var{body_2} \dots)}
-\libraries \scheme{(chezscheme control)}
-\nolistlibraries
+\listlibraries
 \endentryheader
 
 Each form evaluates its body in sequence within a continuation prompt and

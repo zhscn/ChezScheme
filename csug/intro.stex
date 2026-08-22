@@ -74,6 +74,10 @@ Chapter~\ref{CHPTEXPEDITOR} describes {\ChezScheme}'s expression
 editor and how it can be customized.
 Chapter~\ref{CHPTTHREADS} documents the procedures and syntactic forms
 that comprise the interface to {\ChezScheme}'s native thread system.
+Chapter~\ref{CHPTASYNC} documents {\ChezScheme}'s asynchronous
+programming subsystem, covering lightweight cooperative tasks,
+cancellation contexts, composable operations, channels, and nonblocking
+I/O.
 Finally, Chapter~\ref{CHPTCOMPAT} describes various compatibility features.
 
 The back of this book contains a bibliography, 
