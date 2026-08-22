@@ -117,6 +117,10 @@
   $make-async-cancellation-condition $async-cancellation-condition?
   (reason $async-cancellation-reason))
 
+(define-condition-type &async-channel-closed &condition
+  $make-channel-closed-condition $channel-closed-condition?
+  (reason $channel-closed-reason))
+
 
 ;;; -------------------------------------------- scheduler-owned storage
 ;;;
@@ -132,6 +136,12 @@
 ;;; nested run-async from attempting to nest engines.
 (define $async-engine-active
   ($make-thread-parameter #f (lambda (x) x)))
+
+;;; A dynamically scoped context override is part of the fiber's saved thread
+;;; parameter state.  Tasks still retain their own immutable context so task
+;;; cancellation never cancels a caller-supplied shared context.
+(define $async-context-override
+  (make-thread-parameter #f))
 
 ;;; -------------------------------------------------------- sync states
 ;;;
@@ -277,8 +287,28 @@
   (sealed #t)
   (fields (immutable deadline) (immutable deliver-box)))
 
+(define-record-type (async-context make-async-context% $async-context?)
+  (nongenerative)
+  (sealed #t)
+  (fields
+    (immutable parent)
+    (immutable mutex)
+    (mutable canceled? async-context-canceled?/raw
+             async-context-canceled?/raw-set!)
+    (mutable reason async-context-reason/raw async-context-reason/raw-set!)
+    (mutable children)
+    (mutable waiters)                ; list of (ss . deliver)
+    (mutable deadline-cancel)))
+
+(define-record-type (async-context-cancel-result
+                      make-async-context-cancel-result
+                      async-context-cancel-result?)
+  (nongenerative)
+  (sealed #t)
+  (fields (immutable context)))
+
 (define-record-type (async-task make-async-task $async-task?)
-  (nongenerative async-task-layer6)
+  (nongenerative async-task-layer7)
   (sealed #t)
   (fields
     (immutable id)
@@ -296,6 +326,7 @@
     (mutable dynamic-state)         ; saved async-dynamic-state
     (mutable exception-state)       ; exception-state record
     (mutable parent-group)          ; group this task belongs to
+    (immutable context)             ; task-owned cancellation context
     (mutable child-group)           ; group owned by this task, or #f
     (mutable result-values)
     (mutable failure-condition)     ; failure or cancellation condition
@@ -319,6 +350,7 @@
     (mutable waiters)               ; list of (ss . deliver)
     (mutable unobserved)            ; unobserved child failure conditions
     (mutable parent)                ; parent group or #f
+    (immutable context)
     (immutable mutex)))
 
 (define-record-type (operation make-async-operation $async-operation?)
@@ -348,7 +380,9 @@
     (mutable bstart)
     (mutable bcount)
     (mutable puts)                  ; list of (value ss . deliver)
-    (mutable gets)))                ; list of (ss . deliver)
+    (mutable gets)                  ; list of (ss . deliver)
+    (mutable closed?)
+    (mutable close-reason)))
 
 
 
@@ -401,6 +435,142 @@
           (if (box-cas! config-box config config)
               config
               (loop)))))))
+
+;;; ------------------------------------------------ cancellation contexts
+
+(define async-current-context
+  (lambda ()
+    (or ($async-context-override)
+        (let ([sched ($async-scheduler)])
+          (and ($async-scheduler? sched)
+               (let ([task (async-scheduler-current-task sched)])
+                 (and task (async-task-context task))))))))
+
+(define async-context-canceled?/locked
+  (lambda (context)
+    (async-context-canceled?/raw context)))
+
+(define async-cancel-timer!
+  (lambda (timer)
+    (when timer
+      (let* ([deliver-box (async-timer-deliver-box timer)]
+             [deliver (unbox deliver-box)])
+        (when deliver (box-cas! deliver-box deliver #f))))))
+
+(define async-context-detach!
+  (lambda (context)
+    (let ([parent (async-context-parent context)])
+      (when parent
+        (with-async-mutex (async-context-mutex parent)
+          (async-context-children-set! parent
+            (remq context (async-context-children parent))))))))
+
+(define async-context-cancel-core!
+  (lambda (context reason)
+    (let-values ([(won? children waiters cancel-timer)
+                  (with-async-mutex (async-context-mutex context)
+                    (if (async-context-canceled?/locked context)
+                        (values #f '() '() #f)
+                        (let ([children (async-context-children context)]
+                              [waiters (async-context-waiters context)]
+                              [cancel-timer
+                               (async-context-deadline-cancel context)])
+                          (async-context-canceled?/raw-set! context #t)
+                          (async-context-reason/raw-set! context reason)
+                          (async-context-children-set! context '())
+                          (async-context-waiters-set! context '())
+                          (async-context-deadline-cancel-set! context #f)
+                          (values #t children waiters cancel-timer))))])
+      (when won?
+        (async-context-detach! context)
+        (when cancel-timer (cancel-timer))
+        (for-each
+          (lambda (waiter) ((cdr waiter) (cons 'values '())))
+          waiters)
+        (for-each
+          (lambda (child) (async-context-cancel-core! child reason))
+          children))
+      won?)))
+
+(define async-make-context
+  (lambda (parent)
+    (let ([context
+           (make-async-context% parent (make-async-mutex)
+             #f #f '() '() #f)])
+      (when parent
+        (let-values ([(canceled? reason)
+                      (with-async-mutex (async-context-mutex parent)
+                        (if (async-context-canceled?/locked parent)
+                            (values #t (async-context-reason/raw parent))
+                            (begin
+                              (async-context-children-set! parent
+                                (cons context
+                                  (async-context-children parent)))
+                              (values #f #f))))])
+          (when canceled?
+            (async-context-cancel-core! context reason))))
+      context)))
+
+(define async-context-operation
+  (lambda (context)
+    (make-async-operation
+      (lambda (ss)
+        (with-async-mutex (async-context-mutex context)
+          (and (async-context-canceled?/locked context)
+               (cons 'values '()))))
+      (lambda (ss deliver)
+        (let ([ready?
+               (with-async-mutex (async-context-mutex context)
+                 (if (async-context-canceled?/locked context)
+                     #t
+                     (begin
+                       (async-context-waiters-set! context
+                         (cons (cons ss deliver)
+                           (async-context-waiters context)))
+                       #f)))])
+          (if ready?
+              (begin (deliver (cons 'values '())) #f)
+              (list 'context context))))
+      (lambda (vals) vals)
+      (lambda (ss)
+        (with-async-mutex (async-context-mutex context)
+          (async-context-waiters-set! context
+            (let loop ([waiters (async-context-waiters context)])
+              (cond
+                [(null? waiters) '()]
+                [(eq? (caar waiters) ss) (cdr waiters)]
+                [else (cons (car waiters) (loop (cdr waiters)))]))))))))
+
+(define async-context-choice
+  (lambda (context op)
+    (choice-operation op
+      (wrap-operation (async-context-operation context)
+        (lambda () (make-async-context-cancel-result context))))))
+
+(define async-context-cancellation-condition
+  (lambda (context)
+    (make-async-cancellation-condition (async-context-reason/raw context))))
+
+(define async-install-context-deadline!
+  (lambda (who context deadline-us)
+    (let ([sched ($async-scheduler)])
+      (unless (and ($async-scheduler? sched)
+                   (async-scheduler-current-task sched))
+        ($oops who "deadline context creation outside of an async task"))
+      (let* ([timer
+              (async-schedule-timer! sched deadline-us
+                (lambda (payload)
+                  (async-context-cancel-core! context 'deadline-exceeded)))]
+             [cancel (lambda () (async-cancel-timer! timer))]
+             [already-canceled?
+              (with-async-mutex (async-context-mutex context)
+                (if (async-context-canceled?/locked context)
+                    #t
+                    (begin
+                      (async-context-deadline-cancel-set! context cancel)
+                      #f)))])
+        (when already-canceled? (cancel)))
+      context)))
 
 (define async-apply-parameter-config
   (lambda (state config)
@@ -486,12 +656,14 @@
     (memq (async-task-state task) '(completed failed canceled))))
 
 (define task-cancel-requested?
-  (lambda (task) (and (async-task-cancel-state task) #t)))
+  (lambda (task)
+    (or (and (async-task-cancel-state task) #t)
+        (async-context-canceled?/raw (async-task-context task)))))
 
 (define task-cancellation-condition
   (lambda (task)
     (or (async-task-cancel-condition task)
-        (make-async-cancellation-condition #f))))
+        (async-context-cancellation-condition (async-task-context task)))))
 
 ;;; Cancellation points raise whenever cancellation is in effect, unless the
 ;;; current wait is shielded (internal group draining).
@@ -939,11 +1111,13 @@
 ;;; ------------------------------------------------------------- task groups
 
 (define make-async-group
-  (lambda (parent)
-    (make-async-task-group% '() '() '() '() parent (make-async-mutex))))
+  (lambda (parent context)
+    (make-async-task-group% '() '() '() '() parent context
+      (make-async-mutex))))
 
 (define group-cancel-children!
   (lambda (grp reason)
+    (async-context-cancel-core! (async-task-group-context grp) reason)
     (with-async-mutex (async-task-group-mutex grp)
       (for-each
         (lambda (t) (task-cancel! t reason))
@@ -1043,6 +1217,19 @@
         (apply values ((operation-wrap op) (cdr payload)))
         (raise (cdr payload)))))
 
+(define async-deliver-operation-result
+  (lambda (op payload)
+    (call-with-values
+      (lambda () (async-deliver-operation-payload op payload))
+      (lambda vals
+        (if (and (pair? vals)
+                 (null? (cdr vals))
+                 (async-context-cancel-result? (car vals)))
+            (raise
+              (async-context-cancellation-condition
+                (async-context-cancel-result-context (car vals))))
+            (apply values vals))))))
+
 ;;; --------------------------------------------------------------- operations
 
 
@@ -1117,6 +1304,17 @@
     (async-channel-puts-set! ch
       (filter (lambda (w) (not (async-waiter-dead? (cadr w)))) (async-channel-puts ch)))))
 
+(define async-channel-closed-condition
+  (lambda (ch)
+    ($make-channel-closed-condition (async-channel-close-reason ch))))
+
+(define async-channel-put-closed-payload
+  (lambda (ch)
+    (cons 'raise (async-channel-closed-condition ch))))
+
+(define async-channel-receive-closed-payload
+  (lambda () (cons 'values '(#f #f))))
+
 ;;; Deliver value to the first live getter; returns #t on rendezvous.
 (define async-channel-deliver-to-getter!
   (lambda (ch v)
@@ -1124,7 +1322,7 @@
       (cond
         [(null? gs) (async-channel-gets-set! ch '()) #f]
         [(async-waiter-dead? (caar gs)) (loop (cdr gs))]
-        [((cdar gs) (cons 'values (list v)))
+        [((cdar gs) (cons 'values (list v #t)))
          (async-channel-gets-set! ch (cdr gs))
          #t]
         [else (loop (cdr gs))]))))
@@ -1168,7 +1366,7 @@
 ;;; ------------------------------------------------------------------- tasks
 
 (define async-make-task
-  (lambda (sched name parent-group migratable? entry)
+  (lambda (sched name parent-group parent-context migratable? entry)
     (let* ([group ($async-scheduler-group sched)]
            [id (with-async-mutex (async-scheduler-group-mutex group)
                  (let ([id (async-scheduler-group-next-task-id group)])
@@ -1178,12 +1376,14 @@
         (async-snapshot-dynamic-state
           (async-scheduler-active-dynamic-version sched))
         (current-exception-state)
-        parent-group #f '() #f '() #f #f #f #f #f #f #f #f (make-async-mutex)))))
+        parent-group (async-make-context parent-context) #f '() #f '() #f #f
+        #f #f #f #f #f #f (make-async-mutex)))))
 
 (define ensure-child-group
   (lambda (task)
     (or (async-task-child-group task)
-        (let ([grp (make-async-group (async-task-parent-group task))])
+        (let ([grp (make-async-group (async-task-parent-group task)
+                     (async-task-context task))])
           (async-task-child-group-set! task grp)
           grp))))
 
@@ -1206,7 +1406,7 @@
 (define drain-task-group
   (lambda (sched grp outcome)
     (when (eq? (car outcome) 'failed)
-      (group-cancel-children! grp #f))
+      (group-cancel-children! grp (cdr outcome)))
     (let ([task (async-scheduler-current-task sched)])
       (async-task-cancel-shield?-set! task #t)
       (let loop ()
@@ -1254,6 +1454,10 @@
                 [(completed) (cons 'values (cdr outcome))]
                 [else (cons 'raise (cdr outcome))])])
         (for-each (lambda (w) ((cdr w) join-payload)) join-waiters))
+      (async-context-cancel-core! (async-task-context task)
+        (case state
+          [(completed) 'task-completed]
+          [else (cdr outcome)]))
       (when (async-task-parent-group task)
         (group-child-terminated! (async-task-parent-group task) task))
       (let ([group ($async-scheduler-group sched)])
@@ -1550,8 +1754,7 @@
                      (terminate-task! sched task 'completed outcome)
                      #f]
                     [(and (pair? outcome) (eq? (car outcome) 'failed))
-                     (if (and (task-cancel-requested? task)
-                              ($async-cancellation-condition? (cdr outcome)))
+                     (if ($async-cancellation-condition? (cdr outcome))
                          (terminate-task! sched task 'canceled outcome)
                          (terminate-task! sched task 'failed outcome))
                      #f]
@@ -1655,12 +1858,129 @@
     [() ($make-async-cancellation-condition #f)]
     [(reason) ($make-async-cancellation-condition reason)]))
 
+(set! channel-closed-condition? $channel-closed-condition?)
+
+(set! channel-closed-reason $channel-closed-reason)
+
+(set! make-channel-closed-condition
+  (case-lambda
+    [() ($make-channel-closed-condition #f)]
+    [(reason) ($make-channel-closed-condition reason)]))
+
+(set! async-context? $async-context?)
+
+(set-who! make-async-context
+  (case-lambda
+    [() (async-make-context (async-current-context))]
+    [(parent)
+     (unless (or (not parent) (async-context? parent))
+       ($oops who "~s is not an async context or #f" parent))
+     (async-make-context parent)]))
+
+(set-who! async-context-cancel!
+  (case-lambda
+    [(context) (async-context-cancel! context #f)]
+    [(context reason)
+     (unless (async-context? context)
+       ($oops who "~s is not an async context" context))
+     (async-context-cancel-core! context reason)
+     (void)]))
+
+(set-who! async-context-canceled?
+  (lambda (context)
+    (unless (async-context? context)
+      ($oops who "~s is not an async context" context))
+    (with-async-mutex (async-context-mutex context)
+      (async-context-canceled?/raw context))))
+
+(set-who! async-context-reason
+  (lambda (context)
+    (unless (async-context? context)
+      ($oops who "~s is not an async context" context))
+    (with-async-mutex (async-context-mutex context)
+      (async-context-reason/raw context))))
+
+(set-who! async-context-done-operation
+  (lambda (context)
+    (unless (async-context? context)
+      ($oops who "~s is not an async context" context))
+    (async-context-operation context)))
+
+(set-who! async-context-with-timeout
+  (lambda (parent seconds)
+    (unless (async-context? parent)
+      ($oops who "~s is not an async context" parent))
+    (unless (async-valid-seconds? seconds)
+      ($oops who "~s is not a nonnegative real number" seconds))
+    (let ([sched ($async-scheduler)])
+      (unless (and ($async-scheduler? sched)
+                   (async-scheduler-current-task sched))
+        ($oops who "timeout context creation outside of an async task"))
+      (async-install-context-deadline! who (async-make-context parent)
+        (+ (sched-now sched) (async-seconds->us seconds))))))
+
+(set-who! async-context-with-deadline
+  (lambda (parent deadline)
+    (unless (async-context? parent)
+      ($oops who "~s is not an async context" parent))
+    (unless (and (time? deadline)
+                 (eq? (time-type deadline) 'time-monotonic))
+      ($oops who "~s is not a monotonic time" deadline))
+    (let ([sched ($async-scheduler)])
+      (unless (and ($async-scheduler? sched)
+                   (async-scheduler-current-task sched))
+        ($oops who "deadline context creation outside of an async task"))
+      (when (async-scheduler-virtual? sched)
+        ($oops who "absolute deadlines require a real scheduler clock"))
+      (async-install-context-deadline! who (async-make-context parent)
+        (+ (* (time-second deadline) 1000000)
+           (quotient (time-nanosecond deadline) 1000))))))
+
+(set-who! current-async-context
+  (lambda () (async-current-context)))
+
+(set-who! call-with-async-context
+  (lambda (context thunk)
+    (unless (async-context? context)
+      ($oops who "~s is not an async context" context))
+    (unless (procedure? thunk) ($oops who "~s is not a procedure" thunk))
+    (let ([previous ($async-context-override)])
+      (async-dynamic-wind
+        (lambda () ($async-context-override context))
+        thunk
+        (lambda () ($async-context-override previous))))))
+
+(set-who! call-with-async-timeout
+  (lambda (seconds thunk)
+    (unless (procedure? thunk) ($oops who "~s is not a procedure" thunk))
+    (let ([parent (async-current-context)])
+      (unless parent
+        ($oops who "call outside of an async task"))
+      (let ([context (async-context-with-timeout parent seconds)])
+        (async-dynamic-wind
+          (lambda () (void))
+          (lambda () (call-with-async-context context thunk))
+          (lambda ()
+            (async-context-cancel-core! context 'scope-exited)))))))
+
+(set-who! perform-operation/context
+  (lambda (context op)
+    (unless (async-context? context)
+      ($oops who "~s is not an async context" context))
+    (unless (operation? op) ($oops who "~s is not an operation" op))
+    (perform-operation (async-context-choice context op))))
+
 (record-writer (type-descriptor async-task)
   (lambda (r p wr)
     (fprintf p "#<task ~a~a ~a>"
       (task-id r)
       (if (task-name r) (format " ~s" (task-name r)) "")
       (task-state r))))
+
+(record-writer (type-descriptor async-context)
+  (lambda (r p wr)
+    (fprintf p "#<async-context ~a>"
+      (if (async-context-canceled?/raw r) 'canceled 'active))))
 
 (record-writer (type-descriptor async-scheduler)
   (lambda (r p wr)
@@ -1671,7 +1991,9 @@
 
 (record-writer (type-descriptor async-channel)
   (lambda (r p wr)
-    (fprintf p "#<channel capacity=~a>" (async-channel-capacity r))))
+    (fprintf p "#<channel capacity=~a~a>"
+      (async-channel-capacity r)
+      (if (async-channel-closed? r) " closed" ""))))
 
 (record-writer (type-descriptor async-future)
   (lambda (r p wr)
@@ -1710,9 +2032,14 @@
     (unless (task? task) ($oops 'task-scheduler "~s is not a task" task))
     (async-task-scheduler task)))
 
+(set! task-context
+  (lambda (task)
+    (unless (task? task) ($oops 'task-context "~s is not a task" task))
+    (async-task-context task)))
+
 (set-who! make-task-group
   (lambda ()
-    (make-async-group #f)))
+    (make-async-group #f (async-make-context (async-current-context)))))
 
 (set-who! task-group-wait
   (lambda (grp)
@@ -1858,11 +2185,14 @@
         (unless task
           ($oops who "perform-operation outside of an async task"))
         (async-check-cancellation! task)
-        (let ([ss (make-async-sync-state)])
+        (let* ([context (and (not (async-task-cancel-shield? task))
+                             (async-current-context))]
+               [op (if context (async-context-choice context op) op)]
+               [ss (make-async-sync-state)])
           (let ([r ((operation-try op) ss)])
             (if r
-                (async-deliver-operation-payload op r)
-                (async-deliver-operation-payload op
+                (async-deliver-operation-result op r)
+                (async-deliver-operation-result op
                   ($async-suspend sched task ss
                     (lambda (ss*)
                       (let ([nack (lambda () ((operation-nack op) ss))])
@@ -1949,12 +2279,49 @@
 
 (set-who! make-channel
   (case-lambda
-    [() (make-async-channel% 0 (make-async-mutex) #f 0 0 '() '())]
+    [() (make-async-channel% 0 (make-async-mutex) #f 0 0 '() '() #f #f)]
     [(capacity)
      (unless (and (fixnum? capacity) (fx>= capacity 0))
        ($oops who "~s is not a nonnegative fixnum" capacity))
      (make-async-channel% capacity (make-async-mutex)
-       (and (fx> capacity 0) (make-vector capacity)) 0 0 '() '())]))
+       (and (fx> capacity 0) (make-vector capacity)) 0 0 '() '() #f #f)]))
+
+(set-who! channel-close!
+  (case-lambda
+    [(ch) (channel-close! ch #f)]
+    [(ch reason)
+     (unless (channel? ch) ($oops who "~s is not a channel" ch))
+     (let-values ([(puts gets)
+                   (with-async-mutex (async-channel-mutex ch)
+                     (if (async-channel-closed? ch)
+                         (values '() '())
+                         (begin
+                           (async-channel-closed?-set! ch #t)
+                           (async-channel-close-reason-set! ch reason)
+                           (async-channel-prune! ch)
+                           (async-invariant
+                             (or (fx= (async-channel-bcount ch) 0)
+                                 (null? (async-channel-gets ch)))
+                             "buffered channel has a live receiver at close"
+                             ch)
+                           (let ([puts (async-channel-puts ch)]
+                                 [gets (if (fx= (async-channel-bcount ch) 0)
+                                           (async-channel-gets ch)
+                                           '())])
+                             (async-channel-puts-set! ch '())
+                             (async-channel-gets-set! ch '())
+                             (values puts gets)))))])
+       (let ([payload (async-channel-put-closed-payload ch)])
+         (for-each (lambda (p) ((caddr p) payload)) puts))
+       (let ([payload (async-channel-receive-closed-payload)])
+         (for-each (lambda (g) ((cdr g) payload)) gets)))
+     (void)]))
+
+(set-who! channel-closed?
+  (lambda (ch)
+    (unless (channel? ch) ($oops who "~s is not a channel" ch))
+    (with-async-mutex (async-channel-mutex ch)
+      (async-channel-closed? ch))))
 
 (set-who! channel-put-operation
   (lambda (ch v)
@@ -1963,16 +2330,20 @@
       (lambda (ss)
         (with-async-mutex (async-channel-mutex ch)
           (async-channel-prune! ch)
-          (if (async-channel-deliver-to-getter! ch v)
+          (if (async-channel-closed? ch)
+              (async-channel-put-closed-payload ch)
+              (if (async-channel-deliver-to-getter! ch v)
               (cons 'values '())
               (if (and (fx> (async-channel-capacity ch) 0)
                        (fx< (async-channel-bcount ch) (async-channel-capacity ch)))
                   (begin (async-buffer-push! ch v) (cons 'values '()))
-                  #f))))
+                  #f)))))
       (lambda (ss deliver)
         (with-async-mutex (async-channel-mutex ch)
           (async-channel-prune! ch)
-          (if (async-channel-deliver-to-getter! ch v)
+          (if (async-channel-closed? ch)
+              (begin (deliver (async-channel-put-closed-payload ch)) #f)
+              (if (async-channel-deliver-to-getter! ch v)
               (begin (deliver (cons 'values '())) #f)
               (if (and (fx> (async-channel-capacity ch) 0)
                        (fx< (async-channel-bcount ch) (async-channel-capacity ch)))
@@ -1983,7 +2354,7 @@
                   (begin
                     (async-channel-puts-set! ch
                       (append (async-channel-puts ch) (list (list v ss deliver))))
-                    (list 'channel-put ch))))))
+                    (list 'channel-put ch)))))))
       (lambda (vals) vals)
       (lambda (ss)
         (with-async-mutex (async-channel-mutex ch)
@@ -1991,7 +2362,7 @@
             (filter (lambda (p) (not (eq? (cadr p) ss)))
               (async-channel-puts ch))))))))
 
-(set-who! channel-get-operation
+(set-who! channel-receive-operation
   (lambda (ch)
     (unless (channel? ch) ($oops who "~s is not a channel" ch))
     (make-async-operation
@@ -2008,7 +2379,7 @@
                    (if (deliver (cons 'values '()))
                        (begin (async-buffer-push! ch pv) #t)
                        #f)))
-               (cons 'values (list v)))]
+               (cons 'values (list v #t)))]
             [else
              (let ([got (box #f)])
                (if (async-channel-take-from-putter! ch
@@ -2016,8 +2387,9 @@
                        (if (deliver (cons 'values '()))
                            (begin (set-box! got pv) #t)
                            #f)))
-                   (cons 'values (list (unbox got)))
-                   #f))])))
+                   (cons 'values (list (unbox got) #t))
+                   (and (async-channel-closed? ch)
+                        (async-channel-receive-closed-payload))))])))
       (lambda (ss deliver)
         (with-async-mutex (async-channel-mutex ch)
           (async-channel-prune! ch)
@@ -2031,25 +2403,37 @@
                      (if (pdeliver (cons 'values '()))
                          (begin (async-buffer-push! ch pv) #t)
                          #f)))
-                 (deliver (cons 'values (list v)))
+                 (deliver (cons 'values (list v #t)))
                  #f)]
               [(async-channel-take-from-putter! ch
                  (lambda (pv pdeliver)
                    (if (pdeliver (cons 'values '()))
                        (begin (set-box! got pv) #t)
                        #f)))
-               (deliver (cons 'values (list (unbox got))))
+               (deliver (cons 'values (list (unbox got) #t)))
+               #f]
+              [(async-channel-closed? ch)
+               (deliver (async-channel-receive-closed-payload))
                #f]
               [else
                (async-channel-gets-set! ch
                  (append (async-channel-gets ch) (list (cons ss deliver))))
-               (list 'channel-get ch)]))))
+               (list 'channel-receive ch)]))))
       (lambda (vals) vals)
       (lambda (ss)
         (with-async-mutex (async-channel-mutex ch)
           (async-channel-gets-set! ch
             (filter (lambda (g) (not (eq? (car g) ss)))
               (async-channel-gets ch))))))))
+
+(set-who! channel-get-operation
+  (lambda (ch)
+    (unless (channel? ch) ($oops who "~s is not a channel" ch))
+    (wrap-operation (channel-receive-operation ch)
+      (lambda (v open?)
+        (if open?
+            v
+            (raise (async-channel-closed-condition ch)))))))
 
 (set-who! channel-put
   (lambda (ch v)
@@ -2060,10 +2444,14 @@
   (lambda (ch)
     (perform-operation (channel-get-operation ch))))
 
+(set-who! channel-receive
+  (lambda (ch)
+    (perform-operation (channel-receive-operation ch))))
+
 (set-who! spawn-task
   (lambda (thunk . options)
     (unless (procedure? thunk) ($oops who "~s is not a procedure" thunk))
-    (let ([name #f] [group #f] [migratable? #f])
+    (let ([name #f] [group #f] [context #f] [migratable? #f])
       (let loop ([opts options])
         (unless (null? opts)
           (unless (and (pair? (cdr opts)))
@@ -2074,6 +2462,10 @@
               [(eq? k 'group)
                (unless (task-group? v) ($oops who "~s is not a task group" v))
                (set! group v)]
+              [(eq? k 'context)
+               (unless (async-context? v)
+                 ($oops who "~s is not an async context" v))
+               (set! context v)]
               [(eq? k 'migratable?) (set! migratable? (and v #t))]
               [else ($oops who "unrecognized spawn option ~s" k)]))
           (loop (cddr opts))))
@@ -2086,7 +2478,12 @@
           (unless (or group parent)
             ($oops who "spawn-task requires a current task or an explicit group"))
           (let* ([grp (or group (ensure-child-group parent))]
-                 [task (async-make-task sched name grp migratable?
+                 [parent-context
+                  (or context
+                      (and group (async-task-group-context group))
+                      (async-current-context)
+                      (async-task-context parent))]
+                 [task (async-make-task sched name grp parent-context migratable?
                          (lambda () (run-task-entry thunk)))])
             (when (and group parent)
               ;; propagate cancellation toward explicitly grouped tasks
@@ -2127,7 +2524,7 @@
      (let-values ([(child-group cancel-wait?)
                    (with-async-mutex (async-task-mutex task)
                      (if (or (task-terminal? task)
-                             (async-task-cancel-state task))
+                             (task-cancel-requested? task))
                          (values #f #f)
                          (begin
                            (async-task-cancel-state-set! task 'requested)
@@ -2137,6 +2534,7 @@
                              (async-task-child-group task)
                              (and (eq? (async-task-state task) 'waiting)
                                   (not (async-task-cancel-shield? task)))))))])
+       (async-context-cancel-core! (async-task-context task) reason)
        (when child-group
          (group-cancel-children! child-group reason))
        (when cancel-wait?
@@ -2216,9 +2614,10 @@
               (eq? clock 'virtual) group i preemption-ticks)))
         (async-scheduler-group-schedulers-set! group schedulers)
         (let* ([sched (vector-ref schedulers 0)]
-               [root-group (make-async-group #f)]
-               [root (async-make-task sched #f #f #f
-                       (lambda () (run-task-entry thunk)))])
+               [root (async-make-task sched #f #f #f #f
+                       (lambda () (run-task-entry thunk)))]
+               [root-group
+                (make-async-group #f (async-task-context root))])
         (async-scheduler-group-root-task-set! group root)
         (async-task-child-group-set! root root-group)
         (sched-registry-add! sched root)

@@ -11,9 +11,11 @@
 (import (chezscheme async io tty))
 (import (chezscheme async io udp))
 (import (chezscheme async io fs))
+(import (chezscheme async context))
 
 (mat asyncio-libraries
   (and (procedure? async-io-condition?)
+       (procedure? async-context-cancel!)
        (procedure? tcp-connect)
        (procedure? dns-lookup)
        (procedure? random-bytevector)

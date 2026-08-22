@@ -14,6 +14,7 @@
 
 (import (chezscheme async))
 (import (chezscheme async operations))
+(import (chezscheme async context))
 (import (chezscheme async io errors))
 (import (chezscheme async io stream))
 (import (chezscheme async io dns))
@@ -278,7 +279,7 @@
 
   ;; Streaming directory handles read bounded batches and close explicitly.
   (let ([path (asyncio-temp-path "directory-handle")])
-    (when (file-exists? path) (rmdir path))
+    (when (file-exists? path) (delete-directory path))
     (run-async
       (lambda ()
         (directory-create path)
@@ -327,7 +328,9 @@
   ;; reverse DNS, random data, system information, and loop metrics.
   (run-async
     (lambda ()
-      (let-values ([(host service) (dns-reverse "127.0.0.1" 80 '(numeric))])
+      (let-values ([(host service)
+                    (dns-reverse "127.0.0.1" 80
+                      '(numeric-host numeric-service))])
         (let ([memory (system-memory-info)]
               [process (system-process-info)]
               [paths (system-path-info)]
@@ -340,14 +343,14 @@
                (positive? (system-high-resolution-time))
                (real? (system-uptime))
                (= (length (system-load-average)) 3)
-               (assq 'total memory)
-               (assq 'pid process)
-               (assq 'hostname paths)
-               (assq 'system uname)
+               (pair? (assq 'total memory))
+               (pair? (assq 'pid process))
+               (pair? (assq 'hostname paths))
+               (pair? (assq 'system uname))
                (pair? (system-cpu-info))
                (list? (system-interface-info))
-               (assq 'user-time usage)
-               (assq 'loop-count metrics))))))
+               (pair? (assq 'user-time usage))
+               (pair? (assq 'loop-count metrics)))))))
 
   ;; child stdio pipes use the ordinary stream protocol.
   (run-async
@@ -403,8 +406,9 @@
                    (fs-event-close event)
                    (file-delete changed)
                    (and (string? name)
-                        (or (memq 'rename events) (memq 'change events)))))))])
-      (rmdir path)
+                        (or (memq 'rename events) (memq 'change events))
+                        #t)))))])
+      (delete-directory path)
       result))
 
   (let ([path (asyncio-temp-path "fs-poll")])
@@ -448,8 +452,12 @@
       result))
 
   ;; TTY entry points validate descriptors even without a controlling TTY.
-  (and (error? (run-async (lambda () (tty-open -1))))
-       (memq (tty-virtual-terminal-state) '(supported unsupported)))
+  (and (guard (c [else #t])
+         (run-async (lambda () (tty-open -1)))
+         #f)
+       (guard (c [(async-io-condition? c) #t])
+         (and (memq (tty-virtual-terminal-state) '(supported unsupported))
+              #t)))
 
   ;; filesystem failures retain operation and path information
 
@@ -854,6 +862,41 @@
                      (list canceled received))))))))
       (asyncio-delete-if-present path)
       (equal? result '(canceled "after-cancel"))))
+
+  ;; Context cancellation uses the same nack path and leaves a later stream
+  ;; read intact.
+
+  (let ([path (asyncio-temp-path "context-cancel")])
+    (asyncio-delete-if-present path)
+    (let ([result
+           (run-async
+             (lambda ()
+               (let* ([listener (pipe-listen path)]
+                      [connector
+                       (spawn-task (lambda () (pipe-connect path)))]
+                      [server (tcp-accept listener)]
+                      [client (task-join connector)]
+                      [context (make-async-context)]
+                      [started (make-future)]
+                      [reader
+                       (spawn-task
+                         (lambda ()
+                           (guard (c [(async-cancellation-condition? c)
+                                      (async-cancellation-reason c)])
+                             (future-fulfil! started)
+                             (stream-read server)))
+                         'context context)])
+                 (future-get started)
+                 (async-context-cancel! context 'context-canceled)
+                 (let ([canceled (task-join reader)])
+                   (stream-write client (string->utf8 "after-context"))
+                   (let ([received (utf8->string (stream-read server))])
+                     (stream-close server)
+                     (stream-close client)
+                     (tcp-listener-close listener)
+                     (list canceled received))))))])
+      (asyncio-delete-if-present path)
+      (equal? result '(context-canceled "after-context"))))
 
   ;; TCP streams use the same operation and ownership protocol
 

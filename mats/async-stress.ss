@@ -4,6 +4,7 @@
 (import (chezscheme async))
 (import (chezscheme async operations))
 (import (chezscheme async channels))
+(import (chezscheme async context))
 (import (chezscheme async io fs))
 
 (define environment-positive-integer
@@ -160,6 +161,67 @@
              'parallelism 4)])
       (check (fx= value iteration) 'channel-rendezvous iteration value))))
 
+(define stress-channel-close-race
+  (lambda (iteration)
+    (let ([value
+           (run-async
+             (lambda ()
+               (let* ([channel (make-channel)]
+                      [producer
+                       (spawn-task
+                         (lambda ()
+                           (guard (c [(channel-closed-condition? c) 'closed])
+                             (channel-put channel iteration)
+                             'sent))
+                         'migratable? #t)]
+                      [consumer
+                       (spawn-task
+                         (lambda ()
+                           (call-with-values
+                             (lambda () (channel-receive channel)) list))
+                         'migratable? #t)]
+                      [closer
+                       (fork-thread
+                         (lambda () (channel-close! channel 'stress-close)))])
+                 (thread-join closer)
+                 (list (task-join producer) (task-join consumer))))
+             'parallelism 4)])
+      (check (or (equal? value (list 'sent (list iteration #t)))
+                 (equal? value '(closed (#f #f))))
+        'channel-close-race iteration value))))
+
+(define stress-context-completion-cancellation
+  (lambda (iteration)
+    (let ([value
+           (run-async
+             (lambda ()
+               (let* ([context (make-async-context)]
+                      [started (make-future)]
+                      [blocked (make-future)]
+                      [task
+                       (spawn-task
+                         (lambda ()
+                           (future-fulfil! started)
+                           (future-get blocked)
+                           'completed)
+                         'context context
+                         'migratable? #t)])
+                 (future-get started)
+                 (let ([fulfiller
+                        (fork-thread
+                          (lambda () (future-fulfil! blocked #t)))]
+                       [canceler
+                        (fork-thread
+                          (lambda ()
+                            (async-context-cancel! context 'context-stop)))])
+                   (thread-join fulfiller)
+                   (thread-join canceler))
+                 (guard (c [(async-cancellation-condition? c) 'canceled])
+                   (task-join task))))
+             'parallelism 4)])
+      (check (memq value '(completed canceled))
+        'context-completion-cancellation iteration value))))
+
 (define stress-file-owner-routing
   (lambda (iteration)
     (stress-mark! (list iteration 'file-owner-routing 'setup))
@@ -232,10 +294,15 @@
       (stress-parameter-publication i))
     (when (stress-scenario? "cancellation")
       (atomic-box-set! stress-location (list i 'completion-cancellation))
-      (stress-completion-cancellation i))
+      (stress-completion-cancellation i)
+      (atomic-box-set! stress-location
+        (list i 'context-completion-cancellation))
+      (stress-context-completion-cancellation i))
     (when (stress-scenario? "channel")
       (atomic-box-set! stress-location (list i 'channel-rendezvous))
-      (stress-channel-rendezvous i))
+      (stress-channel-rendezvous i)
+      (atomic-box-set! stress-location (list i 'channel-close-race))
+      (stress-channel-close-race i))
     (when (and stress-io? (stress-scenario? "io"))
       (atomic-box-set! stress-location (list i 'file-owner-routing))
       (stress-file-owner-routing i))

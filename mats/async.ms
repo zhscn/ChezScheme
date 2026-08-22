@@ -15,6 +15,7 @@
 (import (chezscheme async))
 (import (chezscheme async operations))
 (import (chezscheme async channels))
+(import (chezscheme async context))
 (import (chezscheme control))
 
 (define async-test-burn
@@ -98,6 +99,11 @@
   (error? (run-async (lambda () (channel-put 'not-a-channel 1))))
   (error? (run-async (lambda () (task-join 'not-a-task))))
   (error? (run-async (lambda () (async-sleep -1))))
+  (error? (make-async-context 'not-a-context))
+  (error? (async-context-cancel! 'not-a-context))
+  (error? (async-context-with-timeout (make-async-context #f) -1))
+  (error? (async-context-with-timeout (make-async-context #f) 1))
+  (error? (call-with-async-timeout 1 (lambda () 'outside)))
 
   ;; ---- yield and fairness
 
@@ -195,6 +201,22 @@
           (list before after)))
       'preemption-ticks 10)
     '(1 1))
+
+  ;; A dynamically installed context survives engine preemption and is
+  ;; restored when its async-aware dynamic extent exits.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([root (current-async-context)]
+              [context (make-async-context)])
+          (let ([inside
+                 (call-with-async-context context
+                   (lambda ()
+                     (async-test-burn 100000)
+                     (eq? (current-async-context) context)))])
+            (list inside (eq? (current-async-context) root)))))
+      'preemption-ticks 10)
+    '(#t #t))
 
   ;; A scheduler entered by preempted user code would nest engines and is
   ;; rejected before it can capture scheduler internals.
@@ -404,6 +426,79 @@
             'clock 'virtual)
     'timed-out)
 
+  ;; Closing a buffered channel preserves queued values and then reports EOF.
+  (equal? (run-async
+            (lambda ()
+              (let ([ch (make-channel 2)])
+                (channel-put ch 'a)
+                (channel-put ch 'b)
+                (channel-close! ch 'finished)
+                (list
+                  (call-with-values (lambda () (channel-receive ch)) list)
+                  (call-with-values (lambda () (channel-receive ch)) list)
+                  (call-with-values (lambda () (channel-receive ch)) list)
+                  (channel-closed? ch)))))
+    '((a #t) (b #t) (#f #f) #t))
+
+  ;; Close is idempotent, and the first reason is retained for failed access.
+  (equal? (run-async
+            (lambda ()
+              (let ([ch (make-channel)])
+                (channel-close! ch 'first)
+                (channel-close! ch 'second)
+                (list
+                  (guard (c [(channel-closed-condition? c)
+                             (channel-closed-reason c)])
+                    (channel-put ch 'late))
+                  (guard (c [(channel-closed-condition? c)
+                             (channel-closed-reason c)])
+                    (channel-get ch))))))
+    '(first first))
+
+  ;; Closing wakes every blocked receiver and sender.
+  (equal? (run-async
+            (lambda ()
+              (let ([receivers (make-channel)] [senders (make-channel)])
+                (let ([r1 (spawn-task
+                            (lambda ()
+                              (call-with-values
+                                (lambda () (channel-receive receivers)) list)))]
+                      [r2 (spawn-task
+                            (lambda ()
+                              (call-with-values
+                                (lambda () (channel-receive receivers)) list)))]
+                      [sender (spawn-task
+                                (lambda ()
+                                  (guard (c [(channel-closed-condition? c)
+                                             (channel-closed-reason c)])
+                                    (channel-put senders 'value))))])
+                  (task-yield)
+                  (channel-close! receivers)
+                  (channel-close! senders 'stopped)
+                  (list (task-join r1) (task-join r2) (task-join sender))))))
+    '((#f #f) (#f #f) stopped))
+
+  ;; A closed receive can win a choice without leaving the other waiter live.
+  (equal? (run-async
+            (lambda ()
+              (let ([closed (make-channel)] [open (make-channel)])
+                (channel-close! closed)
+                (let ([result
+                       (call-with-values
+                         (lambda ()
+                           (perform-operation
+                             (choice-operation
+                               (channel-receive-operation open)
+                               (channel-receive-operation closed))))
+                         list)])
+                  (spawn-task (lambda () (channel-put open 'still-usable)))
+                  (list result (channel-get open))))))
+    '((#f #f) still-usable))
+
+  (and (channel-closed-condition? (make-channel-closed-condition 'reason))
+       (eq? (channel-closed-reason (make-channel-closed-condition 'reason))
+            'reason))
+
   ;; ---- futures
 
   (equal? (run-async
@@ -536,6 +631,130 @@
 
   ;; ---- cancellation
 
+  ;; Every task owns a context, and spawned tasks receive a distinct child.
+  (equal? (run-async
+            (lambda ()
+              (let* ([root (current-async-task)]
+                     [root-context (current-async-context)]
+                     [child (spawn-task
+                              (lambda ()
+                                (list
+                                  (async-context? (current-async-context))
+                                  (not (eq? root-context
+                                           (current-async-context))))))])
+                (list (eq? root-context (task-context root))
+                      (task-join child)))))
+    '(#t (#t #t)))
+
+  ;; Cancellation propagates down the context tree, but never upward or
+  ;; sideways.  The first cancellation reason wins.
+  (equal? (let* ([parent (make-async-context #f)]
+                 [child (make-async-context parent)]
+                 [sibling (make-async-context parent)])
+            (async-context-cancel! child 'child-only)
+            (async-context-cancel! child 'ignored)
+            (let ([before
+                   (list (async-context-canceled? parent)
+                         (async-context-reason child)
+                         (async-context-canceled? sibling))])
+              (async-context-cancel! parent 'parent-stop)
+              (list before
+                    (async-context-reason parent)
+                    (async-context-reason child)
+                    (async-context-reason sibling))))
+    '((#f child-only #f) parent-stop child-only parent-stop))
+
+  ;; A done operation is reusable and completes without values after cancel.
+  (equal? (run-async
+            (lambda ()
+              (let* ([context (make-async-context)]
+                     [done (async-context-done-operation context)]
+                     [waiter (spawn-task
+                               (lambda ()
+                                 (call-with-values
+                                   (lambda () (perform-operation done)) list)))])
+                (task-yield)
+                (async-context-cancel! context 'done)
+                (list (task-join waiter)
+                      (call-with-values
+                        (lambda () (perform-operation done)) list)))))
+    '(() ()))
+
+  ;; An explicit context cancels an operation and runs the operation's nack.
+  (equal? (run-async
+            (lambda ()
+              (let ([context (make-async-context)] [nacks 0])
+                (let ([task
+                       (spawn-task
+                         (lambda ()
+                           (guard (c [(async-cancellation-condition? c)
+                                      (async-cancellation-reason c)])
+                             (perform-operation/context context
+                               (make-operation
+                                 (lambda (ss) #f)
+                                 (lambda (ss deliver) '(blocked))
+                                 (lambda (values) values)
+                                 (lambda (ss) (set! nacks (fx+ nacks 1))))))))])
+                  (task-yield)
+                  (async-context-cancel! context 'explicit-stop)
+                  (list (task-join task) nacks)))))
+    '(explicit-stop 1))
+
+  ;; A dynamically installed context is inherited by ordinary child tasks.
+  (equal? (run-async
+            (lambda ()
+              (let ([context (make-async-context)])
+                (let* ([started (make-future)]
+                       [task
+                        (call-with-async-context context
+                          (lambda ()
+                            (let ([task
+                                   (spawn-task
+                                     (lambda ()
+                                       (guard (c
+                                                [(async-cancellation-condition? c)
+                                                 (async-cancellation-reason c)])
+                                         (future-fulfil! started)
+                                         (async-sleep 100))))])
+                              (future-get started)
+                              (async-context-cancel! context 'inherited-stop)
+                              task)))])
+                  (task-join task))))
+            'clock 'virtual)
+    'inherited-stop)
+
+  ;; Timeout scopes preserve successful values and cancel blocked work at the
+  ;; scheduler deadline.
+  (equal? (list
+            (call-with-values
+              (lambda ()
+                (run-async
+                  (lambda ()
+                    (call-with-async-timeout 10
+                      (lambda () (values 'a 'b))))
+                  'clock 'virtual))
+              list)
+            (run-async
+              (lambda ()
+                (guard (c [(async-cancellation-condition? c)
+                           (async-cancellation-reason c)])
+                  (call-with-async-timeout 1
+                    (lambda () (async-sleep 10) 'late))))
+              'clock 'virtual))
+    '((a b) deadline-exceeded))
+
+  ;; An absolute monotonic deadline uses the real scheduler clock.
+  (equal? (run-async
+            (lambda ()
+              (let ([context
+                     (async-context-with-deadline
+                       (current-async-context)
+                       (current-time 'time-monotonic))])
+                (guard (c [(async-cancellation-condition? c)
+                           (async-cancellation-reason c)])
+                  (perform-operation/context context (sleep-operation 10))))))
+    'deadline-exceeded)
+
   (equal? (run-async
             (lambda ()
               (let ([t (spawn-task (lambda () (async-sleep 100) 'survived))])
@@ -635,6 +854,29 @@
                 (task-group-wait g)
                 'done)))
     'done)
+
+  ;; Explicit task groups retain the context active at group creation.
+  (equal? (run-async
+            (lambda ()
+              (let* ([context (make-async-context)]
+                     [group
+                      (call-with-async-context context make-task-group)]
+                     [started (make-future)]
+                     [task
+                      (spawn-task
+                        (lambda ()
+                          (guard (c [(async-cancellation-condition? c)
+                                     (async-cancellation-reason c)])
+                            (future-fulfil! started)
+                            (async-sleep 100)))
+                        'group group)])
+                (future-get started)
+                (async-context-cancel! context 'group-stop)
+                (let ([result (task-join task)])
+                  (task-group-wait group)
+                  result)))
+            'clock 'virtual)
+    'group-stop)
 
   ;; unobserved child failure is reported to its owning group
   (equal? (run-async
@@ -1054,6 +1296,6 @@
                 (let ([w (task-current-wait t)])
                   (task-cancel! t)
                   (guard (c [else #f]) (task-join t))
-                  (and (pair? w) (eq? (car w) 'sleep))))))
+                  (and (pair? w) (eq? (car w) 'choice))))))
     #t)
 )
