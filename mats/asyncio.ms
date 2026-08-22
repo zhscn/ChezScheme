@@ -14,7 +14,10 @@
 
 (import (chezscheme async))
 (import (chezscheme async operations))
-(import (chezscheme async io))
+(import (chezscheme async io errors))
+(import (chezscheme async io stream))
+(import (chezscheme async io dns))
+(import (chezscheme async io fs))
 
 (define asyncio-temp-path
   (lambda (tag)

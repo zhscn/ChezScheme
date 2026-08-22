@@ -4,7 +4,7 @@
 (import (chezscheme async))
 (import (chezscheme async operations))
 (import (chezscheme async channels))
-(import (chezscheme async io))
+(import (chezscheme async io fs))
 
 (define environment-positive-integer
   (lambda (name default)

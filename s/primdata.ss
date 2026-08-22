@@ -555,7 +555,8 @@
   (channel-get [flags])
 )
 
-(define-symbol-flags* ([libraries (chezscheme async io)] [flags system proc])
+(define-symbol-flags* ([libraries (chezscheme async io errors)]
+                       [flags system proc])
   (make-async-io-condition [flags])
   (async-io-condition? [flags])
   (async-io-condition-operation [flags])
@@ -564,6 +565,10 @@
   (async-io-condition-code [flags])
   (async-io-error-name [flags])
   (async-io-error-message [flags])
+)
+
+(define-symbol-flags* ([libraries (chezscheme async io stream)]
+                       [flags system proc])
   (tcp-listen [flags])
   (tcp-listener? [flags])
   (tcp-listener-close [flags])
@@ -587,8 +592,16 @@
   (async-stream->binary-input-port [flags])
   (async-stream->binary-output-port [flags])
   (async-stream->binary-input/output-port [flags])
+)
+
+(define-symbol-flags* ([libraries (chezscheme async io dns)]
+                       [flags system proc])
   (dns-lookup-operation [flags])
   (dns-lookup [flags])
+)
+
+(define-symbol-flags* ([libraries (chezscheme async io fs)]
+                       [flags system proc])
   (async-file? [flags])
   (file-open-operation [flags])
   (file-open [flags])
@@ -2789,7 +2802,10 @@
   ($chezscheme-async [flags library-uid])
   ($chezscheme-async-operations [flags library-uid])
   ($chezscheme-async-channels [flags library-uid])
-  ($chezscheme-async-io [flags library-uid])
+  ($chezscheme-async-io-errors [flags library-uid])
+  ($chezscheme-async-io-stream [flags library-uid])
+  ($chezscheme-async-io-dns [flags library-uid])
+  ($chezscheme-async-io-fs [flags library-uid])
   ($srfi-:248 [flags library-uid])
   ($srfi-:248-exceptions [flags library-uid])
 )
