@@ -260,7 +260,7 @@
     (mutable scheduler)             ; current or most recent execution scheduler
     (mutable wait-scheduler)        ; scheduler that owns the current wait
     (immutable migratable?)
-    (mutable affinity-reasons)      ; scheduler-local resources held by the task
+    (mutable affinity-reasons)      ; scheduler-bound execution constraints
     (mutable suspension-state)      ; #f | unwinding | parking | parked | delivered
     (mutable dynamic-state)         ; saved async-dynamic-state
     (mutable exception-state)       ; exception-state record
@@ -493,25 +493,6 @@
     (let ([sched ($async-scheduler)])
       (and (async-scheduler? sched)
            (async-scheduler-in-switch? sched)))))
-
-(define async-pin-current-task!
-  (lambda ()
-    (let ([sched ($async-scheduler)])
-      (if (and (async-scheduler? sched)
-               (async-scheduler-current-task sched))
-          (let* ([task (async-scheduler-current-task sched)]
-                 [token (list 'io)]
-                 [active? #t])
-            (async-task-add-affinity! task token)
-            ;; The returned release procedure is idempotent so native close
-            ;; and shutdown paths may safely converge on the same owner.
-            (lambda ()
-              (with-async-mutex (async-task-mutex task)
-                (when active?
-                  (set! active? #f)
-                  (async-task-affinity-reasons-set! task
-                    (remq token (async-task-affinity-reasons task)))))))
-          (lambda () (void))))))
 
 (define async-task-add-affinity!
   (lambda (task reason)
@@ -2223,7 +2204,6 @@
 ;;; Hooks consumed by asyncio.ss.  $async-io-shutdown is replaced by the io
 ;;; layer's real shutdown procedure when that file is loaded.
 (set! $async-new-thread-parameter async-new-thread-parameter)
-(set! $async-pin-current-task! async-pin-current-task!)
 (set! $async-sync-state-live? async-sync-state-live?)
 (set! $async-sync-slot-set! async-sync-slot-set!)
 (set! $async-sync-slot-ref async-sync-slot-ref)
@@ -2236,6 +2216,9 @@
 
 (set! $async-scheduler-io-state-set!
   (lambda (sched v) (async-scheduler-io-state-set! sched v)))
+
+(set! $async-scheduler-group-token
+  (lambda (sched) ($async-scheduler-group sched)))
 
 (set! $async-scheduler-poll-proc-set!
   (lambda (sched v) (async-scheduler-poll-proc-set! sched v)))

@@ -267,78 +267,74 @@
           'parallelism 2)
         '((#t #t #t) (#t #t #t))))
 
-  ;; A live scheduler-local file keeps its users on the owning scheduler.
-  ;; Closing the file releases that resource affinity, so subsequent
-  ;; scheduler-neutral suspension points may migrate the tasks again.
+  ;; File requests are routed to the file's loop while their fibers migrate.
   (or (not (threaded?))
-      (let* ([n 6]
-             [paths
-              (list->vector
-                (map (lambda (i) (asyncio-temp-path (format "affinity-~a" i)))
-                  '(0 1 2 3 4 5)))]
-             [results
-              (run-async
-                (lambda ()
-                  (let ([tasks (make-vector n)])
-                    (do ([i 0 (fx+ i 1)]) ((fx= i n))
-                      (let ([i i])
-                        (vector-set! tasks i
-                          (spawn-task
-                            (lambda ()
-                              (let* ([file
-                                      (file-open (vector-ref paths i)
-                                        '(write create truncate))]
-                                     [owner (current-async-scheduler)]
-                                     [stable? #t]
-                                     [migrated? #f])
-                                (do ([j 0 (fx+ j 1)]) ((fx= j 8))
-                                  (task-yield)
-                                  (unless (eq? owner
-                                               (current-async-scheduler))
-                                    (set! stable? #f)))
-                                (file-close file)
-                                (do ([j 0 (fx+ j 1)]) ((fx= j 32))
-                                  (task-yield)
-                                  (unless (eq? owner
-                                               (current-async-scheduler))
-                                    (set! migrated? #t)))
-                                (list stable? migrated?)))
-                            'migratable? #t))))
-                    (let loop ([i 0] [results '()])
-                      (if (fx= i n)
-                          (reverse results)
-                          (loop (fx+ i 1)
-                            (cons (task-join (vector-ref tasks i))
-                                  results))))))
-                'parallelism 3)])
-        (vector-for-each asyncio-delete-if-present paths)
-        (and (for-all car results)
-             (exists cadr results))))
+      (let ([path (asyncio-temp-path "foreign-file-owner")])
+        (asyncio-delete-if-present path)
+        (let ([result
+               (run-async
+                 (lambda ()
+                   (let* ([file (file-open path '(write create truncate))]
+                          [mutex (make-mutex)]
+                          [condition (make-condition)]
+                          [started? #f]
+                          [writer
+                           (spawn-task
+                             (lambda ()
+                               (with-mutex mutex
+                                 (set! started? #t)
+                                 (condition-broadcast condition))
+                               (file-write file (string->utf8 "routed"))
+                               (file-close file)
+                               #t)
+                             'migratable? #t)]
+                          [nudge
+                           (spawn-task (lambda () (void)) 'migratable? #t)])
+                     ;; Block scheduler 0 until scheduler 1 runs the writer.
+                     (with-mutex mutex
+                       (let loop ()
+                         (unless started?
+                           (condition-wait condition mutex)
+                           (loop))))
+                     (and (task-join writer)
+                          (begin (task-join nudge) #t)
+                          (= (cdr (assq 'size (file-stat path))) 6))))
+                 'parallelism 2)])
+          (asyncio-delete-if-present path)
+          result)))
 
   ;; A request canceled from another scheduler is withdrawn by its loop owner.
   (or (not (threaded?))
       (run-async
         (lambda ()
-          (let* ([root-scheduler (current-async-scheduler)]
-                 [started (make-future)]
+          (let* ([mutex (make-mutex)]
+                 [condition (make-condition)]
+                 [started? #f]
                  [task
                   (spawn-task
                     (lambda ()
-                      (let wait-for-worker ()
-                        (if (eq? root-scheduler (current-async-scheduler))
-                            (begin (task-yield) (wait-for-worker))
-                            (begin
-                              (future-fulfil! started)
-                              (dns-lookup "localhost" "80")))))
-                    'migratable? #t)])
-            (future-get started)
+                      (with-mutex mutex
+                        (set! started? #t)
+                        (condition-broadcast condition))
+                      (dns-lookup "localhost" "80"))
+                    'migratable? #t)]
+                 [nudge
+                  (spawn-task (lambda () (void)) 'migratable? #t)])
+            (with-mutex mutex
+              (let loop ()
+                (unless started?
+                  (condition-wait condition mutex)
+                  (loop))))
             (task-cancel! task)
-            (guard (c [(async-cancellation-condition? c) #t])
-              (task-join task)
-              #f)))
+            (let ([canceled?
+                   (guard (c [(async-cancellation-condition? c) #t])
+                     (task-join task)
+                     #f)])
+              (task-join nudge)
+              canceled?)))
         'parallelism 2))
 
-  ;; A handle can only be operated by the scheduler that owns its libuv loop.
+  ;; Handle requests made on another worker run on the handle's loop owner.
   (or (not (threaded?))
       (let ([path (asyncio-temp-path "foreign-owner")])
         (asyncio-delete-if-present path)
@@ -367,20 +363,19 @@
                              'migratable? #t))))
                      (do ([i 0 (fx+ i 1)]) ((fx= i n))
                        (vector-set! servers i (tcp-accept listener)))
-                     (let ([foreign 0] [rejected 0])
+                     (let ([foreign 0])
                        (do ([i 0 (fx+ i 1)]) ((fx= i n))
                          (let-values ([(sched stream)
                                       (future-get (vector-ref infos i))])
                            (unless (eq? sched owner)
                              (set! foreign (fx+ foreign 1))
-                             (guard (c [else (set! rejected (fx+ rejected 1))])
-                               (stream-write stream (bytevector 1))))))
+                             (stream-write stream (bytevector 1)))))
                        (do ([i 0 (fx+ i 1)]) ((fx= i n))
                          (future-fulfil! (vector-ref gates i))
                          (task-join (vector-ref tasks i))
                          (stream-close (vector-ref servers i)))
                        (tcp-listener-close listener)
-                       (and (fx> foreign 0) (fx= foreign rejected)))))
+                       (fx> foreign 0))))
                  'parallelism 2)])
           (asyncio-delete-if-present path)
           result)))
