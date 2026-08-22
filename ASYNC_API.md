@@ -68,6 +68,7 @@ the operation on which a task is suspended.
 
 ```scheme
 (task-join task) -> values ...
+(task-join-operation task) -> operation
 (task-cancel! task [reason]) -> void
 (task-yield) -> boolean
 (async-sleep seconds) -> void
@@ -78,6 +79,10 @@ cancellation condition. A task cannot join itself. `task-cancel!` is
 idempotent and cancels the task's context. The first cancellation reason is
 retained. `task-yield` returns `#t` after yielding an async task and `#f`
 outside an async task. `seconds` is a nonnegative real number.
+
+`task-join-operation` constructs the operation performed by `task-join`.
+When it loses a choice, its waiter is withdrawn without canceling the target
+task. Performing an operation that targets the current task is an error.
 
 ### Task groups and cancellation
 
@@ -408,6 +413,104 @@ Close a producer-owned channel and consume its remaining values:
               (loop (cons value items))
               (reverse items)))))))
 ;; => (1 2)
+```
+
+## `(chezscheme async syntax)`
+
+This library provides hygienic expression-oriented forms over the task,
+context, operation, and channel APIs. It introduces no separate scheduler or
+runtime state. Forms preserve all values produced by their bodies and do not
+intercept exceptions or cancellation conditions.
+
+```scheme
+(async body ...) -> values ...
+(async/options ([option expression] ...) body ...) -> values ...
+```
+
+`async` invokes `run-async` with the body in a thunk. `async/options` accepts
+the `clock`, `parallelism`, and `preemption-ticks` options of `run-async`.
+Option expressions are evaluated exactly once in source order before the
+scheduler starts.
+
+```scheme
+(go body ...) -> task
+(go/options ([option expression] ...) body ...) -> task
+(await task-expression) -> values ...
+```
+
+`go` spawns a migratable child task. `go/options` accepts the `name`, `group`,
+`context`, and `migratable?` options of `spawn-task`; it also defaults
+`migratable?` to `#t`. Option expressions are evaluated exactly once in source
+order before the task is spawned. `await` joins the task produced by
+`task-expression`.
+
+```scheme
+(select-operation clause ...) -> operation
+(select clause ...) -> values ...
+
+clause = [(on operation-expression variable ...) body ...]
+       | [(recv channel-expression value-variable open?-variable) body ...]
+       | [(send channel-expression value-expression) body ...]
+       | [(after seconds-expression) body ...]
+       | [else body ...]
+```
+
+`select-operation` constructs a choice operation and `select` immediately
+performs that operation. `on` accepts any operation and binds all values it
+produces. `recv`, `send`, and `after` are shorthands for channel receive,
+channel put, and sleep operations. An `else` clause must be last and is ready
+immediately. Without `else`, the selection suspends until an arm is ready.
+
+All arm input expressions are evaluated exactly once in clause order before
+the choice is constructed. Only the selected body runs. Losing operations are
+nacked according to the ordinary `choice-operation` contract. The result of
+the selected body becomes the result of the operation, so a
+`select-operation` can itself be wrapped, combined, or performed under a
+cancellation context.
+
+```scheme
+(with-timeout seconds-expression body ...) -> values ...
+(with-async-context context-expression body ...) -> values ...
+(with-cancel-scope (cancel!) body ...) -> values ...
+```
+
+`with-timeout` installs a timeout context for the body.
+`with-async-context` installs the context produced by `context-expression`.
+`with-cancel-scope` installs a fresh child context and lexically binds
+`cancel!` as a procedure accepting zero or one cancellation-reason argument.
+The scope context is canceled with `scope-exited` when control leaves the
+body, which also bounds descendants created in the scope.
+
+```scheme
+(channel-for (value-variable channel-expression) body ...) -> void
+```
+
+`channel-for` evaluates `channel-expression` once and receives values until
+the channel is closed and empty. Buffered values are drained before the loop
+terminates. The form neither closes the channel nor cancels its producer.
+
+Spawn two producers, select their next available value, and consume a closed
+channel:
+
+```scheme
+(import (chezscheme)
+        (chezscheme async)
+        (chezscheme async channels)
+        (chezscheme async syntax))
+
+(async
+  (let ([left (make-channel 1)]
+        [right (make-channel 1)])
+    (go (channel-put left 'left) (channel-close! left))
+    (go (channel-put right 'right) (channel-close! right))
+    (let ([first
+           (select
+             [(recv left value open?) (and open? value)]
+             [(recv right value open?) (and open? value)])]
+          [remaining '()])
+      (channel-for (value right)
+        (set! remaining (cons value remaining)))
+      (cons first (reverse remaining)))))
 ```
 
 ## I/O conventions

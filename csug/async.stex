@@ -44,13 +44,14 @@ transformed, dynamically selected, and combined using combinators such as
 \scheme{choice-operation} and \scheme{wrap-operation} in the style of
 Concurrent ML (CML).
 
-The core asynchronous subsystem is organized into four primary libraries:
+The core asynchronous subsystem is organized into five primary libraries:
 
 \schemedisplay
 (chezscheme async)
 (chezscheme async context)
 (chezscheme async operations)
 (chezscheme async channels)
+(chezscheme async syntax)
 \endschemedisplay
 
 In addition, modular I/O domain libraries provide nonblocking networking,
@@ -206,6 +207,19 @@ If \var{task} completes successfully, \scheme{task-join} returns all values
 produced by \var{task}.  If \var{task} terminated with an uncaught exception
 or cancellation condition, that condition is re-raised in the calling task.
 An exception is raised if a task attempts to join itself.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{task-join-operation}{\categoryprocedure}{(task-join-operation \var{task})}
+\returns an operation
+\listlibraries
+\endentryheader
+
+\var{task} must be a task object.
+\scheme{task-join-operation} constructs the operation performed by
+\scheme{task-join}.  If the operation loses a choice, its waiter is withdrawn
+without canceling \var{task}.  An exception is raised if the operation targets
+the task that performs it.
 
 %----------------------------------------------------------------------------
 \entryheader
@@ -768,6 +782,218 @@ channel.
           (if open?
               (loop (cons value items))
               (reverse items))))))) ;=> (1 2)
+\endschemedisplay
+
+
+\section{Asynchronous Syntax\label{SECTASYNCSYNTAX}}
+
+\index{asynchronous syntax}%
+\index{tasks!syntactic forms}%
+\index{channels!iteration}%
+The \scheme{(chezscheme async syntax)} library provides hygienic,
+expression-oriented forms over the task, context, operation, and channel
+libraries.  The forms preserve all values produced by their bodies and do not
+intercept exceptions or cancellation conditions.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async}{\categorysyntax}{(async \var{body_1} \var{body_2} \dots)}
+\formdef{async/options}{\categorysyntax}{(async/options ([\var{option} \var{expr}] \dots) \var{body_1} \var{body_2} \dots)}
+\returns the values produced by the body
+\listlibraries
+\endentryheader
+
+\scheme{async} evaluates the body in a thunk passed to \scheme{run-async}.
+\scheme{async/options} additionally accepts the \scheme{clock},
+\scheme{parallelism}, and \scheme{preemption-ticks} options.  Option
+expressions are evaluated exactly once in source order before the scheduler
+starts.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{go}{\categorysyntax}{(go \var{body_1} \var{body_2} \dots)}
+\formdef{go/options}{\categorysyntax}{(go/options ([\var{option} \var{expr}] \dots) \var{body_1} \var{body_2} \dots)}
+\formdef{await}{\categorysyntax}{(await \var{task-expr})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{go} spawns a migratable child task and returns it.
+\scheme{go/options} accepts the \scheme{name}, \scheme{group},
+\scheme{context}, and \scheme{migratable?} options of \scheme{spawn-task},
+defaulting \scheme{migratable?} to \scheme{#t}.  Its option expressions are
+evaluated exactly once in source order.  \scheme{await} joins the task
+produced by \var{task-expr} and returns all of the task's values.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{select-operation}{\categorysyntax}{(select-operation \var{clause} \dots)}
+\formdef{select}{\categorysyntax}{(select \var{clause} \dots)}
+\returns see below
+\listlibraries
+\endentryheader
+
+The clause grammar is:
+
+\schemedisplay
+[(on operation-expr variable ...) body ...]
+[(recv channel-expr value-variable open?-variable) body ...]
+[(send channel-expr value-expr) body ...]
+[(after seconds-expr) body ...]
+[else body ...]
+\endschemedisplay
+
+\scheme{select-operation} constructs an operation and \scheme{select}
+immediately performs it.  An \scheme{on} arm accepts any operation and binds
+the values it produces.  The \scheme{recv}, \scheme{send}, and \scheme{after}
+arms expand to channel receive, channel put, and sleep operations.  An
+\scheme{else} arm must be last and is immediately ready.  Without
+\scheme{else}, selection suspends until an arm is ready.
+
+Arm input expressions are evaluated exactly once in clause order.  Only the
+selected body runs, and losing operations are nacked.  The selected body's
+values become the result of the constructed operation, so the result of
+\scheme{select-operation} can be wrapped, combined with other operations, or
+performed under a cancellation context.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{with-timeout}{\categorysyntax}{(with-timeout \var{seconds-expr} \var{body_1} \var{body_2} \dots)}
+\formdef{with-async-context}{\categorysyntax}{(with-async-context \var{context-expr} \var{body_1} \var{body_2} \dots)}
+\formdef{with-cancel-scope}{\categorysyntax}{(with-cancel-scope (\var{cancel!}) \var{body_1} \var{body_2} \dots)}
+\returns the values produced by the body
+\listlibraries
+\endentryheader
+
+\scheme{with-timeout} installs a timeout context for the body, and
+\scheme{with-async-context} installs the context produced by
+\var{context-expr}.  \scheme{with-cancel-scope} installs a fresh child context
+and lexically binds \var{cancel!} to a procedure that accepts zero or one
+cancellation-reason argument.  The scope context is canceled with
+\scheme{scope-exited} when control leaves the body, bounding descendants
+created within the scope.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{channel-for}{\categorysyntax}{(channel-for (\var{value} \var{channel-expr}) \var{body_1} \var{body_2} \dots)}
+\returns unspecified
+\listlibraries
+\endentryheader
+
+\scheme{channel-for} evaluates \var{channel-expr} once, binds each received
+value to \var{value}, and evaluates the body until the channel is closed and
+empty.  Buffered values are drained before iteration terminates.  The form
+does not close the channel or cancel its producer.
+
+The following examples provide a quick reference for the syntax library.
+The task forms accept the same option names as their procedural counterparts
+while making migratable child tasks the default:
+
+\schemedisplay
+(import (chezscheme)
+        (chezscheme async)
+        (chezscheme async channels)
+        (chezscheme async context)
+        (chezscheme async operations)
+        (chezscheme async syntax))
+
+(async/options
+  (;; run-async options: clock, parallelism, and preemption-ticks
+   [parallelism 2]
+   [preemption-ticks 10000])
+  (let ([worker
+         (go/options
+           (;; spawn-task options: name, group, context, and migratable?
+            [name 'worker]
+            [migratable? #t])
+           (values 'answer 42))])
+    ;; await preserves every value returned by the task.
+    (call-with-values (lambda () (await worker)) list))) ;=> (answer 42)
+\endschemedisplay
+
+\scheme{select} supports general operations as well as channel and timer
+shorthands.  An \scheme{else} arm turns the form into a nonblocking poll;
+omitting it waits until another arm is ready:
+
+\schemedisplay
+(async
+  (let ([input (make-channel)]
+        [output (make-channel 1)]
+        [worker (go (async-sleep 0.01) 'worker-done)])
+    (select
+      ;; Bind every successful value produced by an arbitrary operation.
+      [(on (task-join-operation worker) result)
+       (list 'joined result)]
+
+      ;; Receive returns the value and whether the channel remains open.
+      [(recv input value open?)
+       (if open? (list 'received value) 'input-closed)]
+
+      ;; The branch runs after the value has been accepted or buffered.
+      [(send output 'message)
+       'sent]
+
+      ;; Remove the else arm to make this a real timeout race.
+      [(after 1.0)
+       'timed-out]
+
+      ;; This arm is ready immediately, so the select never blocks.
+      [else 'not-ready])))
+\endschemedisplay
+
+\scheme{select-operation} leaves selection as a first-class operation.  It
+can be wrapped, combined with another choice, or performed under a context:
+
+\schemedisplay
+(async/options ([clock 'virtual])
+  (let* ([input (make-channel 1)]
+         [_ (channel-put input 21)]
+         [selected
+          (select-operation
+            [(recv input value open?)
+             (if open? value 0)]
+            [(after 1) 0])]
+         [doubled
+          (wrap-operation selected (lambda (value) (* value 2)))])
+    (perform-operation doubled))) ;=> 42
+\endschemedisplay
+
+The scope forms preserve body values.  Cancellation raised by a timeout or
+by the procedure bound by \scheme{with-cancel-scope} remains an ordinary
+asynchronous cancellation condition:
+
+\schemedisplay
+(async/options ([clock 'virtual])
+  (guard (c
+           [(async-cancellation-condition? c)
+            (async-cancellation-reason c)])
+    (with-timeout 10
+      (let ([context (make-async-context)])
+        (with-async-context context
+          (with-cancel-scope (cancel!)
+            ;; Descendants inherit the scope's cancellation context.
+            (go (async-sleep 100))
+            (cancel! 'shutdown)
+            ;; The next blocking operation observes cancellation.
+            (async-sleep 1))))))) ;=> shutdown
+\endschemedisplay
+
+\scheme{channel-for} implements channel range iteration.  It drains buffered
+values before recognizing the closed-and-empty state; closing remains the
+producer's responsibility:
+
+\schemedisplay
+(async
+  (let ([values (make-channel 2)])
+    (go
+      (channel-put values 1)
+      (channel-put values 2)
+      ;; channel-for stops only after these buffered values are consumed.
+      (channel-close! values))
+    (let ([items '()])
+      (channel-for (value values)
+        (set! items (cons value items)))
+      (reverse items)))) ;=> (1 2)
 \endschemedisplay
 
 

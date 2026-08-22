@@ -65,6 +65,7 @@ The library boundaries are:
 (chezscheme async context)
 (chezscheme async operations)
 (chezscheme async channels)
+(chezscheme async syntax)
 
 (chezscheme async io errors)
 (chezscheme async io stream)
@@ -92,6 +93,7 @@ Representative public forms are:
 (task? object)
 (task-state task)
 (task-join task)
+(task-join-operation task)
 (task-cancel! task)
 (task-context task)
 (task-yield)
@@ -114,6 +116,14 @@ Representative public forms are:
 (channel-put channel value)
 (channel-get channel)
 (channel-receive channel)
+
+(async body ...)
+(go body ...)
+(await task)
+(select clause ...)
+(with-timeout seconds body ...)
+(with-cancel-scope (cancel!) body ...)
+(channel-for (value channel) body ...)
 ```
 
 ## Scheduler ownership
@@ -347,6 +357,30 @@ the same internal waiter machinery.
 Queue cleanup is incremental. Completed or canceled waiter records are
 removed during ordinary queue operations, with occasional bounded pruning to
 avoid retaining dead resumptions.
+
+## Syntax layer
+
+The `(chezscheme async syntax)` library is a hygienic, expression-oriented
+layer over tasks, operations, contexts, and channels. It does not introduce a
+second scheduler abstraction. `async` delimits scheduler execution, `go`
+spawns a migratable structured child, and `await` joins a task while preserving
+all result values.
+
+`select-operation` constructs an ordinary operation from branch clauses;
+`select` performs the constructed operation. A general `on` clause accepts any
+operation. The `recv`, `send`, and `after` clauses expand to channel and timer
+operations, while `else` supplies an immediately ready arm. Clause input
+expressions are evaluated once in source order, only the committed body runs,
+and losing arms receive ordinary operation nacks. These rules allow selection
+to nest inside wrapping, choice, context, and I/O compositions without special
+scheduler support.
+
+Dynamic scope forms install timeout and explicit cancellation contexts.
+`with-cancel-scope` binds an explicit cancellation procedure and cancels its
+child context on scope exit, bounding the tasks and operations created in that
+extent. `channel-for` implements the two-value channel receive protocol as an
+iteration: it drains buffered values, stops after closed-and-empty, and leaves
+channel ownership with the producer.
 
 ## Cancellation
 

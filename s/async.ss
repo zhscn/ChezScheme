@@ -1473,10 +1473,14 @@
       [(completed) (cons 'values (async-task-result-values task))]
       [else (cons 'raise (async-task-failure-condition task))])))
 
-(define task-join-operation
+(define async-task-join-operation
   (lambda (task)
     (make-async-operation
       (lambda (ss)
+        (let ([sched ($async-scheduler)])
+          (when (and (async-scheduler? sched)
+                     (eq? task (async-scheduler-current-task sched)))
+            ($oops 'task-join-operation "a task cannot join itself")))
         (with-async-mutex (async-task-mutex task)
           (and (task-terminal? task)
                (begin
@@ -2514,7 +2518,12 @@
       (when (and (async-scheduler? sched)
                  (eq? task (async-scheduler-current-task sched)))
         ($oops who "a task cannot join itself")))
-    (perform-operation (task-join-operation task))))
+    (perform-operation (async-task-join-operation task))))
+
+(set-who! task-join-operation
+  (lambda (task)
+    (unless (task? task) ($oops who "~s is not a task" task))
+    (async-task-join-operation task)))
 
 (set-who! task-cancel!
   (case-lambda

@@ -16,6 +16,7 @@
 (import (chezscheme async operations))
 (import (chezscheme async channels))
 (import (chezscheme async context))
+(import (chezscheme async syntax))
 (import (chezscheme control))
 
 (define async-test-burn
@@ -1269,6 +1270,159 @@
                   'parallelism 4)
                 '(completed canceled))
               (loop (fx+ i 1))))))
+
+  ;; ---- syntax layer
+
+  (equal?
+    (call-with-values (lambda () (async (values 'a 'b))) list)
+    '(a b))
+
+  ;; Scheduler option expressions are evaluated once in source order.
+  (equal?
+    (let ([log '()])
+      (async/options
+        ([clock (begin (set! log (cons 'clock log)) 'virtual)]
+         [preemption-ticks
+          (begin (set! log (cons 'preemption-ticks log)) #f)])
+        (reverse log)))
+    '(clock preemption-ticks))
+
+  ;; go returns a task, await preserves all task values, and go/options
+  ;; evaluates option values before spawning the body.
+  (equal?
+    (async
+      (let ([log '()])
+        (let ([task
+               (go/options
+                 ([name (begin (set! log (cons 'name log)) 'worker)]
+                  [migratable?
+                   (begin (set! log (cons 'migratable? log)) #t)])
+                 (values (reverse log) (task-name (current-async-task))))])
+          (call-with-values (lambda () (await task)) list))))
+    '((name migratable?) worker))
+
+  ;; A join operation composes with choice. Selecting another branch removes
+  ;; only the join waiter and leaves the target running.
+  (equal?
+    (async/options ([clock 'virtual])
+      (let ([target (go (async-sleep 2) 'finished)])
+        (let ([selected
+               (perform-operation
+                 (choice-operation
+                   (wrap-operation (task-join-operation target)
+                     (lambda (value) (list 'joined value)))
+                   (always-operation 'other)))])
+          (list selected (await target)))))
+    '(other finished))
+  (error? (task-join-operation 'not-a-task))
+  (error?
+    (async
+      (perform-operation
+        (task-join-operation (current-async-task)))))
+
+  ;; General select clauses preserve multiple values and selected branch
+  ;; values. select-operation remains a first-class operation.
+  (equal?
+    (async
+      (call-with-values
+        (lambda ()
+          (perform-operation
+            (select-operation
+              [(on (always-operation 1 2) left right)
+               (values (+ left right) (* left right))])))
+        list))
+    '(3 2))
+  (equal?
+    (operation?
+      (select-operation
+        [(on (always-operation 'ready) value) value]))
+    #t)
+
+  ;; Clause inputs are evaluated once in source order, and only the selected
+  ;; body runs.
+  (equal?
+    (async/options ([clock 'virtual])
+      (let ([log '()] [channel (make-channel 1)])
+        (channel-put channel 'message)
+        (let ([answer
+               (select
+                 [(recv (begin (set! log (cons 'recv log)) channel)
+                        value open?)
+                  (set! log (cons 'recv-body log))
+                  (list value open?)]
+                 [(send (begin (set! log (cons 'send-channel log)) channel)
+                        (begin (set! log (cons 'send-value log)) 'unused))
+                  (set! log (cons 'send-body log))
+                  'sent]
+                 [(after (begin (set! log (cons 'after log)) 1))
+                  (set! log (cons 'after-body log))
+                  'late])])
+          (list answer (reverse log)))))
+    '((message #t) (recv send-channel send-value after recv-body)))
+
+  (equal?
+    (call-with-values
+      (lambda ()
+        (async
+          (select
+            [(on (never-operation) value) value]
+            [else (values 'default 'branch)])))
+      list)
+    '(default branch))
+
+  ;; send and after shorthands use ordinary channel and timer operations.
+  (equal?
+    (async/options ([clock 'virtual])
+      (let ([channel (make-channel)])
+        (let ([receiver (go (channel-get channel))])
+          (list
+            (select [(send channel 'sent) 'delivered]
+                    [(after 1) 'late])
+            (await receiver)))))
+    '(delivered sent))
+  (equal?
+    (async/options ([clock 'virtual])
+      (select [(after 1) 'timeout]))
+    'timeout)
+
+  ;; Dynamic-scope forms preserve values and cancellation behavior.
+  (equal?
+    (call-with-values
+      (lambda ()
+        (async
+          (let ([context (make-async-context)])
+            (with-async-context context
+              (values (eq? context (current-async-context)) 'value)))))
+      list)
+    '(#t value))
+  (equal?
+    (call-with-values
+      (lambda () (async (with-timeout 1 (values 'a 'b))))
+      list)
+    '(a b))
+  (equal?
+    (async/options ([clock 'virtual])
+      (guard (condition
+               [(async-cancellation-condition? condition)
+                (async-cancellation-reason condition)])
+        (with-cancel-scope (cancel!)
+          (cancel! 'stop)
+          (async-sleep 1)
+          'unreachable)))
+    'stop)
+
+  ;; Channel iteration drains buffered values before stopping at closed and
+  ;; empty, without closing the channel itself.
+  (equal?
+    (async
+      (let ([channel (make-channel 3)] [values '()])
+        (channel-put channel 1)
+        (channel-put channel 2)
+        (channel-close! channel)
+        (channel-for (value channel)
+          (set! values (cons value values)))
+        (list (reverse values) (channel-closed? channel))))
+    '((1 2) #t))
 
   ;; ---- observability
 
