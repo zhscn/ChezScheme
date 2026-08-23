@@ -471,6 +471,172 @@ preserves all values returned by `thunk`.
 ;; => 400
 ```
 
+### Read/write mutexes
+
+```scheme
+(make-async-rw-mutex) -> async-rw-mutex
+(async-rw-mutex? object) -> boolean
+(async-rw-mutex-acquire-operation mutex) -> operation
+(async-rw-mutex-read-acquire-operation mutex) -> operation
+(async-rw-mutex-acquire mutex) -> void
+(async-rw-mutex-read-acquire mutex) -> void
+(async-rw-mutex-release! mutex) -> void
+(async-rw-mutex-read-release! mutex) -> void
+(call-with-async-rw-mutex mutex thunk) -> values ...
+(call-with-async-read-mutex mutex thunk) -> values ...
+```
+
+The ordinary acquire and release procedures use the exclusive write mode.
+Read mode admits multiple tasks concurrently. Once a writer waits, subsequent
+first-time readers queue behind it. A task may recursively acquire read mode;
+each acquisition requires a matching release. Write mode is nonrecursive, a
+write owner cannot acquire read mode, and upgrading a held read lock to write
+mode is an error.
+
+Both acquisition modes are operations and obey the cancellation, choice, task
+ownership, migration, and task-termination rules of an async mutex. The two
+scoped procedures release after normal return, exception, or cancellation and
+preserve all body values.
+
+```scheme
+(run-async
+  (lambda ()
+    (let ([mutex (make-async-rw-mutex)] [value 0])
+      (let ([writer
+             (spawn-task
+               (lambda ()
+                 (call-with-async-rw-mutex mutex
+                   (lambda () (set! value 42))))
+               'migratable? #t)])
+        (task-join writer)
+        (call-with-async-read-mutex mutex (lambda () value)))))
+  'parallelism 2)
+;; => 42
+```
+
+### Wait groups
+
+```scheme
+(make-async-wait-group [count]) -> async-wait-group
+(async-wait-group? object) -> boolean
+(async-wait-group-add! group delta) -> void
+(async-wait-group-done! group) -> void
+(async-wait-group-wait-operation group) -> operation
+(async-wait-group-wait group) -> void
+(spawn-task/async-wait-group group thunk option value ...) -> task
+```
+
+`count` defaults to zero and must be a nonnegative exact integer. `delta` is
+an exact integer, and an update that would make the counter negative is an
+error. `async-wait-group-done!` subtracts one. Every registered waiter resumes
+when the counter reaches zero.
+
+Counter updates are thread-safe and may be made by async tasks or ordinary
+threads. Waiting suspends an async task. A positive addition that starts a new
+generation precedes the corresponding wait. A group can be reused after all
+waits from the preceding generation have returned.
+
+`spawn-task/async-wait-group` adds one before spawning the task, so an
+immediate wait cannot observe a transient zero counter. It accepts the options
+of `spawn-task`. The child calls `async-wait-group-done!` after a normal return
+or an exception, including cancellation, and preserves every value returned by
+`thunk` for `task-join`. The termination action is installed before task
+publication, so cancellation before the child's first turn also balances the
+counter.
+
+```scheme
+(run-async
+  (lambda ()
+    (let ([done (make-async-wait-group 3)])
+      (do ([i 0 (+ i 1)]) ((= i 3))
+        (spawn-task
+          (lambda ()
+            (async-sleep 0.01)
+            (async-wait-group-done! done))))
+      (async-wait-group-wait done)
+      'complete)))
+;; => complete
+```
+
+### Once
+
+```scheme
+(make-async-once) -> async-once
+(async-once? object) -> boolean
+(async-once-run! once thunk) -> void
+```
+
+Exactly one caller invokes `thunk`. Concurrent callers suspend until that
+invocation leaves the thunk, and later callers return immediately. Values
+from `thunk` are discarded. `async-once-run!` runs inside an async task.
+
+The once object becomes done after a normal return or an exception, including
+cancellation. An exception is propagated to the executing caller. Other
+callers return normally and do not retry the thunk. Recursive use of the same
+once object by its executing task is an error.
+
+```scheme
+(run-async
+  (lambda ()
+    (let ([once (make-async-once)] [count 0] [tasks '()])
+      (do ([i 0 (+ i 1)]) ((= i 8))
+        (set! tasks
+          (cons
+            (spawn-task
+              (lambda ()
+                (async-once-run! once
+                  (lambda () (set! count (+ count 1))))))
+            tasks)))
+      (for-each task-join tasks)
+      count))
+  'parallelism 4)
+;; => 1
+```
+
+### Condition variables
+
+```scheme
+(make-async-condition mutex) -> async-condition
+(async-condition? object) -> boolean
+(async-condition-mutex condition) -> mutex
+(async-condition-wait condition) -> void
+(async-condition-signal! condition) -> void
+(async-condition-broadcast! condition) -> void
+```
+
+`mutex` is an async mutex or an async read/write mutex. For a read/write
+mutex, the condition uses write mode. The current task must own the associated
+lock when calling `async-condition-wait`.
+
+Waiting registers the task, releases the lock, suspends, and reacquires the
+lock before returning. Cancellation also reacquires the lock before raising
+its condition. `async-condition-signal!` wakes the first live FIFO waiter;
+`async-condition-broadcast!` wakes all registered waiters. Signaling does not
+require ownership and is safe from ordinary threads, but callers normally
+update the predicate and signal while holding the associated lock.
+
+Condition notifications carry no state and can be observed before a task
+waits, so the predicate is always tested in a loop:
+
+```scheme
+(let ([mutex (make-async-mutex)]
+      [ready (make-async-condition mutex)]
+      [ready? #f])
+  (spawn-task
+    (lambda ()
+      (call-with-async-mutex mutex
+        (lambda ()
+          (let loop ()
+            (unless ready?
+              (async-condition-wait ready)
+              (loop)))
+          'consumed))))
+  (call-with-async-mutex mutex
+    (lambda ()
+      (set! ready? #t)
+      (async-condition-signal! ready))))
+```
+
 ## `(chezscheme async syntax)`
 
 This library provides hygienic expression-oriented forms over the task,
@@ -529,6 +695,9 @@ cancellation context.
 (with-async-context context-expression body ...) -> values ...
 (with-cancel-scope (cancel!) body ...) -> values ...
 (with-async-mutex mutex-expression body ...) -> values ...
+(with-async-rw-mutex mutex-expression body ...) -> values ...
+(with-async-read-mutex mutex-expression body ...) -> values ...
+(with-async-wait-group group-expression body ...) -> task
 ```
 
 `with-timeout` installs a timeout context for the body.
@@ -541,6 +710,25 @@ body, which also bounds descendants created in the scope.
 `with-async-mutex` evaluates its mutex expression once and delegates scoped
 ownership to `call-with-async-mutex`. It preserves every value produced by the
 body and releases the mutex when the body raises, including cancellation.
+
+`with-async-rw-mutex` uses write mode and `with-async-read-mutex` uses read
+mode. Both evaluate the mutex expression once and preserve all body values.
+
+`with-async-wait-group` evaluates its group expression once, adds one in the
+calling task, and spawns a migratable child for the body. It returns that task.
+The child calls `done!` whenever it terminates. This ordering corresponds to
+adding to a Go `WaitGroup` before starting the goroutine.
+
+```scheme
+(async
+  (let ([done (make-async-wait-group)] [value #f])
+    ;; Membership is visible before the child can be scheduled.
+    (with-async-wait-group done
+      (set! value 42))
+    (async-wait-group-wait done)
+    value))
+;; => 42
+```
 
 ```scheme
 (channel-for (value-variable channel-expression) body ...) -> void

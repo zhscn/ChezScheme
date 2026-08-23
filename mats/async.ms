@@ -1662,6 +1662,459 @@
       'parallelism 4)
     320)
 
+  ;; Simultaneous choice handoffs cannot corrupt a task's owned-lock set.
+  (equal?
+    (run-async
+      (lambda ()
+        (do ([iteration 0 (fx+ iteration 1)])
+            ((fx= iteration 25) 'clean)
+          (let ([left (make-async-mutex)]
+                [right (make-async-mutex)]
+                [owners-ready (make-async-wait-group 2)]
+                [release (make-future)])
+            (define make-owner
+              (lambda (mutex)
+                (spawn-task
+                  (lambda ()
+                    (with-async-mutex mutex
+                      (async-wait-group-done! owners-ready)
+                      (future-get release)))
+                  'migratable? #t)))
+            (let ([left-owner (make-owner left)]
+                  [right-owner (make-owner right)])
+              (async-wait-group-wait owners-ready)
+              (let ([chooser
+                     (spawn-task
+                       (lambda ()
+                         (perform-operation
+                           (choice-operation
+                             (wrap-operation
+                               (async-mutex-acquire-operation left)
+                               (lambda () 'left))
+                             (wrap-operation
+                               (async-mutex-acquire-operation right)
+                               (lambda () 'right)))))
+                       'migratable? #t)])
+                (let wait-until-registered ()
+                  (unless (task-current-wait chooser)
+                    (task-yield)
+                    (wait-until-registered)))
+                (future-fulfil! release #t)
+                (task-join left-owner)
+                (task-join right-owner)
+                ;; The chooser deliberately leaves its winning acquisition
+                ;; unscoped; termination cleanup must release it.
+                (task-join chooser)
+                (with-async-mutex left (void))
+                (with-async-mutex right (void)))))))
+      'parallelism 4)
+    'clean)
+
+  ;; ---- read/write mutexes
+
+  (and (async-rw-mutex? (make-async-rw-mutex))
+       (not (async-rw-mutex? 'not-a-mutex)))
+  (error? (async-rw-mutex-acquire (make-async-rw-mutex)))
+  (error? (async-rw-mutex-read-acquire 'not-a-mutex))
+
+  ;; Multiple readers may overlap across schedulers.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-rw-mutex)]
+              [first-entered (make-future)]
+              [second-entered (make-future)]
+              [release (make-future)])
+          (let ([first
+                 (spawn-task
+                   (lambda ()
+                     (with-async-read-mutex mutex
+                       (future-fulfil! first-entered #t)
+                       (future-get release)
+                       'first))
+                   'migratable? #t)])
+            (future-get first-entered)
+            (let ([second
+                   (spawn-task
+                     (lambda ()
+                       (with-async-read-mutex mutex
+                         (future-fulfil! second-entered #t)
+                         'second))
+                     'migratable? #t)])
+              (future-get second-entered)
+              (future-fulfil! release #t)
+              (list (task-join first) (task-join second))))))
+      'parallelism 3)
+    '(first second))
+
+  ;; A queued writer precedes readers that arrive later.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-rw-mutex)] [order '()])
+          (async-rw-mutex-read-acquire mutex)
+          (let ([writer-started (make-future)])
+            (let ([writer
+                   (spawn-task
+                     (lambda ()
+                       (future-fulfil! writer-started #t)
+                       (with-async-rw-mutex mutex
+                         (set! order (append order '(writer))))))])
+              (future-get writer-started)
+              (let ([reader-started (make-future)])
+                (let ([reader
+                       (spawn-task
+                         (lambda ()
+                           (future-fulfil! reader-started #t)
+                           (with-async-read-mutex mutex
+                             (set! order (append order '(reader))))))])
+                  (future-get reader-started)
+                  (async-rw-mutex-read-release! mutex)
+                  (task-join writer)
+                  (task-join reader)
+                  order)))))))
+    '(writer reader))
+
+  ;; Read locks are recursive; write locks and upgrades are not.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutex (make-async-rw-mutex)] [writer-ran? #f])
+          (async-rw-mutex-read-acquire mutex)
+          (async-rw-mutex-read-acquire mutex)
+          (let ([upgrade?
+                 (guard (c [else #t])
+                   (async-rw-mutex-acquire mutex)
+                   #f)])
+            (async-rw-mutex-read-release! mutex)
+            (let ([writer
+                   (spawn-task
+                     (lambda ()
+                       (with-async-rw-mutex mutex
+                         (set! writer-ran? #t))))])
+              (task-yield)
+              (let ([blocked? (not writer-ran?)])
+                (async-rw-mutex-read-release! mutex)
+                (task-join writer)
+                (async-rw-mutex-acquire mutex)
+                (let ([recursive?
+                       (guard (c [else #t])
+                         (async-rw-mutex-acquire mutex)
+                         #f)])
+                  (async-rw-mutex-release! mutex)
+                  (list upgrade? blocked? recursive? writer-ran?))))))))
+    '(#t #t #t #t))
+
+  ;; ---- wait groups
+
+  (and (async-wait-group? (make-async-wait-group))
+       (not (async-wait-group? 'not-a-group)))
+  (error? (make-async-wait-group -1))
+  (error? (async-wait-group-done! (make-async-wait-group)))
+  (error? (spawn-task/async-wait-group
+            (make-async-wait-group) 'not-a-procedure))
+
+  ;; A spawn validation failure rolls back membership before propagating.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([group (make-async-wait-group)])
+          (guard (c [else (void)])
+            (spawn-task/async-wait-group group (lambda () (void))
+              'unknown-option #t))
+          (async-wait-group-wait group)
+          'rolled-back)))
+    'rolled-back)
+
+  ;; Scoped spawning adds before publication, preserves task values, and
+  ;; balances the counter when the child exits.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([group (make-async-wait-group)])
+          (let ([task
+                 (with-async-wait-group group
+                   (values 1 2 3))])
+            (async-wait-group-wait group)
+            (call-with-values (lambda () (task-join task)) list)))))
+    '(1 2 3))
+
+  ;; Exceptions and cancellation also leave scoped membership.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([group (make-async-wait-group)] [started (make-future)])
+          (let ([failed
+                 (with-async-wait-group group
+                   (raise (make-message-condition "worker failed")))])
+            (guard (c [else (void)]) (task-join failed)))
+          (let ([worker
+                 (with-async-wait-group group
+                   (future-fulfil! started #t)
+                   (async-sleep 10))])
+            (future-get started)
+            (task-cancel! worker 'stop)
+            (guard (c [else (void)]) (task-join worker))
+            (async-wait-group-wait group)
+            'balanced))))
+    'balanced)
+
+  ;; Cancellation before the child's first turn still balances membership.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([group (make-async-wait-group)] [ran? #f])
+          (let ([worker
+                 (with-async-wait-group group
+                   (set! ran? #t))])
+            (task-cancel! worker 'before-start)
+            (guard (c [else (void)]) (task-join worker))
+            (async-wait-group-wait group)
+            (list ran? 'balanced)))))
+    '(#f balanced))
+
+  ;; The completion action belongs only to the registered task.  A nested
+  ;; ordinary spawn must not inherit it and release the group early.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([group (make-async-wait-group)] [outer-finished? #f])
+          (with-async-wait-group group
+            (task-join (spawn-task (lambda () (void))))
+            (async-sleep 0.02)
+            (set! outer-finished? #t))
+          (async-wait-group-wait group)
+          outer-finished?)))
+    #t)
+
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([group (make-async-wait-group 2)] [order '()])
+          (spawn-task
+            (lambda ()
+              (task-yield)
+              (set! order (cons 'first order))
+              (async-wait-group-done! group)))
+          (spawn-task
+            (lambda ()
+              (task-yield)
+              (task-yield)
+              (set! order (cons 'second order))
+              (async-wait-group-done! group)))
+          (async-wait-group-wait group)
+          ;; A completed group can be reused after its wait returns.
+          (async-wait-group-add! group 1)
+          (spawn-task (lambda () (async-wait-group-done! group)))
+          (perform-operation (async-wait-group-wait-operation group))
+          (reverse order))))
+    '(first second))
+
+  ;; Cancellation withdraws a wait-group operation without changing count.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([group (make-async-wait-group 1)] [started (make-future)])
+          (let ([waiter
+                 (spawn-task
+                   (lambda ()
+                     (future-fulfil! started #t)
+                     (async-wait-group-wait group)))])
+            (future-get started)
+            (task-cancel! waiter 'stop)
+            (guard (c [else (void)]) (task-join waiter))
+            (async-wait-group-done! group)
+            (async-wait-group-wait group)
+            'usable))))
+    'usable)
+
+  ;; Wait groups accept exact counters larger than the fixnum range.
+  (equal?
+    (run-async
+      (lambda ()
+        (let* ([count (expt 2 80)]
+               [group (make-async-wait-group count)])
+          (async-wait-group-add! group (- count))
+          (async-wait-group-wait group)
+          'large-counter)))
+    'large-counter)
+
+  ;; ---- once
+
+  (and (async-once? (make-async-once))
+       (not (async-once? 'not-once)))
+  (error? (async-once-run! (make-async-once) (lambda () (void))))
+
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([once (make-async-once)] [count 0] [tasks '()])
+          (do ([i 0 (fx+ i 1)]) ((fx= i 12))
+            (set! tasks
+              (cons
+                (spawn-task
+                  (lambda ()
+                    (async-once-run! once
+                      (lambda ()
+                        (task-yield)
+                        (set! count (fx+ count 1)))))
+                  'migratable? #t)
+                tasks)))
+          (for-each task-join tasks)
+          count))
+      'parallelism 4)
+    1)
+
+  ;; An exception marks Once as done; later invocations do not retry it.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([once (make-async-once)] [count 0])
+          (guard (c [else (void)])
+            (async-once-run! once
+              (lambda ()
+                (set! count 1)
+                (raise (make-message-condition "once failed")))))
+          (async-once-run! once (lambda () (set! count 2)))
+          count)))
+    1)
+
+  ;; Cancellation of the initializer completes Once and releases its waiters.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([once (make-async-once)] [started (make-future)])
+          (let ([initializer
+                 (spawn-task
+                   (lambda ()
+                     (async-once-run! once
+                       (lambda ()
+                         (future-fulfil! started #t)
+                         (async-sleep 10)))))])
+            (future-get started)
+            (let ([waiter
+                   (spawn-task
+                     (lambda ()
+                       (async-once-run! once (lambda () 'not-run))
+                       'released))])
+              (task-yield)
+              (task-cancel! initializer 'stop)
+              (guard (c [else (void)]) (task-join initializer))
+              (let ([result (task-join waiter)])
+                (async-once-run! once (lambda () 'not-run))
+                result)))))
+      'parallelism 2
+      'preemption-ticks 1000)
+    'released)
+
+  ;; ---- conditions
+
+  (let* ([mutex (make-async-mutex)]
+         [condition (make-async-condition mutex)])
+    (and (async-condition? condition)
+         (eq? (async-condition-mutex condition) mutex)
+         (not (async-condition? 'not-a-condition))))
+  (error?
+    (run-async
+      (lambda ()
+        (async-condition-wait
+          (make-async-condition (make-async-mutex))))))
+
+  ;; Wait atomically registers, releases, suspends, and reacquires the mutex.
+  (equal?
+    (run-async
+      (lambda ()
+        (let* ([mutex (make-async-mutex)]
+               [condition (make-async-condition mutex)]
+               [started (make-future)]
+               [ready? #f]
+               [waiter
+                (spawn-task
+                  (lambda ()
+                    (with-async-mutex mutex
+                      (future-fulfil! started #t)
+                      (let loop ()
+                        (unless ready?
+                          (async-condition-wait condition)
+                          (loop)))
+                      'awakened)))])
+          (future-get started)
+          (with-async-mutex mutex
+            (set! ready? #t)
+            (async-condition-signal! condition))
+          (task-join waiter))))
+    'awakened)
+
+  ;; Broadcast wakes every waiter, and an RWMutex can be the condition lock.
+  (equal?
+    (run-async
+      (lambda ()
+        (let* ([mutex (make-async-rw-mutex)]
+               [condition (make-async-condition mutex)]
+               [started (make-async-wait-group 3)]
+               [ready? #f]
+               [tasks
+                (map
+                  (lambda (id)
+                    (spawn-task
+                      (lambda ()
+                        (with-async-rw-mutex mutex
+                          (async-wait-group-done! started)
+                          (let loop ()
+                            (unless ready?
+                              (async-condition-wait condition)
+                              (loop)))
+                          id))))
+                  '(a b c))])
+          (async-wait-group-wait started)
+          (with-async-rw-mutex mutex
+            (set! ready? #t)
+            (async-condition-broadcast! condition))
+          (map task-join tasks))))
+    '(a b c))
+
+  ;; A canceled condition waiter reacquires before unwinding its lock scope.
+  (equal?
+    (run-async
+      (lambda ()
+        (let* ([mutex (make-async-mutex)]
+               [condition (make-async-condition mutex)]
+               [started (make-future)]
+               [waiter
+                (spawn-task
+                  (lambda ()
+                    (with-async-mutex mutex
+                      (future-fulfil! started #t)
+                      (async-condition-wait condition))))])
+          (future-get started)
+          (task-cancel! waiter 'stop)
+          (guard (c [else (void)]) (task-join waiter))
+          (with-async-mutex mutex 'reacquired))))
+    'reacquired)
+
+  ;; Cancellation already pending at Wait leaves the still-owned mutex alone.
+  (equal?
+    (run-async
+      (lambda ()
+        (let* ([mutex (make-async-mutex)]
+               [condition (make-async-condition mutex)]
+               [observed #f]
+               [waiter
+                (spawn-task
+                  (lambda ()
+                    (with-async-mutex mutex
+                      (task-cancel! (current-async-task) 'stop)
+                      (set! observed
+                        (guard (c
+                                 [(async-cancellation-condition? c)
+                                  'canceled]
+                                 [else 'wrong-condition])
+                          (async-condition-wait condition)
+                          'unexpected)))))])
+          (guard (c [else (void)]) (task-join waiter))
+          (list observed (with-async-mutex mutex 'usable)))))
+    '(canceled usable))
+
   ;; ---- observability
 
   (equal? (run-async

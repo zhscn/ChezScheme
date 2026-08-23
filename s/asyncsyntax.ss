@@ -222,3 +222,20 @@
   (syntax-rules ()
     [(_ mutex body1 body2 ...)
      (call-with-async-mutex mutex (lambda () body1 body2 ...))]))
+
+(define-syntax async-syntax:with-async-rw-mutex
+  (syntax-rules ()
+    [(_ mutex body1 body2 ...)
+     (call-with-async-rw-mutex mutex (lambda () body1 body2 ...))]))
+
+(define-syntax async-syntax:with-async-read-mutex
+  (syntax-rules ()
+    [(_ mutex body1 body2 ...)
+     (call-with-async-read-mutex mutex (lambda () body1 body2 ...))]))
+
+(define-syntax async-syntax:with-async-wait-group
+  (syntax-rules ()
+    [(_ group body1 body2 ...)
+     (spawn-task/async-wait-group group
+       (lambda () body1 body2 ...)
+       'migratable? #t)]))

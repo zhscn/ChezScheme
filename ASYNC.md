@@ -359,12 +359,12 @@ Queue cleanup is incremental. Completed or canceled waiter records are
 removed during ordinary queue operations, with occasional bounded pruning to
 avoid retaining dead resumptions.
 
-## Fiber-aware mutexes
+## Fiber-aware synchronization
 
-The `(chezscheme async sync)` library provides mutexes whose contended
-acquisition suspends the current task. Mutex ownership is attached to the task
-rather than its scheduler thread, so a task retains ownership while it yields,
-waits for an operation, is preempted, or migrates within its scheduler group.
+The `(chezscheme async sync)` library provides task-suspending synchronization
+primitives. Mutex ownership is attached to the task rather than its scheduler
+thread, so a task retains ownership while it yields, waits for an operation,
+is preempted, or migrates within its scheduler group.
 
 Waiters receive ownership in FIFO registration order. Ownership is published
 before a selected waiter can resume on another scheduler. Cancellation or a
@@ -375,6 +375,33 @@ The scoped procedure and `with-async-mutex` syntax release ownership after a
 normal return or an exception, including task cancellation. They preserve all
 values returned by the protected body. Task termination releases any remaining
 unscoped acquisitions before publishing the task's terminal state.
+
+An async read/write mutex admits concurrent readers or one writer. Once a
+writer is queued, new readers wait behind it; this bounds writer starvation.
+Read locking is recursive for the owning task. Write locking is nonrecursive,
+and read-to-write upgrades are rejected. Read and write acquisition are
+first-class operations, and task termination releases either ownership mode.
+
+An async wait group contains a nonnegative counter. `add!` changes the
+counter, `done!` subtracts one, and waiters resume together when it reaches
+zero. Waiting is an operation, so it composes with choices and cancellation.
+A positive addition that starts a generation precedes its wait. Reuse begins
+only after every wait from the preceding generation has returned. Scoped
+spawning adds one before publishing a child task and calls `done!` whenever
+that child terminates, including cancellation before its first turn.
+
+An async once object selects one caller to execute an initialization thunk.
+Other callers suspend until that invocation leaves the thunk. The once object
+becomes done after either a normal return or an exception, matching Go's
+single-attempt rule. The executing caller receives the exception; suspended
+and later callers return normally without retrying the thunk.
+
+An async condition variable is associated with an async mutex or the write
+mode of an async read/write mutex. Waiting registers the task before releasing
+the lock, suspends it, and reacquires the lock before returning or propagating
+cancellation. Signal wakes one FIFO waiter and broadcast wakes all registered
+waiters. Applications test their predicate in a loop while holding the
+associated lock.
 
 ## Syntax layer
 
@@ -399,8 +426,10 @@ Dynamic scope forms install timeout and explicit cancellation contexts.
 child context on scope exit, bounding the tasks and operations created in that
 extent. `channel-for` implements the two-value channel receive protocol as an
 iteration: it drains buffered values, stops after closed-and-empty, and leaves
-channel ownership with the producer. `with-async-mutex` evaluates a body while
-the current task owns a fiber-aware mutex.
+channel ownership with the producer. The scoped synchronization forms evaluate
+a body while the current task owns an async mutex, an async read/write mutex in
+write mode, or an async read/write mutex in read mode. The wait-group form
+spawns a migratable child with counter membership covering its lifetime.
 
 ## Cancellation
 

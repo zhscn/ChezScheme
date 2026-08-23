@@ -786,15 +786,15 @@ channel.
 \endschemedisplay
 
 
-\section{Fiber-Aware Mutexes\label{SECTASYNCMUTEXES}}
+\section{Fiber-Aware Synchronization\label{SECTASYNCMUTEXES}}
 
 \index{mutexes!asynchronous}%
 \index{synchronization!fibers}%
-The \scheme{(chezscheme async sync)} library provides mutual exclusion for
-asynchronous tasks.  Waiting for an async mutex suspends the calling task
-instead of blocking its scheduler thread.  Ownership belongs to the task and
-is retained when the task yields, waits, is preempted, or migrates to another
-scheduler in the same group.
+The \scheme{(chezscheme async sync)} library provides task-suspending
+synchronization primitives.  Waiting for an async mutex suspends the calling
+task instead of blocking its scheduler thread.  Ownership belongs to the task
+and is retained when the task yields, waits, is preempted, or migrates to
+another scheduler in the same group.
 
 %----------------------------------------------------------------------------
 \entryheader
@@ -874,6 +874,234 @@ ownership.
         (for-each task-join workers)
         counter)))
   'parallelism 4) ;=> 400
+\endschemedisplay
+
+\bigskip\noindent\textbf{Read/write mutexes.}\par
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-async-rw-mutex}{\categoryprocedure}{(make-async-rw-mutex)}
+\returns a new async read/write mutex
+\listlibraries
+\endentryheader
+
+The new mutex is initially unowned.  Read mode admits multiple tasks, while
+write mode grants exclusive ownership.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-rw-mutex?}{\categoryprocedure}{(async-rw-mutex? \var{obj})}
+\returns \scheme{#t} if \var{obj} is an async read/write mutex, \scheme{#f} otherwise
+\listlibraries
+\endentryheader
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-rw-mutex-acquire-operation}{\categoryprocedure}{(async-rw-mutex-acquire-operation \var{mutex})}
+\formdef{async-rw-mutex-read-acquire-operation}{\categoryprocedure}{(async-rw-mutex-read-acquire-operation \var{mutex})}
+\formdef{async-rw-mutex-acquire}{\categoryprocedure}{(async-rw-mutex-acquire \var{mutex})}
+\formdef{async-rw-mutex-read-acquire}{\categoryprocedure}{(async-rw-mutex-read-acquire \var{mutex})}
+\returns see below
+\listlibraries
+\endentryheader
+
+The forms without \scheme{read} acquire write mode.  Once a writer is waiting,
+subsequent first-time readers queue behind it.  A task may recursively acquire
+read mode, with one release required for each acquisition.  Write mode is
+nonrecursive.  Acquiring write mode while holding read mode, or acquiring read
+mode while holding write mode, is an error.  The operation forms compose with
+choice, timeout, and context operations.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-rw-mutex-release!}{\categoryprocedure}{(async-rw-mutex-release! \var{mutex})}
+\formdef{async-rw-mutex-read-release!}{\categoryprocedure}{(async-rw-mutex-read-release! \var{mutex})}
+\returns unspecified
+\listlibraries
+\endentryheader
+
+The current task must own the corresponding write or read mode.  Task
+termination releases any modes still owned by the terminating task.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{call-with-async-rw-mutex}{\categoryprocedure}{(call-with-async-rw-mutex \var{mutex} \var{thunk})}
+\formdef{call-with-async-read-mutex}{\categoryprocedure}{(call-with-async-read-mutex \var{mutex} \var{thunk})}
+\returns the values returned by \var{thunk}
+\listlibraries
+\endentryheader
+
+The first procedure uses write mode and the second uses read mode.  Each
+releases its mode after normal return, exception, or cancellation.
+
+\bigskip\noindent\textbf{Wait groups.}\par
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-async-wait-group}{\categoryprocedure}{(make-async-wait-group)}
+\formdef{make-async-wait-group}{\categoryprocedure}{(make-async-wait-group \var{count})}
+\returns a new async wait group
+\listlibraries
+\endentryheader
+
+\var{count} defaults to zero and must be a nonnegative exact integer.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-wait-group?}{\categoryprocedure}{(async-wait-group? \var{obj})}
+\returns \scheme{#t} if \var{obj} is an async wait group, \scheme{#f} otherwise
+\listlibraries
+\endentryheader
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-wait-group-add!}{\categoryprocedure}{(async-wait-group-add! \var{group} \var{delta})}
+\formdef{async-wait-group-done!}{\categoryprocedure}{(async-wait-group-done! \var{group})}
+\returns unspecified
+\listlibraries
+\endentryheader
+
+\scheme{async-wait-group-add!} changes the counter by the exact integer
+\var{delta}; a negative result is an error.  \scheme{async-wait-group-done!}
+subtracts one.  Counter updates are thread-safe.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-wait-group-wait-operation}{\categoryprocedure}{(async-wait-group-wait-operation \var{group})}
+\formdef{async-wait-group-wait}{\categoryprocedure}{(async-wait-group-wait \var{group})}
+\returns see below
+\listlibraries
+\endentryheader
+
+The operation becomes ready when the counter is zero.  The direct procedure
+performs that operation and returns an unspecified value.  A positive addition
+that begins a generation precedes its corresponding wait.  A group may be
+reused after every wait from the preceding generation has returned.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{spawn-task/async-wait-group}{\categoryprocedure}{(spawn-task/async-wait-group \var{group} \var{thunk} \var{option} \var{value} \dots)}
+\returns a new task
+\listlibraries
+\endentryheader
+
+The procedure adds one to \var{group} before spawning the task, then calls
+\scheme{async-wait-group-done!} when the child leaves \var{thunk} by normal
+return, exception, or cancellation.  It accepts the options of
+\scheme{spawn-task}.  Adding before publication ensures that an immediate wait
+cannot observe a transient zero counter.  A termination action installed before
+publication also handles cancellation before the child's first turn.
+
+\bigskip\noindent\textbf{One-time initialization.}\par
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-async-once}{\categoryprocedure}{(make-async-once)}
+\returns a new async once object
+\listlibraries
+\endentryheader
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-once?}{\categoryprocedure}{(async-once? \var{obj})}
+\returns \scheme{#t} if \var{obj} is an async once object, \scheme{#f} otherwise
+\listlibraries
+\endentryheader
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-once-run!}{\categoryprocedure}{(async-once-run! \var{once} \var{thunk})}
+\returns unspecified
+\listlibraries
+\endentryheader
+
+Exactly one caller invokes \var{thunk}; concurrent callers suspend until that
+invocation finishes.  The once object becomes done after either a normal
+return or an exception, including cancellation.  The executing caller receives
+the exception, while other and later callers return normally without retrying
+\var{thunk}.  Values from \var{thunk} are discarded.  Recursive use by the
+executing task is an error.
+
+\bigskip\noindent\textbf{Condition variables.}\par
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{make-async-condition}{\categoryprocedure}{(make-async-condition \var{mutex})}
+\returns a new async condition variable
+\listlibraries
+\endentryheader
+
+\var{mutex} must be an async mutex or an async read/write mutex.  A read/write
+mutex is used in write mode.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-condition?}{\categoryprocedure}{(async-condition? \var{obj})}
+\returns \scheme{#t} if \var{obj} is an async condition variable, \scheme{#f} otherwise
+\listlibraries
+\endentryheader
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-condition-mutex}{\categoryprocedure}{(async-condition-mutex \var{condition})}
+\returns the mutex associated with \var{condition}
+\listlibraries
+\endentryheader
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-condition-wait}{\categoryprocedure}{(async-condition-wait \var{condition})}
+\returns unspecified
+\listlibraries
+\endentryheader
+
+The current task must own the associated mutex.  Waiting registers the task,
+releases the mutex, suspends, and reacquires the mutex before returning.
+Cancellation also reacquires the mutex before raising its condition.  Since a
+notification carries no state, callers test their shared predicate in a loop.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{async-condition-signal!}{\categoryprocedure}{(async-condition-signal! \var{condition})}
+\formdef{async-condition-broadcast!}{\categoryprocedure}{(async-condition-broadcast! \var{condition})}
+\returns unspecified
+\listlibraries
+\endentryheader
+
+The signal procedure wakes the first live FIFO waiter.  The broadcast
+procedure wakes all registered waiters.  Both procedures are thread-safe and
+do not require ownership of the associated mutex.
+
+The following example combines a wait group, one-time initialization, and a
+condition variable.  The predicate loop remains necessary even when every
+state update is protected by the mutex.
+
+\schemedisplay
+(run-async
+  (lambda ()
+    (let* ([mutex (make-async-mutex)]
+           [ready (make-async-condition mutex)]
+           [done (make-async-wait-group 2)]
+           [once (make-async-once)]
+           [value #f])
+      (do ([i 0 (+ i 1)]) ((= i 2))
+        (spawn-task
+          (lambda ()
+            (async-once-run! once
+              (lambda ()
+                (call-with-async-mutex mutex
+                  (lambda ()
+                    (set! value 42)
+                    (async-condition-broadcast! ready)))))
+            (async-wait-group-done! done))))
+      (call-with-async-mutex mutex
+        (lambda ()
+          (let loop ()
+            (unless value
+              (async-condition-wait ready)
+              (loop)))))
+      (async-wait-group-wait done)
+      value))) ;=> 42
 \endschemedisplay
 
 
@@ -980,14 +1208,29 @@ does not close the channel or cancel its producer.
 %----------------------------------------------------------------------------
 \entryheader
 \formdef{with-async-mutex}{\categorysyntax}{(with-async-mutex \var{mutex-expr} \var{body_1} \var{body_2} \dots)}
+\formdef{with-async-rw-mutex}{\categorysyntax}{(with-async-rw-mutex \var{mutex-expr} \var{body_1} \var{body_2} \dots)}
+\formdef{with-async-read-mutex}{\categorysyntax}{(with-async-read-mutex \var{mutex-expr} \var{body_1} \var{body_2} \dots)}
 \returns the values produced by the body
 \listlibraries
 \endentryheader
 
 The \var{mutex-expr} expression is evaluated once.  The body runs through
-\scheme{call-with-async-mutex}.  The mutex is released after a normal return
-or an exception, including cancellation, and remains owned across asynchronous
-suspension and timed preemption.
+the corresponding scoped synchronization procedure.  The first two forms use
+exclusive mode, while \scheme{with-async-read-mutex} uses read mode.  The mode
+is released after a normal return or an exception, including cancellation,
+and remains owned across asynchronous suspension and timed preemption.
+
+%----------------------------------------------------------------------------
+\entryheader
+\formdef{with-async-wait-group}{\categorysyntax}{(with-async-wait-group \var{group-expr} \var{body_1} \var{body_2} \dots)}
+\returns a new task
+\listlibraries
+\endentryheader
+
+The form evaluates \var{group-expr} once, adds one in the calling task, and
+spawns a migratable child for its body.  The child calls
+\scheme{async-wait-group-done!} whenever it terminates.  The addition is
+visible before the task is published, so the caller may wait immediately.
 
 The following examples provide a quick reference for the syntax library.
 The task forms accept the same option names as their procedural counterparts
@@ -1033,6 +1276,36 @@ blocking a scheduler thread.  The body may suspend while retaining ownership:
              '(10 20 12))])
       (for-each (lambda (worker) (await worker)) workers)
       total))) ;=> 42
+\endschemedisplay
+
+Read and write scopes compose with the same task forms.  A queued writer takes
+priority over readers that have not already acquired read mode:
+
+\schemedisplay
+(async/options ([parallelism 2])
+  (let ([rw (make-async-rw-mutex)] [items '()])
+    (let ([writer
+           (go
+             (with-async-rw-mutex rw
+               ;; Exclusive access protects the update.
+               (set! items (cons 'ready items))))])
+      (await writer)
+      (with-async-read-mutex rw
+        ;; Multiple readers may inspect the protected state concurrently.
+        items)))) ;=> (ready)
+\endschemedisplay
+
+The wait-group form publishes membership before spawning its child, so the
+caller can wait without first yielding to the scheduler:
+
+\schemedisplay
+(async
+  (let ([done (make-async-wait-group)] [value #f])
+    (with-async-wait-group done
+      ;; done! runs when this child returns, raises, or is canceled.
+      (set! value 42))
+    (async-wait-group-wait done)
+    value)) ;=> 42
 \endschemedisplay
 
 \scheme{select} supports general operations as well as channel and timer

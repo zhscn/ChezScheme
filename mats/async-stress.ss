@@ -186,6 +186,83 @@
              'parallelism 4)])
       (check (fx= value 200) 'async-mutex iteration value))))
 
+(define stress-sync-primitives
+  (lambda (iteration)
+    (let ([value
+           (run-async
+             (lambda ()
+               (let ([rw-mutex (make-async-rw-mutex)]
+                     [once (make-async-once)]
+                     [workers-done (make-async-wait-group)]
+                     [once-count 0]
+                     [counter 0]
+                     [scoped-finished? #f]
+                     [workers '()])
+                 (do ([i 0 (fx+ i 1)]) ((fx= i 12))
+                   (set! workers
+                     (cons
+                       (spawn-task/async-wait-group workers-done
+                         (lambda ()
+                           (async-once-run! once
+                             (lambda ()
+                               (task-yield)
+                               (set! once-count (fx+ once-count 1))))
+                           (call-with-async-rw-mutex rw-mutex
+                             (lambda ()
+                               (let ([old counter])
+                                 (task-yield)
+                                 (set! counter (fx+ old 1)))))
+                           (call-with-async-read-mutex rw-mutex
+                             (lambda () counter)))
+                         'migratable? #t)
+                       workers)))
+                 (async-wait-group-wait workers-done)
+                 (for-each task-join workers)
+                 (spawn-task/async-wait-group workers-done
+                   (lambda ()
+                     (task-join
+                       (spawn-task (lambda () (void)) 'migratable? #t))
+                     (async-sleep 0.001)
+                     (set! scoped-finished? #t))
+                   'migratable? #t)
+                 (async-wait-group-wait workers-done)
+                 (let ([canceled
+                        (spawn-task/async-wait-group workers-done
+                          (lambda () (set! scoped-finished? 'unexpected))
+                          'migratable? #t)])
+                   (task-cancel! canceled 'before-start)
+                   (guard (c [else (void)]) (task-join canceled))
+                   (async-wait-group-wait workers-done))
+                 (let* ([mutex (make-async-mutex)]
+                        [condition (make-async-condition mutex)]
+                        [waiters-ready (make-async-wait-group 4)]
+                        [ready? #f]
+                        [waiters
+                         (map
+                           (lambda (id)
+                             (spawn-task
+                               (lambda ()
+                                 (call-with-async-mutex mutex
+                                   (lambda ()
+                                     (async-wait-group-done! waiters-ready)
+                                     (let loop ()
+                                       (unless ready?
+                                         (async-condition-wait condition)
+                                         (loop)))
+                                     id)))
+                               'migratable? #t))
+                           '(a b c d))])
+                   (async-wait-group-wait waiters-ready)
+                   (call-with-async-mutex mutex
+                     (lambda ()
+                       (set! ready? #t)
+                       (async-condition-broadcast! condition)))
+                   (list once-count counter scoped-finished?
+                     (map task-join waiters)))))
+             'parallelism 4)])
+      (check (equal? value '(1 12 #t (a b c d)))
+        'sync-primitives iteration value))))
+
 (define stress-channel-close-race
   (lambda (iteration)
     (let ([value
@@ -331,6 +408,9 @@
     (when (stress-scenario? "mutex")
       (atomic-box-set! stress-location (list i 'async-mutex))
       (stress-async-mutex i))
+    (when (stress-scenario? "sync")
+      (atomic-box-set! stress-location (list i 'sync-primitives))
+      (stress-sync-primitives i))
     (when (and stress-io? (stress-scenario? "io"))
       (atomic-box-set! stress-location (list i 'file-owner-routing))
       (stress-file-owner-routing i))

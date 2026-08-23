@@ -143,6 +143,10 @@
 (define $async-context-override
   (make-thread-parameter #f))
 
+;;; Initialized after the public task procedures are assembled.  The internal
+;;; entry accepts non-inherited termination actions for scoped task creation.
+(define async-spawn-task #f)
+
 ;;; -------------------------------------------------------- sync states
 ;;;
 ;;; A sync state owns an atomic state box holding one of:
@@ -308,7 +312,7 @@
   (fields (immutable context)))
 
 (define-record-type (async-task make-async-task $async-task?)
-  (nongenerative async-task-layer8)
+  (nongenerative async-task-layer9)
   (sealed #t)
   (fields
     (immutable id)
@@ -339,7 +343,8 @@
     (mutable payload)               ; pending delivery for a ready task
     (mutable sync-state)            ; box of the current wait, or #f
     (mutable cancel-shield?)        ; #t in shielded internal waits
-    (mutable owned-mutexes)         ; async mutexes released at termination
+    (mutable termination-actions)   ; trusted hooks run exactly at termination
+    (mutable owned-mutexes)         ; async locks released at termination
     (immutable mutex)))
 
 (define-record-type (async-task-group make-async-task-group% $async-task-group?)
@@ -392,6 +397,40 @@
     (immutable mutex)
     (mutable owner)                 ; task or #f
     (mutable waiters)))             ; FIFO list of (task ss . deliver)
+
+(define-record-type (async-rw-mutex make-async-rw-mutex% $async-rw-mutex?)
+  (nongenerative)
+  (sealed #t)
+  (fields
+    (immutable mutex)
+    (mutable writer)                ; task or #f
+    (immutable readers)             ; task -> recursive read count
+    (mutable waiters)))             ; FIFO vectors: mode task ss deliver
+
+(define-record-type (async-wait-group make-async-wait-group% $async-wait-group?)
+  (nongenerative)
+  (sealed #t)
+  (fields
+    (immutable mutex)
+    (mutable count)
+    (mutable waiters)))             ; list of (ss . deliver)
+
+(define-record-type (async-once make-async-once% $async-once?)
+  (nongenerative)
+  (sealed #t)
+  (fields
+    (immutable mutex)
+    (mutable state)                 ; pending | running | done
+    (mutable owner)                 ; task while running
+    (mutable waiters)))             ; list of (ss . deliver)
+
+(define-record-type (async-condition make-async-condition% $async-condition?)
+  (nongenerative)
+  (sealed #t)
+  (fields
+    (immutable mutex async-condition-guard)
+    (immutable lock)                ; async mutex or async rw mutex
+    (mutable waiters)))             ; FIFO list of (ss . deliver)
 
 
 
@@ -1318,14 +1357,16 @@
 
 (define async-task-add-owned-mutex!
   (lambda (task mutex)
-    (unless (memq mutex (async-task-owned-mutexes task))
-      (async-task-owned-mutexes-set! task
-        (cons mutex (async-task-owned-mutexes task))))))
+    (with-async-mutex (async-task-mutex task)
+      (unless (memq mutex (async-task-owned-mutexes task))
+        (async-task-owned-mutexes-set! task
+          (cons mutex (async-task-owned-mutexes task)))))))
 
 (define async-task-remove-owned-mutex!
   (lambda (task mutex)
-    (async-task-owned-mutexes-set! task
-      (remq mutex (async-task-owned-mutexes task)))))
+    (with-async-mutex (async-task-mutex task)
+      (async-task-owned-mutexes-set! task
+        (remq mutex (async-task-owned-mutexes task))))))
 
 ;;; Ownership is published before a waiter can resume on another scheduler.
 (define async-mutex-handoff!
@@ -1405,6 +1446,338 @@
                 (async-fiber-mutex-waiters mutex)))))))))
 
 
+;;; ----------------------------------------------------------- read/write mutexes
+
+(define async-rw-mutex-prune!
+  (lambda (mutex)
+    (async-rw-mutex-waiters-set! mutex
+      (filter
+        (lambda (waiter)
+          (async-sync-state-live? (vector-ref waiter 2)))
+        (async-rw-mutex-waiters mutex)))))
+
+(define async-rw-mutex-reader-count
+  (lambda (mutex task)
+    (hashtable-ref (async-rw-mutex-readers mutex) task 0)))
+
+(define async-rw-mutex-add-reader!
+  (lambda (mutex task)
+    (let ([readers (async-rw-mutex-readers mutex)])
+      (hashtable-set! readers task
+        (fx+ 1 (hashtable-ref readers task 0)))
+      (async-task-add-owned-mutex! task mutex))))
+
+(define async-rw-mutex-remove-reader!
+  (lambda (mutex task)
+    (let* ([readers (async-rw-mutex-readers mutex)]
+           [count (hashtable-ref readers task 0)])
+      (cond
+        [(fx= count 0) #f]
+        [(fx= count 1)
+         (hashtable-delete! readers task)
+         (async-task-remove-owned-mutex! task mutex)
+         #t]
+        [else
+         (hashtable-set! readers task (fx- count 1))
+         #t]))))
+
+(define async-rw-mutex-idle?
+  (lambda (mutex)
+    (and (not (async-rw-mutex-writer mutex))
+         (fx= (hashtable-size (async-rw-mutex-readers mutex)) 0))))
+
+;;; Grant either the first writer or the consecutive reader prefix.  The
+;;; state is installed before delivery so resumed tasks observe ownership.
+(define async-rw-mutex-handoff!
+  (lambda (mutex)
+    (let writer-loop ((waiters (async-rw-mutex-waiters mutex)))
+      (cond
+        ((null? waiters)
+         (async-rw-mutex-waiters-set! mutex '()))
+        (else
+         (let ([waiter (car waiters)])
+           (if (not (async-sync-state-live? (vector-ref waiter 2)))
+               (begin
+                 (async-rw-mutex-waiters-set! mutex (cdr waiters))
+                 (writer-loop (cdr waiters)))
+               (case (vector-ref waiter 0)
+                 ((write)
+                  (let ([task (vector-ref waiter 1)]
+                        [deliver (vector-ref waiter 3)]
+                        [rest (cdr waiters)])
+                    (async-rw-mutex-waiters-set! mutex rest)
+                    (async-rw-mutex-writer-set! mutex task)
+                    (async-task-add-owned-mutex! task mutex)
+                    (unless (deliver (cons 'values '()))
+                      (async-task-remove-owned-mutex! task mutex)
+                      (async-rw-mutex-writer-set! mutex #f)
+                      (writer-loop rest))))
+                 ((read)
+                  (let reader-loop ((pending waiters) (granted? #f))
+                    (cond
+                      ((or (null? pending)
+                           (eq? (vector-ref (car pending) 0) 'write))
+                       (async-rw-mutex-waiters-set! mutex pending)
+                       (unless granted? (writer-loop pending)))
+                      (else
+                       (let* ([reader (car pending)]
+                              [rest (cdr pending)]
+                              [task (vector-ref reader 1)]
+                              [ss (vector-ref reader 2)]
+                              [deliver (vector-ref reader 3)])
+                         (if (async-sync-state-live? ss)
+                             (begin
+                               (async-rw-mutex-add-reader! mutex task)
+                               (if (deliver (cons 'values '()))
+                                   (reader-loop rest #t)
+                                   (begin
+                                     (async-rw-mutex-remove-reader! mutex task)
+                                     (reader-loop rest granted?))))
+                             (reader-loop rest granted?))))))))))))
+      (void))))
+
+(define async-rw-mutex-acquire-operation/raw
+  (lambda (mutex mode)
+    (let ([token (list 'async-rw-mutex-acquire-operation mode)])
+      (make-async-operation
+        (lambda (ss)
+          (let ([task (async-mutex-current-task
+                        (if (eq? mode 'read)
+                            'async-rw-mutex-read-acquire-operation
+                            'async-rw-mutex-acquire-operation))])
+            (async-sync-slot-set! ss token task)
+            (with-async-mutex (async-rw-mutex-mutex mutex)
+              (async-rw-mutex-prune! mutex)
+              (cond
+                [(eq? mode 'read)
+                 (cond
+                   [(eq? (async-rw-mutex-writer mutex) task)
+                    ($oops 'async-rw-mutex-read-acquire-operation
+                      "write owner cannot acquire a read lock")]
+                   [(fx> (async-rw-mutex-reader-count mutex task) 0)
+                    (async-rw-mutex-add-reader! mutex task)
+                    (cons 'values '())]
+                   [(and (not (async-rw-mutex-writer mutex))
+                         (null? (async-rw-mutex-waiters mutex)))
+                    (async-rw-mutex-add-reader! mutex task)
+                    (cons 'values '())]
+                   [else #f])]
+                [else
+                 (cond
+                   [(eq? (async-rw-mutex-writer mutex) task)
+                    ($oops 'async-rw-mutex-acquire-operation
+                      "mutex is not recursive")]
+                   [(fx> (async-rw-mutex-reader-count mutex task) 0)
+                    ($oops 'async-rw-mutex-acquire-operation
+                      "read-to-write upgrade is not supported")]
+                   [(and (async-rw-mutex-idle? mutex)
+                         (null? (async-rw-mutex-waiters mutex)))
+                    (async-rw-mutex-writer-set! mutex task)
+                    (async-task-add-owned-mutex! task mutex)
+                    (cons 'values '())]
+                   [else #f])]))))
+        (lambda (ss deliver)
+          (let ([task (async-sync-slot-ref ss token #f)])
+            (unless task
+              ($oops 'async-rw-mutex-acquire-operation
+                "acquire operation has no current task"))
+            (with-async-mutex (async-rw-mutex-mutex mutex)
+              (async-rw-mutex-prune! mutex)
+              (cond
+                [(and (eq? mode 'read)
+                      (not (async-rw-mutex-writer mutex))
+                      (null? (async-rw-mutex-waiters mutex)))
+                 (async-rw-mutex-add-reader! mutex task)
+                 (unless (deliver (cons 'values '()))
+                   (async-rw-mutex-remove-reader! mutex task)
+                   (when (async-rw-mutex-idle? mutex)
+                     (async-rw-mutex-handoff! mutex)))
+                 #f]
+                [(and (eq? mode 'write)
+                      (async-rw-mutex-idle? mutex)
+                      (null? (async-rw-mutex-waiters mutex)))
+                 (async-rw-mutex-writer-set! mutex task)
+                 (async-task-add-owned-mutex! task mutex)
+                 (unless (deliver (cons 'values '()))
+                   (async-task-remove-owned-mutex! task mutex)
+                   (async-rw-mutex-writer-set! mutex #f)
+                   (async-rw-mutex-handoff! mutex))
+                 #f]
+                [else
+                 (async-rw-mutex-waiters-set! mutex
+                   (append (async-rw-mutex-waiters mutex)
+                     (list (vector mode task ss deliver))))
+                 (list 'async-rw-mutex mode)]))))
+        (lambda (values) values)
+        (lambda (ss)
+          (with-async-mutex (async-rw-mutex-mutex mutex)
+            (async-rw-mutex-waiters-set! mutex
+              (filter
+                (lambda (waiter)
+                  (not (eq? (vector-ref waiter 2) ss)))
+                (async-rw-mutex-waiters mutex)))))))))
+
+
+;;; ------------------------------------------------ wait groups, once, conditions
+
+(define async-wait-group-prune!
+  (lambda (group)
+    (async-wait-group-waiters-set! group
+      (filter
+        (lambda (waiter) (async-sync-state-live? (car waiter)))
+        (async-wait-group-waiters group)))))
+
+(define async-wait-group-wait-operation/raw
+  (lambda (group)
+    (make-async-operation
+      (lambda (ss)
+        (with-async-mutex (async-wait-group-mutex group)
+          (and (= (async-wait-group-count group) 0)
+               (cons 'values '()))))
+      (lambda (ss deliver)
+        (with-async-mutex (async-wait-group-mutex group)
+          (async-wait-group-prune! group)
+          (if (= (async-wait-group-count group) 0)
+              (begin (deliver (cons 'values '())) #f)
+              (begin
+                (async-wait-group-waiters-set! group
+                  (append (async-wait-group-waiters group)
+                    (list (cons ss deliver))))
+                (list 'async-wait-group)))))
+      (lambda (values) values)
+      (lambda (ss)
+        (with-async-mutex (async-wait-group-mutex group)
+          (async-wait-group-waiters-set! group
+            (filter
+              (lambda (waiter) (not (eq? (car waiter) ss)))
+              (async-wait-group-waiters group))))))))
+
+(define async-once-wait-operation
+  (lambda (once)
+    (make-async-operation
+      (lambda (ss)
+        (with-async-mutex (async-once-mutex once)
+          (and (eq? (async-once-state once) 'done)
+               (cons 'values '()))))
+      (lambda (ss deliver)
+        (with-async-mutex (async-once-mutex once)
+          (if (eq? (async-once-state once) 'done)
+              (begin (deliver (cons 'values '())) #f)
+              (begin
+                (async-once-waiters-set! once
+                  (append (async-once-waiters once)
+                    (list (cons ss deliver))))
+                (list 'async-once)))))
+      (lambda (values) values)
+      (lambda (ss)
+        (with-async-mutex (async-once-mutex once)
+          (async-once-waiters-set! once
+            (filter
+              (lambda (waiter) (not (eq? (car waiter) ss)))
+              (async-once-waiters once))))))))
+
+(define async-lock-owned-by?
+  (lambda (lock task)
+    (cond
+      [($async-mutex? lock)
+       (with-async-mutex (async-fiber-mutex-mutex lock)
+         (eq? (async-fiber-mutex-owner lock) task))]
+      [($async-rw-mutex? lock)
+       (with-async-mutex (async-rw-mutex-mutex lock)
+         (eq? (async-rw-mutex-writer lock) task))]
+      [else #f])))
+
+(define async-lock-release!
+  (lambda (lock)
+    (if ($async-mutex? lock)
+        (async-mutex-release! lock)
+        (async-rw-mutex-release! lock))))
+
+(define async-lock-acquire!
+  (lambda (lock)
+    (if ($async-mutex? lock)
+        (async-mutex-acquire lock)
+        (async-rw-mutex-acquire lock))))
+
+(define async-condition-wait-operation
+  (lambda (condition lock task released-box)
+    (make-async-operation
+      (lambda (ss) #f)
+      (lambda (ss deliver)
+        (with-async-mutex (async-condition-guard condition)
+          (let ([shielded-deliver
+                 (lambda (payload)
+                   ;; Publish the shield before making the task runnable, so
+                   ;; cancellation cannot overtake lock reacquisition.
+                   (async-task-cancel-shield?-set! task #t)
+                   (deliver payload))])
+            (async-condition-waiters-set! condition
+              (append (async-condition-waiters condition)
+                (list (cons ss shielded-deliver)))))
+          ;; Registration precedes unlock. A conventional signaler that owns
+          ;; the same lock cannot pass this point early and lose the wakeup.
+          (async-lock-release! lock)
+          (set-box! released-box #t)
+          (list 'async-condition)))
+      (lambda (values) values)
+      (lambda (ss)
+        (with-async-mutex (async-condition-guard condition)
+          (async-condition-waiters-set! condition
+            (filter
+              (lambda (waiter) (not (eq? (car waiter) ss)))
+              (async-condition-waiters condition)))
+          ;; The only chooser around this private operation is the current
+          ;; cancellation context. Shield before its cancellation payload can
+          ;; resume the task.
+          (when (unbox released-box)
+            (async-task-cancel-shield?-set! task #t)))))))
+
+(define async-release-task-lock!
+  (lambda (lock task)
+    (cond
+      [($async-mutex? lock)
+       (with-async-mutex (async-fiber-mutex-mutex lock)
+         (when (eq? (async-fiber-mutex-owner lock) task)
+           (async-task-remove-owned-mutex! task lock)
+           (async-fiber-mutex-owner-set! lock #f)
+           (async-mutex-handoff! lock)))]
+      [($async-rw-mutex? lock)
+       (with-async-mutex (async-rw-mutex-mutex lock)
+         (when (eq? (async-rw-mutex-writer lock) task)
+           (async-rw-mutex-writer-set! lock #f))
+         (when (fx> (async-rw-mutex-reader-count lock task) 0)
+           (hashtable-delete! (async-rw-mutex-readers lock) task))
+         (async-task-remove-owned-mutex! task lock)
+         (when (async-rw-mutex-idle? lock)
+           (async-rw-mutex-handoff! lock)))]
+      [else (void)])))
+
+(define async-call-with-rw-lock
+  (lambda (mutex thunk read?)
+    (unless ($async-rw-mutex? mutex)
+      ($oops (if read? 'call-with-async-read-mutex
+                 'call-with-async-rw-mutex)
+        "~s is not an async rw mutex" mutex))
+    (unless (procedure? thunk)
+      ($oops (if read? 'call-with-async-read-mutex
+                 'call-with-async-rw-mutex)
+        "~s is not a procedure" thunk))
+    ((if read? async-rw-mutex-read-acquire async-rw-mutex-acquire) mutex)
+    (let ([released? #f])
+      (define release!
+        (lambda ()
+          (unless released?
+            (set! released? #t)
+            ((if read? async-rw-mutex-read-release!
+                 async-rw-mutex-release!) mutex))))
+      (guard (condition
+               [else (release!) (raise condition)])
+        (call-with-values thunk
+          (lambda result*
+            (release!)
+            (apply values result*)))))))
+
+
 ;;; ---------------------------------------------------------------- channels
 
 
@@ -1481,7 +1854,8 @@
 ;;; ------------------------------------------------------------------- tasks
 
 (define async-make-task
-  (lambda (sched name parent-group parent-context migratable? entry)
+  (lambda (sched name parent-group parent-context migratable?
+           termination-actions entry)
     (let* ([group ($async-scheduler-group sched)]
            [id (with-async-mutex (async-scheduler-group-mutex group)
                  (let ([id (async-scheduler-group-next-task-id group)])
@@ -1492,7 +1866,8 @@
           (async-scheduler-active-dynamic-version sched))
         (current-exception-state)
         parent-group (async-make-context parent-context) #f '() #f '() #f #f
-        #f #f #f #f #f #f '() (make-async-os-mutex)))))
+        #f #f #f #f #f #f termination-actions '()
+        (make-async-os-mutex)))))
 
 (define ensure-child-group
   (lambda (task)
@@ -1550,14 +1925,18 @@
     ;; A task can be canceled after an acquisition has won but before its
     ;; continuation observes the result.  Termination is the final ownership
     ;; backstop for both that race and unscoped acquisitions.
-    (for-each
-      (lambda (mutex)
-        (with-async-mutex (async-fiber-mutex-mutex mutex)
-          (when (eq? (async-fiber-mutex-owner mutex) task)
-            (async-task-remove-owned-mutex! task mutex)
-            (async-fiber-mutex-owner-set! mutex #f)
-            (async-mutex-handoff! mutex))))
-      (async-task-owned-mutexes task))
+    (let ([owned-locks
+           (with-async-mutex (async-task-mutex task)
+             (async-task-owned-mutexes task))])
+      (for-each
+        (lambda (lock) (async-release-task-lock! lock task))
+        owned-locks))
+    ;; Completion actions are installed before task publication, so they also
+    ;; run for a task canceled before its entry thunk starts. Lock cleanup
+    ;; precedes wakeup of completion observers.
+    (let ([actions (async-task-termination-actions task)])
+      (async-task-termination-actions-set! task '())
+      (for-each (lambda (action) (action)) actions))
     (let ([join-waiters
            (with-async-mutex (async-task-mutex task)
              (async-task-state-set! task state)
@@ -2144,6 +2523,14 @@
 
 (set! async-mutex? $async-mutex?)
 
+(set! async-rw-mutex? $async-rw-mutex?)
+
+(set! async-wait-group? $async-wait-group?)
+
+(set! async-once? $async-once?)
+
+(set! async-condition? $async-condition?)
+
 (set! task-id
   (lambda (task)
     (unless (task? task) ($oops 'task-id "~s is not a task" task))
@@ -2241,6 +2628,280 @@
           (lambda result*
             (release!)
             (apply values result*)))))))
+
+(set-who! make-async-rw-mutex
+  (lambda ()
+    (make-async-rw-mutex% (make-async-os-mutex)
+      #f (make-eq-hashtable) '())))
+
+(set-who! async-rw-mutex-acquire-operation
+  (lambda (mutex)
+    (unless (async-rw-mutex? mutex)
+      ($oops who "~s is not an async rw mutex" mutex))
+    (async-rw-mutex-acquire-operation/raw mutex 'write)))
+
+(set-who! async-rw-mutex-read-acquire-operation
+  (lambda (mutex)
+    (unless (async-rw-mutex? mutex)
+      ($oops who "~s is not an async rw mutex" mutex))
+    (async-rw-mutex-acquire-operation/raw mutex 'read)))
+
+(set-who! async-rw-mutex-acquire
+  (lambda (mutex)
+    (unless (async-rw-mutex? mutex)
+      ($oops who "~s is not an async rw mutex" mutex))
+    (perform-operation (async-rw-mutex-acquire-operation/raw mutex 'write))))
+
+(set-who! async-rw-mutex-read-acquire
+  (lambda (mutex)
+    (unless (async-rw-mutex? mutex)
+      ($oops who "~s is not an async rw mutex" mutex))
+    (perform-operation (async-rw-mutex-acquire-operation/raw mutex 'read))))
+
+(set-who! async-rw-mutex-release!
+  (lambda (mutex)
+    (unless (async-rw-mutex? mutex)
+      ($oops who "~s is not an async rw mutex" mutex))
+    (let ([task (async-mutex-current-task who)])
+      (with-async-mutex (async-rw-mutex-mutex mutex)
+        (unless (eq? (async-rw-mutex-writer mutex) task)
+          ($oops who "current task does not own the write lock"))
+        (async-rw-mutex-writer-set! mutex #f)
+        (async-task-remove-owned-mutex! task mutex)
+        (async-rw-mutex-handoff! mutex)))
+    (void)))
+
+(set-who! async-rw-mutex-read-release!
+  (lambda (mutex)
+    (unless (async-rw-mutex? mutex)
+      ($oops who "~s is not an async rw mutex" mutex))
+    (let ([task (async-mutex-current-task who)])
+      (with-async-mutex (async-rw-mutex-mutex mutex)
+        (unless (async-rw-mutex-remove-reader! mutex task)
+          ($oops who "current task does not own a read lock"))
+        (when (async-rw-mutex-idle? mutex)
+          (async-rw-mutex-handoff! mutex))))
+    (void)))
+
+(set-who! call-with-async-rw-mutex
+  (lambda (mutex thunk) (async-call-with-rw-lock mutex thunk #f)))
+
+(set-who! call-with-async-read-mutex
+  (lambda (mutex thunk) (async-call-with-rw-lock mutex thunk #t)))
+
+(set-who! make-async-wait-group
+  (case-lambda
+    [() (make-async-wait-group 0)]
+    [(count)
+     (unless (and (integer? count) (exact? count) (>= count 0))
+       ($oops who "~s is not a nonnegative exact integer" count))
+     (make-async-wait-group% (make-async-os-mutex) count '())]))
+
+(set-who! async-wait-group-add!
+  (lambda (group delta)
+    (unless (async-wait-group? group)
+      ($oops who "~s is not an async wait group" group))
+    (unless (and (integer? delta) (exact? delta))
+      ($oops who "~s is not an exact integer" delta))
+    (let ([waiters
+           (with-async-mutex (async-wait-group-mutex group)
+             (let ([count (+ (async-wait-group-count group) delta)])
+               (when (< count 0)
+                 ($oops who "wait group counter would become negative"))
+               (async-wait-group-count-set! group count)
+               (if (= count 0)
+                   (let ([waiters (async-wait-group-waiters group)])
+                     (async-wait-group-waiters-set! group '())
+                     waiters)
+                   '())))])
+      (for-each
+        (lambda (waiter) ((cdr waiter) (cons 'values '())))
+        waiters))
+    (void)))
+
+(set-who! async-wait-group-done!
+  (lambda (group) (async-wait-group-add! group -1)))
+
+(set-who! async-wait-group-wait-operation
+  (lambda (group)
+    (unless (async-wait-group? group)
+      ($oops who "~s is not an async wait group" group))
+    (async-wait-group-wait-operation/raw group)))
+
+(set-who! async-wait-group-wait
+  (lambda (group)
+    (unless (async-wait-group? group)
+      ($oops who "~s is not an async wait group" group))
+    (perform-operation (async-wait-group-wait-operation/raw group))))
+
+(set-who! spawn-task/async-wait-group
+  (lambda (group thunk . options)
+    (unless (async-wait-group? group)
+      ($oops who "~s is not an async wait group" group))
+    (unless (procedure? thunk)
+      ($oops who "~s is not a procedure" thunk))
+    (let* ([parent (async-mutex-current-task who)]
+           [old-shield? (async-task-cancel-shield? parent)]
+           [added? #f]
+           [spawned? #f]
+           [completion-claimed (box #f)])
+      (define finish!
+        (lambda ()
+          (when (box-cas! completion-claimed #f #t)
+            (async-wait-group-done! group))))
+      ;; Add and spawn form one cancellation-safe publication step. Once the
+      ;; child exists, its termination action is the final backstop, including
+      ;; cancellation before the entry thunk starts.
+      (guard (condition
+               [else
+                (async-task-cancel-shield?-set! parent old-shield?)
+                (when (and added? (not spawned?))
+                  (finish!))
+                (raise condition)])
+        (async-task-cancel-shield?-set! parent #t)
+        (async-wait-group-add! group 1)
+        (set! added? #t)
+        (let ([task (async-spawn-task who thunk options (list finish!))])
+          (set! spawned? #t)
+          (async-task-cancel-shield?-set! parent old-shield?)
+          task)))))
+
+(set-who! make-async-once
+  (lambda ()
+    (make-async-once% (make-async-os-mutex) 'pending #f '())))
+
+(set-who! async-once-run!
+  (lambda (once thunk)
+    (unless (async-once? once)
+      ($oops who "~s is not an async once" once))
+    (unless (procedure? thunk)
+      ($oops who "~s is not a procedure" thunk))
+    (let* ([task (async-mutex-current-task who)]
+           [old-shield? (async-task-cancel-shield? task)])
+      ;; Do not let timed preemption inject cancellation after this caller is
+      ;; published as the initializer but before its cleanup guard exists.
+      (async-task-cancel-shield?-set! task #t)
+      (guard (condition
+               [else
+                (async-task-cancel-shield?-set! task old-shield?)
+                (raise condition)])
+        (let ([action
+               (with-async-mutex (async-once-mutex once)
+                 (case (async-once-state once)
+                   [(pending)
+                    (async-once-state-set! once 'running)
+                    (async-once-owner-set! once task)
+                    'run]
+                   [(done) 'done]
+                   [else
+                    (if (eq? (async-once-owner once) task)
+                        ($oops who "recursive async once invocation")
+                        'wait)]))])
+          (case action
+            [(done)
+             (async-task-cancel-shield?-set! task old-shield?)
+             (void)]
+            [(wait)
+             (async-task-cancel-shield?-set! task old-shield?)
+             (perform-operation (async-once-wait-operation once))
+             (void)]
+            [else
+             (letrec ([finish!
+                       (lambda ()
+                         (let ([waiters
+                                (with-async-mutex (async-once-mutex once)
+                                  (async-once-state-set! once 'done)
+                                  (async-once-owner-set! once #f)
+                                  (let ([waiters (async-once-waiters once)])
+                                    (async-once-waiters-set! once '())
+                                    waiters))])
+                           (for-each
+                             (lambda (waiter)
+                               ((cdr waiter) (cons 'values '())))
+                             waiters)))])
+               (guard (condition
+                        [else
+                         (async-task-cancel-shield?-set! task #t)
+                         (finish!)
+                         (async-task-cancel-shield?-set! task old-shield?)
+                         (raise condition)])
+                 (async-task-cancel-shield?-set! task old-shield?)
+                 (thunk)
+                 (async-task-cancel-shield?-set! task #t)
+                 (finish!)
+                 (async-task-cancel-shield?-set! task old-shield?)
+                 (void)))]))))))
+
+(set-who! make-async-condition
+  (lambda (lock)
+    (unless (or (async-mutex? lock) (async-rw-mutex? lock))
+      ($oops who "~s is not an async mutex or async rw mutex" lock))
+    (make-async-condition% (make-async-os-mutex) lock '())))
+
+(set! async-condition-mutex
+  (lambda (condition)
+    (unless (async-condition? condition)
+      ($oops 'async-condition-mutex "~s is not an async condition" condition))
+    (async-condition-lock condition)))
+
+(set-who! async-condition-wait
+  (lambda (condition)
+    (unless (async-condition? condition)
+      ($oops who "~s is not an async condition" condition))
+    (let* ([task (async-mutex-current-task who)]
+           [lock (async-condition-lock condition)]
+           [released-box (box #f)]
+           [old-shield? (async-task-cancel-shield? task)])
+      (unless (async-lock-owned-by? lock task)
+        ($oops who "current task does not own the condition mutex"))
+      (letrec ([reacquire!
+                (lambda ()
+                  ;; Delivery or nack publishes this shield before the task is
+                  ;; runnable. Keep it installed until ownership is restored.
+                  (async-task-cancel-shield?-set! task #t)
+                  (async-lock-acquire! lock)
+                  (set-box! released-box #f))])
+        (guard (condition
+                 [else
+                  (when (unbox released-box) (reacquire!))
+                  (async-task-cancel-shield?-set! task old-shield?)
+                  (raise condition)])
+          (perform-operation
+            (async-condition-wait-operation
+              condition lock task released-box))
+          (reacquire!)
+          (async-task-cancel-shield?-set! task old-shield?)
+          (void))))))
+
+(set-who! async-condition-signal!
+  (lambda (condition)
+    (unless (async-condition? condition)
+      ($oops who "~s is not an async condition" condition))
+    (with-async-mutex (async-condition-guard condition)
+      (let loop ([waiters (async-condition-waiters condition)])
+        (cond
+          [(null? waiters)
+           (async-condition-waiters-set! condition '())]
+          [else
+           (let ([waiter (car waiters)])
+             (async-condition-waiters-set! condition (cdr waiters))
+             (unless ((cdr waiter) (cons 'values '()))
+               (loop (cdr waiters))))])))
+    (void)))
+
+(set-who! async-condition-broadcast!
+  (lambda (condition)
+    (unless (async-condition? condition)
+      ($oops who "~s is not an async condition" condition))
+    (let ([waiters
+           (with-async-mutex (async-condition-guard condition)
+             (let ([waiters (async-condition-waiters condition)])
+               (async-condition-waiters-set! condition '())
+               waiters))])
+      (for-each
+        (lambda (waiter) ((cdr waiter) (cons 'values '())))
+        waiters))
+    (void)))
 
 (set-who! make-operation
   (case-lambda
@@ -2631,8 +3292,8 @@
   (lambda (ch)
     (perform-operation (channel-receive-operation ch))))
 
-(set-who! spawn-task
-  (lambda (thunk . options)
+(set! async-spawn-task
+  (lambda (who thunk options termination-actions)
     (unless (procedure? thunk) ($oops who "~s is not a procedure" thunk))
     (let ([name #f] [group #f] [context #f] [migratable? #f])
       (let loop ([opts options])
@@ -2667,6 +3328,7 @@
                       (async-current-context)
                       (async-task-context parent))]
                  [task (async-make-task sched name grp parent-context migratable?
+                         termination-actions
                          (lambda () (run-task-entry thunk)))])
             (when (and group parent)
               ;; propagate cancellation toward explicitly grouped tasks
@@ -2689,6 +3351,10 @@
                   (async-debug-queue-claim! task 'next)
                   (async-queue-push! (async-scheduler-next-queue sched) task)))
             task))))))
+
+(set-who! spawn-task
+  (lambda (thunk . options)
+    (async-spawn-task who thunk options '())))
 
 (set-who! task-join
   (lambda (task)
@@ -2802,7 +3468,7 @@
               (eq? clock 'virtual) group i preemption-ticks)))
         (async-scheduler-group-schedulers-set! group schedulers)
         (let* ([sched (vector-ref schedulers 0)]
-               [root (async-make-task sched #f #f #f #f
+               [root (async-make-task sched #f #f #f #f '()
                        (lambda () (run-task-entry thunk)))]
                [root-group
                 (make-async-group #f (async-task-context root))])
