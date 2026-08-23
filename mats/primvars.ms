@@ -1011,6 +1011,88 @@
   (error? (#3%$native-fiber-adopt 16))
   (error? (#3%$native-fiber-adopt 'debug)))
 
+(mat native-fiber-single-thread-switch
+  (error? (#3%$native-fiber-create values values 0))
+  (error? (#3%$native-fiber-create values values #b101))
+  (error? (#3%$native-fiber-create values values #b010))
+  (error? (#3%$native-fiber-create #f values #b100))
+  (error? (#3%$native-fiber-create values #f #b100))
+  (let* ([scheduler (#3%$current-native-fiber)]
+         [task #f]
+         [unclaimed (#3%$native-fiber-create values values #b100)])
+    (and (not (#3%$native-fiber-try-claim! scheduler))
+         (guard (condition [else #t])
+           (#3%$native-fiber-switch scheduler unclaimed 'invalid)
+           #f)
+         (eq? (#3%$native-fiber-state scheduler) 'running)
+         (eq? (#3%$native-fiber-state unclaimed) 'new)
+         (begin
+           (set! task
+             (#3%$native-fiber-create
+               (lambda ()
+                 (and (#3%$native-fiber-try-claim! scheduler)
+                      (let ([transfer
+                             (#3%$native-fiber-switch task scheduler 'yielded)])
+                        (and (eq? (car transfer) scheduler)
+                             (eq? (cdr transfer) 'resumed)
+                             'result))))
+               (lambda (fiber outcome)
+                 (and (#3%$native-fiber-try-claim! scheduler)
+                      (#3%$native-fiber-finish fiber scheduler outcome)))
+               #b100))
+           #t)
+         (#3%$native-fiber-try-claim! task)
+         (let ([first (#3%$native-fiber-switch scheduler task 'started)])
+           (and (eq? (car first) task)
+                (eq? (cdr first) 'yielded)))
+         (eq? (#3%$native-fiber-state task) 'parked)
+         (#3%$native-fiber-try-claim! task)
+         (let ([second (#3%$native-fiber-switch scheduler task 'resumed)])
+           (and (eq? (car second) task)
+                (equal? (cdr second) '(return . result))))
+         (eq? (#3%$native-fiber-state scheduler) 'running)
+         (eq? (#3%$native-fiber-state task) 'finished)
+         (not (#3%$native-fiber-try-claim! task)))))
+
+(mat native-fiber-deep-ping-pong
+  (let* ([scheduler (#3%$current-native-fiber)]
+         [task #f]
+         [depth 512]
+         [rounds 64]
+         [descend
+          (lambda (base)
+            (let loop ([n depth])
+              (if (fx= n 0)
+                  (let ping ([i 0])
+                    (if (fx= i rounds)
+                        base
+                        (begin
+                          (#3%$native-fiber-try-claim! scheduler)
+                          (#3%$native-fiber-switch task scheduler i)
+                          (ping (fx+ i 1)))))
+                  (fx+ 1 (loop (fx- n 1))))))])
+    (set! task
+      (#3%$native-fiber-create
+        (lambda () (descend 7))
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-finish fiber scheduler outcome))
+        #b100))
+    (#3%$native-fiber-try-claim! task)
+    (let loop ([i 0] [transfer (#3%$native-fiber-switch scheduler task 'start)])
+      (cond
+        [(fx< i rounds)
+         (and (eq? (car transfer) task)
+              (fx= (cdr transfer) i)
+              (#3%$native-fiber-try-claim! task)
+              (loop (fx+ i 1)
+                    (#3%$native-fiber-switch scheduler task i)))]
+        [else
+         (and (eq? (car transfer) task)
+              (equal? (cdr transfer) (cons 'return (fx+ depth 7)))
+              (eq? (#3%$native-fiber-state task) 'finished)
+              (eq? (#3%$native-fiber-state scheduler) 'running))]))))
+
 (when (threaded?)
   (mat native-fiber-thread-state
     (let ([result #f])

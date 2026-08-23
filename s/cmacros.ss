@@ -1579,6 +1579,19 @@
   ([ptr type]
    [ptr data 0]))
 
+;; This layout mirrors the private `native-fiber-record` declared in
+;; prims.ss.  Hand-coded switch entries use these displacements while the
+;; collector continues to treat the object as an ordinary Scheme record.
+(define-primitive-structure-disps native-fiber type-typed-object
+  ([ptr type]
+   [ptr control]
+   [ptr context]
+   [ptr handler-stack]
+   [ptr entry]
+   [ptr on-return]
+   [ptr flags]
+   [ptr id]))
+
 (define-primitive-structure-disps thread type-typed-object
   ([iptr type] [uptr tc]))
 
@@ -2951,6 +2964,10 @@
      (cddddr #f 1 #t #t)
      (dounderflow* #f 2 #f #t)
      (call1cc #f 1 #f #f)
+     ($native-fiber-allocate-descriptor #f 0 #f #f)
+     ($native-fiber-make-context #f 1 #f #f)
+     ($native-fiber-switch-entry #f 1 #f #f)
+     (native-fiber-context #f 0 #f #f)
      (dorest0 #f 0 #f #f)
      (dorest1 #f 0 #f #f)
      (dorest2 #f 0 #f #f)

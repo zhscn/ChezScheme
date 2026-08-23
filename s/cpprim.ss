@@ -3511,7 +3511,7 @@
     (let ()
       (define hand-coded-closure?
         (lambda (name)
-          (not (memq name '(nuate nonprocedure-code error-invoke invoke
+          (not (memq name '(nuate native-fiber-context nonprocedure-code error-invoke invoke
                                   $wrapper-apply wrapper-apply arity-wrapper-apply
                                   popcount-slow cpu-features)))))
       (define-inline 2 $hand-coded
@@ -3996,6 +3996,12 @@
       [(e) (build-libcall #f src sexpr callcc e)])
     (define-inline 3 call/1cc
       [(e) (build-libcall #f src sexpr call1cc e)])
+    (define-inline 3 $native-fiber-allocate-descriptor
+      [() (build-libcall #f src sexpr $native-fiber-allocate-descriptor)])
+    (define-inline 3 $native-fiber-make-context
+      [(e) (build-libcall #f src sexpr $native-fiber-make-context e)])
+    (define-inline 3 $native-fiber-switch-entry
+      [(e) (build-libcall #f src sexpr $native-fiber-switch-entry e)])
     (define-inline 2 $event
       [() (build-libcall #f src sexpr event)])
     (define-inline 2 $event-trap-check
