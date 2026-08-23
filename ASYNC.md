@@ -49,6 +49,10 @@ timers, channel sends and receives, and task joins are operations.
 A **resumption** is a one-shot captured task continuation. Exactly one
 completion, cancellation, or failure path may claim it.
 
+A Scheme continuation captured by application code inside a task belongs to
+that task and is invoked only while that task is running. Task-to-task control
+transfer uses async operations, task joins, channels, or futures.
+
 A **task group** owns a set of child tasks and provides a structured lifetime
 boundary for them.
 
@@ -170,10 +174,10 @@ state
 entry-or-resumption
 scheduler
 affinity
-dynamic-state
 exception-state
 parent-group
 context
+context-override
 child-group
 result-values
 failure-condition
@@ -211,7 +215,7 @@ current task group unless an explicit group is supplied.
 Every task owns a cancellation context. The root task receives an independent
 root context. A spawned task receives a child of its explicit context, its
 explicit task group's context, or the dynamically current context. This
-separates task-local cancellation ownership from caller-supplied shared
+separates task-owned cancellation state from caller-supplied shared
 contexts: canceling one task never cancels a shared parent context.
 
 A task group obeys the following rules:
@@ -470,33 +474,26 @@ point. I/O conditions retain the libuv error code and include the operation,
 handle, and relevant address or path information.
 
 Each spawned task inherits an independent exception state from its parent.
-Internal scheduler prompts are runtime control state rather than part of a
-saved exception state.
+The task stores exception state independently from its cancellation context.
+Internal scheduler prompts remain scheduler control state.
 
 ## Dynamic state
 
-Fiber-local dynamic state is required even when multiple fibers share one
-operating-system thread. A spawned task inherits the values of its parent's
-parameters, while subsequent parameter mutations are isolated between tasks.
+Chez thread parameters retain their native-thread contract. Async task
+switches neither capture nor install the thread-parameter vector. A direct
+thread-parameter assignment inside a task changes the current worker's value
+and is not task state. Application state is passed explicitly through lexical
+bindings, closures, records, channels, and operation values. Lexically scoped
+`parameterize` remains valid across suspension because its continuation
+winders leave and reenter the dynamic extent.
 
-The runtime captures and activates a dynamic-state snapshot that includes
-ordinary dynamic parameter state and thread-parameter values. Thread-parameter
-slot allocation and reuse are published to every live scheduler group before
-the allocator returns, including allocations made by ordinary Scheme threads.
-Snapshot activation preserves the normal interaction between `parameterize`,
-continuation invocation, exception state, and continuation marks.
-
-Scheduler ownership, the currently running task, exception dispatch state,
-and libuv callback state are maintained separately from the task snapshot or
-reinstalled immediately after its activation. Activating a task cannot replace
-these scheduler invariants.
-
-Each task carries a versioned dynamic-state snapshot that is activated before
-the task enters user code. Parameter changes, exception state, and
-continuation marks therefore remain fiber-local when a ready task migrates to
-another scheduler thread. Scheduler ownership and native resource ownership
-are reinstalled from scheduler-controlled state rather than inherited from
-the task snapshot.
+The scheduler saves and restores exception-handler state separately from
+native worker state. Each task also has one dedicated ambient cancellation
+context override used by `call-with-async-context`; it is not a general-purpose
+dynamic binding facility. The currently running task, native resource
+ownership, prompt ownership, preemption state, and libuv callback state live
+in scheduler-owned records or owner-loop data. The receiving worker supplies
+these values when it claims a migratable task.
 
 ## Dynamic winders
 
@@ -583,8 +580,10 @@ Cross-scheduler channels and task joins use atomic queues. Publishing remote
 work wakes the destination loop with `uv_async_send`. Scheduler-local I/O
 registries require no cross-thread mutation.
 
-Parallel execution requires complete fiber-local dynamic-state support.
-Without that support, the scheduler rejects parallelism greater than one.
+Parallel execution activates the task's exception state and resolves the
+dedicated ambient context from the current task record without copying a
+thread-parameter vector. Other dynamic extents are carried by the task
+continuation.
 
 ## Timed preemption
 
@@ -614,9 +613,10 @@ extent is rearmed without capturing a partially owned prompt stack.
 
 An async scheduler cannot be entered from an active engine, and an engine
 cannot be invoked from an async task. Engine control state and timer ownership
-are runtime-thread-local and are not included in the fiber-local dynamic-state
-contract. A task running under a preemptive scheduler cannot invoke a nested
-scheduler because the outer task owns that thread's timer until its turn ends.
+remain attached to the operating-system thread and are outside async
+task state. A task running under a preemptive scheduler cannot invoke a
+nested scheduler because the outer task owns that thread's timer until its
+turn ends.
 
 Preemption is enabled per `run-async` invocation with a `preemption-ticks`
 value of at least 1000. The lower bound leaves enough runtime instructions for
@@ -697,7 +697,7 @@ Required test classes include:
 - multiple joiners and exception propagation;
 - parent, descendant, deadline, and cross-thread context cancellation;
 - cleanup through async-aware dynamic winders;
-- parameter and exception-state isolation;
+- ambient-context and exception-state isolation;
 - handle close while reads and writes are pending;
 - descriptor reuse after close;
 - remote submission and loop wakeup;
@@ -715,7 +715,8 @@ The implementation is organized into these capability layers:
 
 1. A single-thread cooperative scheduler with private prompts,
    one-shot resumptions, joining, cancellation, and deterministic tests.
-2. Fiber-local dynamic-state capture and activation.
+2. Explicit task exception-state activation and dedicated ambient-context
+   state.
 3. The operation protocol, timers, futures, closeable channels, choice, and
    hierarchical cancellation contexts.
 4. The libuv shim, async streams, name resolution, filesystem requests, and

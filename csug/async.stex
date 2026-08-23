@@ -282,7 +282,6 @@ exception unwinding, and cancellation cleanup.  Unlike standard
 scheduler task switches (such as task suspension, resumption, cooperative
 yielding, or preemption).
 
-
 \section{Task Groups\label{SECTASYNCTASKGROUPS}}
 
 \index{task groups}%
@@ -481,12 +480,15 @@ cancellation condition carrying the context's cancellation reason is raised.
 \listlibraries
 \endentryheader
 
-\scheme{current-async-context} returns the ambient fiber-local cancellation
+\scheme{current-async-context} returns the current task's ambient cancellation
 context, or \scheme{#f} if none is active.
 \scheme{call-with-async-context} installs \var{context} as the ambient
 cancellation context for the dynamic extent of \var{thunk}.  Tasks spawned
 within that extent inherit child contexts of \var{context}, and operations
 performed by the current task are bounded by \var{context}.
+The context carries cancellation and deadline ownership.  Application state
+is passed explicitly through lexical bindings, closures, records, channels,
+and operation values.
 
 %----------------------------------------------------------------------------
 \entryheader

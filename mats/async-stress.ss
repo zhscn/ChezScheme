@@ -43,10 +43,7 @@
 (define stress-scenario?
   (lambda (name)
     (or (string=? stress-scenario "all")
-        (string=? stress-scenario name)
-        (and (string=? stress-scenario "parameter-io")
-             (or (string=? name "parameter")
-                 (string=? name "io"))))))
+        (string=? stress-scenario name))))
 (define stress-done? (box #f))
 (define stress-location (box '(startup)))
 
@@ -80,37 +77,6 @@
     (when stress-trace?
       (printf "async stress: ~s\n" location)
       (flush-output-port (current-output-port)))))
-
-(define stress-parameter-publication
-  (lambda (iteration)
-    (let ([value
-           (run-async
-             (lambda ()
-               (let ([ready (make-future)]
-                     [parameter-box (box #f)]
-                     [readers (make-vector 8)])
-                 (do ([i 0 (fx+ i 1)]) ((fx= i (vector-length readers)))
-                   (vector-set! readers i
-                     (spawn-task
-                       (lambda ()
-                         (future-get ready)
-                         ((unbox parameter-box)))
-                       'migratable? #t)))
-                 (let ([creator
-                        (spawn-task
-                          (lambda ()
-                            (let ([p (make-thread-parameter 'initial)])
-                              (set-box! parameter-box p)
-                              (p 'creator)
-                              (future-fulfil! ready #t)
-                              (task-yield)
-                              (p)))
-                          'migratable? #t)])
-                   (cons (task-join creator)
-                     (vector->list (vector-map task-join readers))))))
-             'parallelism 4)])
-      (check (equal? value (cons 'creator (make-list 8 'initial)))
-        'parameter-publication iteration value))))
 
 (define stress-completion-cancellation
   (lambda (iteration)
@@ -192,27 +158,29 @@
     (let ([value
            (run-async
              (lambda ()
-               (let ([parameter (make-thread-parameter 'root)]
-                     [started (make-future)])
+               (let ([started (make-future)])
                  (let* ([workers
                          (map
                            (lambda (id)
                              (spawn-task
                                (lambda ()
-                                 (parameter id)
-                                 (do ([round 0 (fx+ round 1)])
-                                     ((fx= round 4))
-                                   (let loop ([i 0])
-                                     (unless (fx= i 10000)
-                                       (loop (fx+ i 1))))
-                                   (unless
-                                     (eqv?
-                                       (reset
-                                         (shift/1 k (k (parameter))))
-                                       id)
-                                     (error 'async-stress
-                                       "prompt or parameter corruption")))
-                                 (parameter))
+                                 (let ([context (make-async-context)])
+                                   (call-with-async-context context
+                                     (lambda ()
+                                       (do ([round 0 (fx+ round 1)])
+                                           ((fx= round 4))
+                                         (let loop ([i 0])
+                                           (unless (fx= i 10000)
+                                             (loop (fx+ i 1))))
+                                         (unless
+                                           (eq?
+                                             (reset
+                                               (shift/1 k
+                                                 (k (current-async-context))))
+                                             context)
+                                           (error 'async-stress
+                                             "prompt or context corruption")))
+                                       id))))
                                'migratable? #t))
                            '(0 1 2 3))]
                         [victim
@@ -444,9 +412,6 @@
     (when stress-trace?
       (printf "async stress: starting iteration ~s\n" i)
       (flush-output-port (current-output-port)))
-    (when (stress-scenario? "parameter")
-      (atomic-box-set! stress-location (list i 'parameter-publication))
-      (stress-parameter-publication i))
     (when (stress-scenario? "cancellation")
       (atomic-box-set! stress-location (list i 'completion-cancellation))
       (stress-completion-cancellation i)

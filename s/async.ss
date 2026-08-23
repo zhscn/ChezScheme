@@ -176,18 +176,11 @@
 
 ;;; -------------------------------------------- scheduler-owned storage
 ;;;
-;;; The current scheduler lives in a thread parameter.  It is re-installed
-;;; after every dynamic-state swap so that a task's snapshot can never
-;;; replace scheduler invariants.
+;;; The current scheduler is native-thread-local worker state.  Async task
+;;; switches never capture or install Chez thread parameters.
 
 (define $async-scheduler
   ($make-thread-parameter #f (lambda (x) x)))
-
-;;; A dynamically scoped context override is part of the fiber's saved thread
-;;; parameter state.  Tasks still retain their own immutable context so task
-;;; cancellation never cancels a caller-supplied shared context.
-(define $async-context-override
-  (make-thread-parameter #f))
 
 ;;; Initialized after the public task procedures are assembled.  The internal
 ;;; entry accepts non-inherited termination actions for scoped task creation.
@@ -276,7 +269,7 @@
 ;;; ------------------------------------------------------------ records
 
 (define-record-type (async-scheduler make-async-scheduler% $async-scheduler?)
-  (nongenerative async-scheduler-layer13)
+  (nongenerative async-scheduler-layer14)
   (sealed #t)
   (fields
     (immutable prompt-tag)          ; shared one-shot suspension prompt
@@ -299,8 +292,6 @@
     (mutable timers)                ; sorted list of async-timer
     (mutable current-task)          ; running task or #f
     (mutable in-switch?)            ; #t while unwinding/rewinding a switch
-    (mutable saved-dynamic-state)   ; ambient async-dynamic-state
-    (mutable active-dynamic-version); version installed on the owner thread
     (mutable saved-exception-state) ; ambient exception state
     (mutable turn-count $async-scheduler-turn-count $async-scheduler-turn-count-set!)
     (mutable exec-count)
@@ -322,7 +313,6 @@
     (immutable ready-queue)         ; ready migratable tasks
     (immutable tasks)               ; stable id -> task registry for the group
     (mutable task-count)
-    (immutable parameter-config)    ; atomic box of versioned updates
     (mutable schedulers)
     (mutable root-task)
     (mutable next-task-id)
@@ -357,7 +347,7 @@
   (fields (immutable context)))
 
 (define-record-type (async-task make-async-task $async-task?)
-  (nongenerative async-task-layer11)
+  (nongenerative async-task-layer12)
   (sealed #t)
   (fields
     (immutable id)
@@ -371,10 +361,13 @@
     (mutable wait-scheduler)        ; scheduler that owns the current wait
     (immutable migratable?)
     (mutable suspension-state)      ; #f | unwinding | parking | parked | delivered
-    (mutable dynamic-state)         ; saved async-dynamic-state
-    (mutable exception-state)       ; exception-state record
+    ;; Chez exception-handler state is VM dynamic state.  It is activated
+    ;; separately at scheduler boundaries.
+    (mutable exception-state async-task-exception-state
+                             async-task-exception-state-set!)
     (mutable parent-group)          ; group this task belongs to
     (immutable context)             ; task-owned cancellation context
+    (mutable context-override)      ; dynamically scoped ambient context or #f
     (mutable child-group)           ; group owned by this task, or #f
     (mutable result-values)
     (mutable failure-condition)     ; failure or cancellation condition
@@ -509,96 +502,24 @@
 
 
 
-;;; ------------------------------------------------- dynamic state (fiber-local)
-
-(define-record-type (async-dynamic-state make-async-dynamic-state async-dynamic-state?)
-  (nongenerative)
-  (sealed #t)
-  (fields (immutable parameters) (immutable version)))
-
-(define async-snapshot-dynamic-state
-  (lambda (version)
-    (make-async-dynamic-state
-      (if-feature pthreads
-        (with-tc-mutex
-          (vector-copy ($tc-field 'parameters ($tc))))
-        #f)
-      version)))
-
-(define async-install-dynamic-state/raw!
-  (lambda (state)
-    (if-feature pthreads
-      (let ([snap (async-dynamic-state-parameters state)])
-        (when snap
-          (let ([cur ($tc-field 'parameters ($tc))])
-            (if (fx< (vector-length cur) (vector-length snap))
-                ($tc-field 'parameters ($tc) (vector-copy snap))
-                (do ([i 0 (fx+ i 1)])
-                    ((fx= i (vector-length snap)))
-                  (vector-set! cur i (vector-ref snap i)))))))
-      (void))))
-
-(define async-extend-parameter-vector
-  (lambda (parameters size)
-    (if (or (not parameters) (fx>= (vector-length parameters) size))
-        parameters
-        (let ([new (make-vector size #f)])
-          (do ([i 0 (fx+ i 1)]) ((fx= i (vector-length parameters)))
-            (vector-set! new i (vector-ref parameters i)))
-          new))))
-
-(define async-parameter-config-ref
-  (lambda (group)
-    (let ([config-box (async-scheduler-group-parameter-config group)])
-      (let loop ()
-        (let ([config (unbox config-box)])
-          (if (box-cas! config-box config config)
-              config
-              (loop)))))))
-
-;;; Thread-parameter slots are allocated and reused process-wide.  Keep the
-;;; update logs of all live scheduler groups registered under the same runtime
-;;; mutex used by the slot allocator, so a publication cannot miss a group
-;;; whose fibers already have saved parameter vectors.
-(define async-parameter-configs (box '()))
-
-(define async-register-parameter-config!
-  (lambda ()
-    (let ([config (box (cons 0 '()))])
-      (if-feature pthreads
-        (with-tc-mutex
-          (async-atomic-box-set! async-parameter-configs
-            (cons (weak-cons config #t)
-              (async-atomic-box-ref async-parameter-configs))))
-        (void))
-      config)))
-
-(define async-unregister-parameter-config!
-  (lambda (config)
-    (if-feature pthreads
-      (with-tc-mutex
-        (async-atomic-box-set! async-parameter-configs
-          (filter
-            (lambda (entry)
-              (let ([registered (car entry)])
-                (and (not (bwp-object? registered))
-                     (not (eq? registered config)))))
-            (async-atomic-box-ref async-parameter-configs))))
-      (void))))
-
-(define async-parameter-version
-  (lambda (group)
-    (car (async-parameter-config-ref group))))
+(define async-current-task/required
+  (lambda (who)
+    (let ([sched ($async-scheduler)])
+      (unless (and ($async-scheduler? sched)
+                   (async-scheduler-current-task sched))
+        ($oops who "called outside of an async task"))
+      (async-scheduler-current-task sched))))
 
 ;;; ------------------------------------------------ cancellation contexts
 
 (define async-current-context
   (lambda ()
-    (or ($async-context-override)
-        (let ([sched ($async-scheduler)])
-          (and ($async-scheduler? sched)
-               (let ([task (async-scheduler-current-task sched)])
-                 (and task (async-task-context task))))))))
+    (let ([sched ($async-scheduler)])
+      (and ($async-scheduler? sched)
+           (let ([task (async-scheduler-current-task sched)])
+             (and task
+                  (or (async-task-context-override task)
+                      (async-task-context task))))))))
 
 (define async-context-canceled?/locked
   (lambda (context)
@@ -726,81 +647,6 @@
         (when already-canceled? (cancel)))
       context)))
 
-(define async-apply-parameter-config
-  (lambda (state config)
-    (let ([version (car config)]
-          [old-version (async-dynamic-state-version state)])
-      (let collect ([updates (cdr config)] [pending '()])
-        (if (or (null? updates)
-                (fx<= (car (car updates)) old-version))
-            (let apply ([updates pending]
-                        [parameters (async-dynamic-state-parameters state)])
-              (if (null? updates)
-                  (make-async-dynamic-state parameters version)
-                  (let* ([update (car updates)]
-                         [index (cadr update)]
-                         [initval (caddr update)]
-                         [size (cadddr update)]
-                         [parameters
-                          (async-extend-parameter-vector parameters size)])
-                    (when parameters
-                      (vector-set! parameters index initval))
-                    (apply (cdr updates) parameters))))
-            (collect (cdr updates) (cons (car updates) pending)))))))
-
-(define async-normalize-dynamic-state
-  (lambda (group state)
-    (let ([config (async-parameter-config-ref group)])
-      (if (fx= (car config) (async-dynamic-state-version state))
-          state
-          (async-apply-parameter-config state config)))))
-
-(define async-normalize-and-install-dynamic-state!
-  (lambda (group state)
-    (if-feature pthreads
-      ;; Parameter allocation and parameter-vector access are serialized by
-      ;; the runtime's thread-context mutex.  Configuration publication itself
-      ;; is atomic and never takes a Scheme mutex while this mutex is held.
-      (with-tc-mutex
-        (let ([state (async-normalize-dynamic-state group state)])
-          (async-install-dynamic-state/raw! state)
-          state))
-      state)))
-
-;;; Parameter updates are published as immutable versioned entries.  A saved
-;;; fiber applies missed entries when it is next installed, including entries
-;;; for reused slots.
-(define async-new-thread-parameter
-  (lambda (index initval size)
-    ;; This hook runs inside the runtime's thread-context mutex, after the new
-    ;; slot has been initialized in every live thread context.  Registration
-    ;; and removal of group logs use that mutex as well.
-    (let loop ([entries (async-atomic-box-ref async-parameter-configs)]
-               [live '()])
-      (if (null? entries)
-          (async-atomic-box-set! async-parameter-configs (reverse live))
-          (let* ([entry (car entries)]
-                 [config-box (car entry)])
-            (if (bwp-object? config-box)
-                (loop (cdr entries) live)
-                (let* ([config (async-atomic-box-ref config-box)]
-                       [version (fx+ 1 (car config))]
-                       [next
-                        (cons version
-                          (cons (list version index initval size)
-                            (cdr config)))])
-                  (unless (box-cas! config-box config next)
-                    ($oops 'make-thread-parameter
-                      "concurrent parameter publication under the thread-context mutex"))
-                  (loop (cdr entries) (cons entry live)))))))
-    ;; The allocating thread already contains the initialized slot.  Mark its
-    ;; scheduler view current; the next task snapshot takes the group version
-    ;; directly and preserves any mutation made after this allocation.
-    (let ([sched ($async-scheduler)])
-      (when ($async-scheduler? sched)
-        (async-scheduler-active-dynamic-version-set! sched
-          (async-parameter-version ($async-scheduler-group sched)))))))
-
 ;;; ------------------------------------------- scheduler/task internal helpers
 
 
@@ -855,39 +701,21 @@
         (async-scheduler-vtime sched)
         (async-monotonic-us))))
 
-(define install-task-dynamic-state!
+(define install-task-exception-state!
   (lambda (sched task)
-    (let* ([group ($async-scheduler-group sched)]
-           [ambient
-            (async-snapshot-dynamic-state
-              (async-parameter-version group))]
-           [state (async-normalize-and-install-dynamic-state! group
-                    (async-task-dynamic-state task))])
-      (async-scheduler-saved-dynamic-state-set! sched ambient)
-      (async-scheduler-saved-exception-state-set! sched (current-exception-state))
-      (async-task-dynamic-state-set! task state)
-      (async-scheduler-active-dynamic-version-set! sched
-        (async-dynamic-state-version state))
-      (current-exception-state (async-task-exception-state task)))
+    (async-scheduler-saved-exception-state-set! sched
+      (current-exception-state))
+    (current-exception-state (async-task-exception-state task))
     ($async-scheduler sched)))
 
-(define snapshot-task-dynamic-state!
+(define snapshot-task-exception-state!
   (lambda (sched task)
-    (async-task-dynamic-state-set! task
-      (async-snapshot-dynamic-state
-        (async-parameter-version ($async-scheduler-group sched))))
     (async-task-exception-state-set! task (current-exception-state))))
 
-(define restore-scheduler-dynamic-state!
+(define restore-scheduler-exception-state!
   (lambda (sched)
-      (let ([state
-             (async-normalize-and-install-dynamic-state!
-               ($async-scheduler-group sched)
-               (async-scheduler-saved-dynamic-state sched))])
-      (async-scheduler-saved-dynamic-state-set! sched state)
-      (async-scheduler-active-dynamic-version-set! sched
-        (async-dynamic-state-version state))
-      (current-exception-state (async-scheduler-saved-exception-state sched)))
+    (current-exception-state
+      (async-scheduler-saved-exception-state sched))
     ($async-scheduler sched)))
 
 (define sched-registry-add/raw!
@@ -1369,7 +1197,7 @@
 (define $async-suspend
   (lambda (sched task ss register!)
     (async-check-cancellation! task)
-    (snapshot-task-dynamic-state! sched task)
+    (snapshot-task-exception-state! sched task)
     (set-sched-switch! sched #t)
     (let ([payload
             ($control-shift1-at
@@ -2005,10 +1833,8 @@
                    (async-scheduler-group-next-task-id-set! group (fx+ 1 id))
                    id))])
       (make-async-task id name 'ready entry #f #f group sched #f migratable? #f
-        (async-snapshot-dynamic-state
-          (async-parameter-version group))
         (current-exception-state)
-        parent-group (async-make-context parent-context)
+        parent-group (async-make-context parent-context) #f
         #f                         ; child group
         '()                        ; result values
         #f                         ; failure condition
@@ -2193,8 +2019,7 @@
       (make-async-queue) (make-async-os-mutex)
       (if-feature pthreads (make-condition) #f)
       (make-eq-hashtable) 0 0 #f 'created virtual? 0 '() #f #f
-      (async-snapshot-dynamic-state (async-parameter-version group))
-      (async-parameter-version group) (current-exception-state)
+      (current-exception-state)
       0 0 preemption-ticks 0 0 0 #f #f #f)))
 
 (define async-drain-remote!
@@ -2332,7 +2157,7 @@
               ;; safe point as preemption, without first capturing another
               ;; continuation.
               (async-check-cancellation! task)
-              (snapshot-task-dynamic-state! sched task)
+              (snapshot-task-exception-state! sched task)
               (set-sched-switch! sched #t)
               ;; set-timer directly consumes the value returned when the
               ;; continuation is resumed.  This is the final operation in the
@@ -2480,7 +2305,7 @@
                       (async-scheduler-preemption-ticks sched))))
                 (async-task-state-set! task 'running)
                 (async-scheduler-current-task-set! sched task)
-                (install-task-dynamic-state! sched task)
+                (install-task-exception-state! sched task)
                 (let* ([ticks (async-scheduler-preemption-ticks sched)]
                        [outcome
                         (guard (c [else (cons 'internal-escape c)])
@@ -2493,7 +2318,7 @@
                   (set-sched-switch! sched #f)
                   (async-scheduler-preemption-exit-set! sched #f)
                   (async-scheduler-current-task-set! sched #f)
-                  (restore-scheduler-dynamic-state! sched)
+                  (restore-scheduler-exception-state! sched)
                   (cond
                     [(eq? outcome async-suspend-token)
                      (async-finish-suspension! task)
@@ -2705,11 +2530,15 @@
     (unless (async-context? context)
       ($oops who "~s is not an async context" context))
     (unless (procedure? thunk) ($oops who "~s is not a procedure" thunk))
-    (let ([previous ($async-context-override)])
+    (let ([task (async-current-task/required who)]
+          [outside-context #f])
       (async-dynamic-wind
-        (lambda () ($async-context-override context))
+        (lambda ()
+          (set! outside-context (async-task-context-override task))
+          (async-task-context-override-set! task context))
         thunk
-        (lambda () ($async-context-override previous))))))
+        (lambda ()
+          (async-task-context-override-set! task outside-context))))))
 
 (set-who! call-with-async-timeout
   (lambda (seconds thunk)
@@ -3707,8 +3536,7 @@
                    (async-scheduler-preemption-ticks outer))
           ($oops who
             "cannot nest an async scheduler inside a preemptive task")))
-      ;; Engine bookkeeping uses runtime-private thread parameters.  A fiber
-      ;; snapshot must never copy that active state to a scheduler worker.
+      ;; Engines and async preemption both own the native thread's timer.
       (when ($engine-active?)
         ($oops who "cannot run an async scheduler inside an active engine"))
       (when (and (eq? clock 'virtual) (fx> parallelism 1))
@@ -3717,13 +3545,12 @@
         (if-feature pthreads
           (void)
           ($oops who "parallel scheduler groups require thread support")))
-      (let* ([parameter-config (async-register-parameter-config!)]
-             [group (make-async-scheduler-group
+      (let* ([group (make-async-scheduler-group
                       (control:make-continuation-prompt-tag 'async-scheduler-group)
                       (make-async-os-mutex)
                       (if-feature pthreads (make-condition) #f)
                       (make-async-queue) (make-eq-hashtable) 0
-                      parameter-config '#() #f 0 0 (box 0) #f #f '())]
+                      '#() #f 0 0 (box 0) #f #f '())]
              [schedulers (make-vector parallelism)])
         (do ([i 0 (fx+ i 1)]) ((fx= i parallelism))
           (vector-set! schedulers i
@@ -3769,7 +3596,6 @@
           (if-feature pthreads
             (for-each thread-join workers)
             (void)))
-        (async-unregister-parameter-config! parameter-config)
         (async-debug-check-group-quiescent! group)
         (when (async-scheduler-group-failure group)
           (raise (async-scheduler-group-failure group)))
@@ -3821,7 +3647,6 @@
 
 ;;; Hooks consumed by asyncio.ss.  $async-io-shutdown is replaced by the io
 ;;; layer's real shutdown procedure when that file is loaded.
-(set! $async-new-thread-parameter async-new-thread-parameter)
 (set! $async-task-active?
   (lambda ()
     (let ([sched ($async-scheduler)])

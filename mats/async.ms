@@ -38,70 +38,6 @@
         (proc)
         (fx+ 1 (async-test-call-at-depth (fx- depth 1) proc)))))
 
-(define async-test-spawn-stale-parameter-task
-  (lambda (parameters-box)
-    (let ([old (make-thread-parameter 'old-initial)])
-      (old 'stale-slot-value)
-      (spawn-task
-        (lambda ()
-          (map (lambda (entry) ((car entry))) (unbox parameters-box)))))))
-
-(define async-test-external-parameter-reuse
-  (lambda ()
-    (if (not (threaded?))
-        #t
-        (let ([mutex (make-mutex)]
-              [condition (make-condition)]
-              [stage 0]
-              [parameters-box (box '())]
-              [result-box (box #f)])
-          (define advance!
-            (lambda (next)
-              (with-mutex mutex
-                (set! stage next)
-                (condition-broadcast condition))))
-          (define await!
-            (lambda (target)
-              (with-mutex mutex
-                (let loop ()
-                  (unless (>= stage target)
-                    (condition-wait condition mutex)
-                    (loop))))))
-          (let ([worker
-                 (fork-thread
-                   (lambda ()
-                     (set-box! result-box
-                       (guard (c [else c])
-                         (run-async
-                           (lambda ()
-                             (let ([task
-                                    (async-test-spawn-stale-parameter-task
-                                      parameters-box)])
-                               (advance! 1)
-                               (await! 2)
-                               (task-join task))))))
-                     (advance! 3)))])
-            (await! 1)
-            ;; The old parameter procedure is unreachable, but its value is
-            ;; still present in the suspended fiber snapshot.  Allocation
-            ;; drains the slot guardian and then reuses the released slot.
-            (collect)
-            (collect)
-            (let ([entries
-                   (let loop ([i 0] [entries '()])
-                     (if (fx= i 64)
-                         (reverse entries)
-                         (let ([initial (cons 'fresh i)])
-                           (loop (fx+ i 1)
-                             (cons
-                               (cons (make-thread-parameter initial) initial)
-                               entries)))))])
-              (set-box! parameters-box entries)
-              (advance! 2)
-              (await! 3)
-              (thread-join worker)
-              (equal? (unbox result-box) (map cdr entries))))))))
-
 (mat async
 
   ;; ---- basic scheduling
@@ -254,8 +190,8 @@
       list)
     '(a b c))
 
-  ;; Exception handlers and fiber-local parameters survive repeated native
-  ;; preemption and resumption.
+  ;; Exception handlers and dynamically scoped parameters survive repeated
+  ;; native preemption and resumption.
   (equal?
     (run-async
       (lambda ()
@@ -417,32 +353,34 @@
       'preemption-ticks 1000)
     128)
 
-  ;; Fiber-local thread parameters remain isolated while many preempted tasks
-  ;; are eligible for work stealing by different scheduler threads.
+  ;; Each preempted task retains its explicitly scoped ambient context while
+  ;; it remains eligible for work stealing by different scheduler threads.
   (or (not (threaded?))
       (equal?
         (run-async
           (lambda ()
-            (let ([parameter (make-thread-parameter 'root)])
-              (let ([tasks
-                     (let loop ([i 0] [tasks '()])
-                       (if (fx= i 16)
-                           tasks
-                           (loop (fx+ i 1)
-                             (cons
-                               (spawn-task
-                                 (lambda ()
-                                   (parameter i)
-                                   (do ([round 0 (fx+ round 1)])
-                                       ((fx= round 4))
-                                     (async-test-burn 100000)
-                                     (unless (fx= (parameter) i)
-                                       (error 'preemption-parameter
-                                         "fiber parameter leaked")))
-                                   (parameter))
-                                 'migratable? #t)
-                               tasks))))])
-                (map task-join (reverse tasks)))))
+            (let ([tasks
+                   (let loop ([i 0] [tasks '()])
+                     (if (fx= i 16)
+                         tasks
+                         (loop (fx+ i 1)
+                           (cons
+                             (spawn-task
+                               (lambda ()
+                                 (let ([context (make-async-context)])
+                                   (call-with-async-context context
+                                     (lambda ()
+                                       (do ([round 0 (fx+ round 1)])
+                                           ((fx= round 4))
+                                         (async-test-burn 100000)
+                                         (unless
+                                           (eq? (current-async-context) context)
+                                           (error 'preemption-context
+                                             "ambient context leaked")))
+                                       i))))
+                               'migratable? #t)
+                             tasks))))])
+              (map task-join (reverse tasks))))
           'parallelism 4
           'preemption-ticks 1000)
         '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)))
@@ -820,22 +758,23 @@
           'parallelism 4)
         #t))
 
-  ;; a blocked operation applies its wrapper in the resumed fiber, not in the
-  ;; thread that completes the operation
-  (equal? (let ([p (make-thread-parameter 'outside)])
-            (run-async
-              (lambda ()
-                (p 'fiber)
-                (let ([f (make-future)])
-                  (fork-thread
-                    (lambda ()
-                      (p 'foreign-thread)
-                      (sleep (make-time 'time-duration 1000000 0))
-                      (future-fulfil! f 'value)))
-                  (perform-operation
-                    (wrap-operation (future-operation f)
-                      (lambda (v) (list v (p)))))))))
-    '(value fiber))
+  ;; A blocked operation applies its wrapper with the resumed task's ambient
+  ;; context, not in the thread that completes the operation.
+  (equal? (run-async
+            (lambda ()
+              (let ([context (make-async-context)]
+                    [f (make-future)])
+                (call-with-async-context context
+                  (lambda ()
+                    (fork-thread
+                      (lambda ()
+                        (sleep (make-time 'time-duration 1000000 0))
+                        (future-fulfil! f 'value)))
+                    (perform-operation
+                      (wrap-operation (future-operation f)
+                        (lambda (v)
+                          (list v (eq? (current-async-context) context))))))))))
+    '(value #t))
 
   ;; completion and cancellation race through the same one-shot claim
   (equal? (run-async
@@ -1265,84 +1204,60 @@
                 (list befores afters))))
     '(2 2))
 
-  ;; ---- fiber-local dynamic state
+  ;; ---- task-owned dynamic state
 
-  (equal? (let ([p (make-thread-parameter 'parent)])
-            (run-async
-              (lambda ()
-                (p 'in-root)
-                (let ([t (spawn-task (lambda ()
-                                       (let ([inherited (p)])
-                                         (p 'child-mutated)
-                                         inherited)))])
-                  (let ([inherited (task-join t)])
-                    (list inherited (p)))))))
-    '(in-root in-root))
-
-  ;; a thread parameter allocated by one task starts at its initial value in
-  ;; siblings whose snapshots predate the allocation
+  ;; Ambient context overrides nest dynamically and restore the task-owned
+  ;; context after normal exit.
   (equal? (run-async
             (lambda ()
-              (let ([pbox (box #f)])
-                (let ([a (spawn-task
-                           (lambda ()
-                             (let ([p (make-thread-parameter 'initial)])
-                               (set-box! pbox p)
-                               (p 'task-a)
-                               (task-yield)
-                               (p))))]
-                      [b (spawn-task
-                           (lambda ()
-                             (task-yield)
-                             ((unbox pbox))))])
-                  (list (task-join a) (task-join b))))))
-    '(task-a initial))
+              (let ([root (current-async-context)]
+                    [outer (make-async-context)]
+                    [inner (make-async-context)])
+                (list
+                  (call-with-async-context outer
+                    (lambda ()
+                      (list
+                        (eq? (current-async-context) outer)
+                        (call-with-async-context inner
+                          (lambda ()
+                            (eq? (current-async-context) inner)))
+                        (eq? (current-async-context) outer))))
+                  (eq? (current-async-context) root)))))
+    '((#t #t #t) #t))
 
-  ;; parameter allocation is published lazily to fibers on every worker
-  (or (not (threaded?))
-      (let loop ([i 0])
-        (or (fx= i 64)
-            (and
-              (equal? (run-async
-                        (lambda ()
-                          (let ([ready (make-future)]
-                                [pbox (box #f)]
-                                [readers (make-vector 8)])
-                            (do ([i 0 (fx+ i 1)])
-                                ((fx= i (vector-length readers)))
-                              (vector-set! readers i
-                                (spawn-task
-                                  (lambda ()
-                                    (future-get ready)
-                                    ((unbox pbox)))
-                                  'migratable? #t)))
-                            (let ([creator
-                                   (spawn-task
-                                     (lambda ()
-                                       (let ([p
-                                              (make-thread-parameter 'initial)])
-                                         (set-box! pbox p)
-                                         (p 'creator)
-                                         (future-fulfil! ready #t)
-                                         (task-yield)
-                                         (p)))
-                                     'migratable? #t)])
-                              (cons (task-join creator)
-                                (vector->list
-                                  (vector-map task-join readers))))))
-                        'parallelism 4)
-                      (cons 'creator (make-list 8 'initial)))
-              (loop (fx+ i 1))))))
+  ;; Non-local exit restores the task-owned context.
+  (equal? (run-async
+            (lambda ()
+              (let ([root (current-async-context)]
+                    [override (make-async-context)])
+                (guard (c [else (void)])
+                  (call-with-async-context override
+                    (lambda () (error 'context-test "leave scope"))))
+                (eq? (current-async-context) root))))
+    #t)
 
-  ;; Slot reuse is process-wide. A parameter allocated outside the scheduler
-  ;; updates snapshots belonging to every live scheduler group.
-  (async-test-external-parameter-reuse)
-
-  ;; scheduler exit restores the caller's thread-parameter state
-  (equal? (let ([p (make-thread-parameter 'outside)])
-            (run-async (lambda () (p 'inside) (task-yield) (p)))
-            (p))
-    'outside)
+  ;; A child spawned under an override derives its cancellation context from
+  ;; that override and remains linked after the parent leaves the scope.
+  (eq? (run-async
+         (lambda ()
+           (let ([context (make-async-context)]
+                 [started (make-future)]
+                 [child #f])
+             (call-with-async-context context
+               (lambda ()
+                 (set! child
+                   (spawn-task
+                     (lambda ()
+                       (future-fulfil! started)
+                       (guard (c
+                                [(async-cancellation-condition? c)
+                                 (async-cancellation-reason c)])
+                         (async-sleep 60)
+                         'unexpected))))
+                 (future-get started)
+                 (async-context-cancel! context 'inherited)))
+             (task-join child))))
+    'inherited)
 
   ;; ordinary parameterize state rides each task's continuation
   (equal? (let ([p (make-parameter 'default)])
@@ -1357,7 +1272,19 @@
                     (list (p) (task-join t)))))))
     '(root child))
 
-  ;; exception handler stacks are fiber-local across scheduler switches
+  ;; Direct thread-parameter assignment has native worker semantics.  The
+  ;; scheduler does not snapshot or restore the parameter vector.
+  (equal? (let ([p (make-thread-parameter 'outside)])
+            (let ([inside
+                   (run-async
+                     (lambda ()
+                       (p 'inside)
+                       (task-yield)
+                       (p)))])
+              (list inside (p))))
+    '(inside inside))
+
+  ;; Exception handler stacks remain owned by their tasks across switches.
   (equal? (run-async
             (lambda ()
               (let ([root-state
@@ -1375,6 +1302,42 @@
                   (list (raise-continuable 'root-probe)
                         (task-join child))))))
     '(root-handler child-handler))
+
+  ;; A migrated, preemptible task retains both its ambient context override
+  ;; and exception handler state.  Neither may come from a task that
+  ;; previously occupied the receiving worker.
+  (or (not (threaded?))
+      (equal?
+        (run-async
+          (lambda ()
+            (let ([tasks
+                   (let loop ([i 0] [tasks '()])
+                     (if (fx= i 12)
+                         (reverse tasks)
+                         (loop (fx+ i 1)
+                           (cons
+                             (spawn-task
+                               (lambda ()
+                                 (let ([context (make-async-context)])
+                                   (call-with-async-context context
+                                     (lambda ()
+                                       (current-exception-state
+                                         (create-exception-state
+                                           (lambda (condition) i)))
+                                       (do ([round 0 (fx+ round 1)])
+                                           ((fx= round 8))
+                                         (async-test-burn 50000)
+                                         (task-yield))
+                                       (list
+                                         (eq? (current-async-context) context)
+                                         (raise-continuable 'probe))))))
+                               'migratable? #t)
+                             tasks))))])
+              (map task-join tasks)))
+          'parallelism 4
+          'preemption-ticks 1000)
+        '((#t 0) (#t 1) (#t 2) (#t 3) (#t 4) (#t 5)
+          (#t 6) (#t 7) (#t 8) (#t 9) (#t 10) (#t 11))))
 
   ;; ---- remote wakeup from a plain thread
 
@@ -1476,33 +1439,37 @@
                    [gate (make-future)]
                    [mutex (make-mutex)]
                    [condition (make-condition)]
-                   [parameter (make-thread-parameter 'unset)]
                    [started 0])
               (do ([i 0 (fx+ i 1)]) ((fx= i n))
                 (vector-set! tasks i
                   (spawn-task
-                    (let ([i i])
+                    (let ([i i]
+                          [context (make-async-context)])
                       (lambda ()
-                        (let ([scheduler (current-async-scheduler)])
-                          (parameter i)
-                          ;; Hold one task on each scheduler until all three
-                          ;; scheduler threads have entered user code.
-                          (with-mutex mutex
-                            (set! started (fx+ started 1))
-                            (when (fx= started 3)
-                              (condition-broadcast condition))
-                            (let loop ()
-                              (unless (fx>= started 3)
-                                (condition-wait condition mutex)
-                                (loop))))
-                          (future-get gate)
-                          (do ([j 0 (fx+ j 1)]) ((fx= j 16))
-                            (task-yield))
-                          (vector-set! results i
-                            (list (async-scheduler? scheduler)
-                                  (eq? (task-scheduler (current-async-task))
-                                       (current-async-scheduler))
-                                  (fx= (parameter) i))))))
+                        (call-with-async-context context
+                          (lambda ()
+                            (let ([scheduler (current-async-scheduler)])
+                              ;; Hold one task on each scheduler until all
+                              ;; three scheduler threads have entered user
+                              ;; code.
+                              (with-mutex mutex
+                                (set! started (fx+ started 1))
+                                (when (fx= started 3)
+                                  (condition-broadcast condition))
+                                (let loop ()
+                                  (unless (fx>= started 3)
+                                    (condition-wait condition mutex)
+                                    (loop))))
+                              (future-get gate)
+                              (do ([j 0 (fx+ j 1)]) ((fx= j 16))
+                                (task-yield))
+                              (vector-set! results i
+                                (list (async-scheduler? scheduler)
+                                      (eq?
+                                        (task-scheduler (current-async-task))
+                                        (current-async-scheduler))
+                                      (eq? (current-async-context)
+                                           context))))))))
                     'migratable? #t)))
               (let loop ()
                 (unless (with-mutex mutex (fx= started n))

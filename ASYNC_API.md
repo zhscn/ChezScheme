@@ -203,9 +203,14 @@ an operation while racing it against context cancellation; cancellation
 nacks the operation and raises an async cancellation condition carrying the
 context reason.
 
-`call-with-async-context` installs a fiber-local current context for `thunk`.
+`call-with-async-context` installs the current task's ambient cancellation
+context for the dynamic extent of `thunk`.
 Ordinary `spawn-task` calls in that extent inherit it. All operations
 performed by a task are also bounded by its current context.
+
+The ambient context carries cancellation and deadline ownership. Application
+state is passed explicitly through lexical bindings, closures, records,
+channels, and operation values.
 
 ```scheme
 (async-context-with-timeout parent seconds) -> async-context
