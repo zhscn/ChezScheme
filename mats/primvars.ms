@@ -994,3 +994,33 @@
    (error? (trace-output-port (open-input-string "hello")))
  )
 
+(mat native-fiber-representation
+  (not (#3%$native-fiber? #f))
+  (let ([fiber (#3%$native-fiber-adopt 0)])
+    (and (#3%$native-fiber? fiber)
+         (eq? (#3%$native-fiber-state fiber) 'running)
+         (fx= (#3%$native-fiber-owner fiber) (get-thread-id))
+         (fx= (#3%$native-fiber-flags fiber) #b011)
+         (fixnum? (#3%$native-fiber-id fiber))
+         (eq? (#3%$current-native-fiber) fiber)
+         (fx= (#3%$fiber-switch-prohibited-depth) 0)))
+  (begin (collect) (#3%$native-fiber? (#3%$current-native-fiber)))
+  (error? (#3%$native-fiber-adopt 0))
+  (error? (#3%$native-fiber-adopt -1))
+  (error? (#3%$native-fiber-adopt #b0100))
+  (error? (#3%$native-fiber-adopt 16))
+  (error? (#3%$native-fiber-adopt 'debug)))
+
+(when (threaded?)
+  (mat native-fiber-thread-state
+    (let ([result #f])
+      (thread-join
+        (fork-thread
+          (lambda ()
+            (let ([fiber (#3%$native-fiber-adopt #b1000)])
+              (set! result
+                (and (eq? (#3%$native-fiber-state fiber) 'running)
+                     (fx= (#3%$native-fiber-owner fiber) (get-thread-id))
+                     (fx= (#3%$native-fiber-flags fiber) #b1011)
+                     (eq? (#3%$current-native-fiber) fiber)))))))
+      result)))

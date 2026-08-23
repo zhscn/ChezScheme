@@ -3604,6 +3604,8 @@
       (define-tc-parameter $current-winders winders)
       (define-tc-parameter $current-attachments attachments)
       (define-tc-parameter $current-handler-stack handler-stack)
+      (define-tc-parameter $current-native-fiber current-native-fiber)
+      (define-tc-parameter $fiber-switch-prohibited-depth fiber-switch-prohibited-depth)
       (define-tc-parameter default-record-equal-procedure default-record-equal-procedure)
       (define-tc-parameter default-record-hash-procedure default-record-hash-procedure)
       (define-tc-parameter current-errno-source current-errno-source)

@@ -1822,6 +1822,122 @@
    [() ($current-handler-stack)]
    [(w) ($current-handler-stack w)]))
 
+(define-who $current-native-fiber
+  (case-lambda
+    [() ($current-native-fiber)]
+    [(fiber) ($current-native-fiber fiber)]))
+
+(define-who $fiber-switch-prohibited-depth
+  (case-lambda
+    [() ($fiber-switch-prohibited-depth)]
+    [(depth) ($fiber-switch-prohibited-depth depth)]))
+
+;; A native fiber is a linear VM execution context.  Its control field is the
+;; only field read or written concurrently; all other mutable fields are owned
+;; by the worker that has successfully claimed the fiber.
+(define $native-fiber?)
+(define $native-fiber-state)
+(define $native-fiber-owner)
+(define $native-fiber-flags)
+(define $native-fiber-id)
+(define $native-fiber-adopt)
+(let ()
+(define-record-type (native-fiber-record make-native-fiber-record native-fiber-record?)
+  (fields
+    (mutable control native-fiber-control native-fiber-control-set!)
+    (mutable context native-fiber-context native-fiber-context-set!)
+    (mutable handler-stack native-fiber-handler-stack native-fiber-handler-stack-set!)
+    (mutable entry native-fiber-entry native-fiber-entry-set!)
+    (immutable on-return native-fiber-on-return)
+    (mutable flags native-fiber-flags native-fiber-flags-set!)
+    (immutable id native-fiber-id))
+  (nongenerative #{native-fiber vm-native-fiber-0})
+  (sealed #t)
+  (opaque #t))
+
+(define native-fiber-next-id (box 0))
+
+(define native-fiber-allocate-id
+  (lambda ()
+    (let loop ()
+      (let ([id (unbox native-fiber-next-id)])
+        (let ([next-id (if (fx= id (most-positive-fixnum)) 0 (fx+ id 1))])
+          (if (box-cas! native-fiber-next-id id next-id)
+              id
+              (loop)))))))
+
+(define native-fiber-pack-control
+  (lambda (state owner)
+    (fxlogor state (fxsll owner (constant native-fiber-state-bits)))))
+
+(define native-fiber-control-state
+  (lambda (control)
+    (fxlogand control (constant native-fiber-state-mask))))
+
+(define native-fiber-control-owner
+  (lambda (control)
+    (fxsrl control (constant native-fiber-state-bits))))
+
+(set! $native-fiber?
+  (lambda (x)
+    (native-fiber-record? x)))
+
+(set! $native-fiber-state
+  (lambda (fiber)
+    (unless ($native-fiber? fiber)
+      ($oops '$native-fiber-state "~s is not a native fiber" fiber))
+    (case (native-fiber-control-state (native-fiber-control fiber))
+      [(0) 'new]
+      [(1) 'claimed]
+      [(2) 'running]
+      [(3) 'parking]
+      [(4) 'parked]
+      [(5) 'finishing]
+      [(6) 'finished]
+      [else ($oops '$native-fiber-state "invalid native-fiber control word")])))
+
+(set! $native-fiber-owner
+  (lambda (fiber)
+    (unless ($native-fiber? fiber)
+      ($oops '$native-fiber-owner "~s is not a native fiber" fiber))
+    (let ([owner (native-fiber-control-owner (native-fiber-control fiber))])
+      (and (fx> owner 0) (fx- owner 1)))))
+
+(set! $native-fiber-flags
+  (lambda (fiber)
+    (unless ($native-fiber? fiber)
+      ($oops '$native-fiber-flags "~s is not a native fiber" fiber))
+    (native-fiber-flags fiber)))
+
+(set! $native-fiber-id
+  (lambda (fiber)
+    (unless ($native-fiber? fiber)
+      ($oops '$native-fiber-id "~s is not a native fiber" fiber))
+    (native-fiber-id fiber)))
+
+(set! $native-fiber-adopt
+  (lambda (flags)
+    (unless (and (fixnum? flags)
+                 (fx>= flags 0)
+                 (fx= (fxlogand flags (fxlognot (constant native-fiber-flags-mask))) 0)
+                 (fx= (fxlogand flags (constant native-fiber-flag-migratable)) 0))
+      ($oops '$native-fiber-adopt "invalid native-fiber flags ~s" flags))
+    (when ($current-native-fiber)
+      ($oops '$native-fiber-adopt "the current native thread already has an active fiber"))
+    (let* ([owner (fx+ (#3%get-thread-id) 1)]
+           [control (native-fiber-pack-control
+                      (constant native-fiber-state-running)
+                      owner)]
+           [fiber (make-native-fiber-record
+                    control #f #f #f #f
+                    (fxlogor flags
+                      (constant native-fiber-flag-pinned)
+                      (constant native-fiber-flag-scheduler))
+                    (native-fiber-allocate-id))])
+      ($current-native-fiber fiber)
+      fiber)))
+)
+
 (define lock-object
   (foreign-procedure __atomic __alloc "(cs)lock_object" (scheme-object) void))
 (define unlock-object

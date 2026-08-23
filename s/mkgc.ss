@@ -990,6 +990,8 @@
       (trace-pure (tc-winders tc))
       (trace-pure (tc-attachments tc))
       (trace-pure (tc-handler-stack tc))
+      (trace-pure (tc-current-native-fiber tc))
+      (trace-pure (tc-fiber-switch-prohibited-depth tc))
       (case-mode
        [sweep
         (set! (tc-cached-frame tc) Sfalse)]

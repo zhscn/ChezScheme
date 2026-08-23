@@ -830,6 +830,8 @@ static void sweep(thread_gc *tgc, ptr p, IGEN from_g)
             relocate_pure(&(WINDERS(tc)));
             relocate_pure(&(ATTACHMENTS(tc)));
             relocate_pure(&(HANDLERSTACK(tc)));
+            relocate_pure(&(CURRENTNATIVEFIBER(tc)));
+            relocate_pure(&(FIBERSWITCHPROHIBITEDDEPTH(tc)));
             CACHEDFRAME(tc) = Sfalse;
             {
               ptr xcp = FRAME(tc, 0);
@@ -1475,6 +1477,8 @@ static void sweep_object_in_old(thread_gc *tgc, ptr p)
             relocate_pure(&(WINDERS(tc)));
             relocate_pure(&(ATTACHMENTS(tc)));
             relocate_pure(&(HANDLERSTACK(tc)));
+            relocate_pure(&(CURRENTNATIVEFIBER(tc)));
+            relocate_pure(&(FIBERSWITCHPROHIBITEDDEPTH(tc)));
             {
               ptr xcp = FRAME(tc, 0);
               {
@@ -2358,6 +2362,8 @@ static void sweep_thread(thread_gc *tgc, ptr p)
         relocate_pure(&(WINDERS(tc)));
         relocate_pure(&(ATTACHMENTS(tc)));
         relocate_pure(&(HANDLERSTACK(tc)));
+        relocate_pure(&(CURRENTNATIVEFIBER(tc)));
+        relocate_pure(&(FIBERSWITCHPROHIBITEDDEPTH(tc)));
         CACHEDFRAME(tc) = Sfalse;
         {
           ptr xcp = FRAME(tc, 0);

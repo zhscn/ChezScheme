@@ -128,6 +128,8 @@ ptr S_create_thread_object(const char *who, ptr p_tc) {
   ATTACHMENTS(tc) = Snil;
   HANDLERSTACK(tc) = Sfalse;
   CACHEDFRAME(tc) = Sfalse;
+  CURRENTNATIVEFIBER(tc) = Sfalse;
+  FIBERSWITCHPROHIBITEDDEPTH(tc) = FIX(0);
   STACKLINK(tc) = SYMVAL(S_G.null_continuation_id);
   STACKCACHE(tc) = Snil;
 

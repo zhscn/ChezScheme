@@ -1662,7 +1662,11 @@
    [uptr pb-regs (constant pb-reg-count)] ; "pb.c" assumes that `pb-regs` through `pb-call-arena` are together
    [double pb-fpregs (constant pb-fpreg-count)]
    [uptr pb-call-arena (constant pb-call-arena-size)]
-   [xptr gc-data]))
+   [xptr gc-data]
+   ;; VM-extension fields remain at the end because existing thread-context
+   ;; displacements are part of the boot-image ABI.
+   [ptr current-native-fiber]
+   [ptr fiber-switch-prohibited-depth]))
 
 (define tc-field-list
   (let f ([ls (oblist)] [params '()])
@@ -1682,6 +1686,24 @@
 (define-constant unactivate-mode-noop       0)
 (define-constant unactivate-mode-deactivate 1)
 (define-constant unactivate-mode-destroy    2)
+
+;; Native-fiber lifecycle values occupy the low bits of the packed control
+;; word.  The remaining bits hold the owning native-thread number plus one.
+(define-constant native-fiber-state-bits 3)
+(define-constant native-fiber-state-mask #b111)
+(define-constant native-fiber-state-new 0)
+(define-constant native-fiber-state-claimed 1)
+(define-constant native-fiber-state-running 2)
+(define-constant native-fiber-state-parking 3)
+(define-constant native-fiber-state-parked 4)
+(define-constant native-fiber-state-finishing 5)
+(define-constant native-fiber-state-finished 6)
+
+(define-constant native-fiber-flag-pinned #b001)
+(define-constant native-fiber-flag-scheduler #b010)
+(define-constant native-fiber-flag-migratable #b0100)
+(define-constant native-fiber-flag-debug #b1000)
+(define-constant native-fiber-flags-mask #b1111)
 
 (define-primitive-structure-disps rtd-counts type-typed-object
   ([iptr type]
