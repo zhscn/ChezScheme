@@ -555,6 +555,33 @@
                                   (future-fulfil! f 1)
                                   (future-fulfil! f 2)))))
 
+  ;; Growing the Chase--Lev rings while other schedulers steal preserves
+  ;; exactly-once execution across wraparound and growth boundaries.
+  (or (not (threaded?))
+      (equal?
+        (run-async
+          (lambda ()
+            (let* ([n 512]
+                   [seen (make-bytevector n 0)]
+                   [mutex (make-mutex)]
+                   [tasks (make-vector n)])
+              (do ([i 0 (fx+ i 1)]) ((fx= i n))
+                (vector-set! tasks i
+                  (spawn-task
+                    (let ([i i])
+                      (lambda ()
+                        (with-mutex mutex
+                          (bytevector-u8-set! seen i
+                            (fx+ 1 (bytevector-u8-ref seen i))))))
+                    'migratable? #t)))
+              (vector-for-each task-join tasks)
+              (let loop ([i 0])
+                (or (fx= i n)
+                    (and (fx= (bytevector-u8-ref seen i) 1)
+                         (loop (fx+ i 1)))))))
+          'parallelism 4)
+        #t))
+
   ;; a blocked operation applies its wrapper in the resumed fiber, not in the
   ;; thread that completes the operation
   (equal? (let ([p (make-thread-parameter 'outside)])

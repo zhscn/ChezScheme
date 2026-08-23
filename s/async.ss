@@ -94,6 +94,58 @@
       (when (null? (cdr h)) (async-fifo-tail-set! q '()))
       (car h))))
 
+;;; Owner-only Chase--Lev work-stealing deque.  The owner publishes and
+;;; removes work at bottom; thieves compete for top with CAS.  Growing
+;;; publishes a fresh ring while the old ring remains reachable by any thief
+;;; that already loaded it.
+(define-record-type (async-work-ring make-async-work-ring async-work-ring?)
+  (nongenerative)
+  (sealed #t)
+  (fields (immutable slots) (immutable mask)))
+
+(define-record-type (async-work-deque make-async-work-deque% async-work-deque?)
+  (nongenerative)
+  (sealed #t)
+  (fields
+    (immutable top)                 ; atomic box
+    (immutable bottom)              ; atomic box; written only by owner
+    (immutable ring)))              ; atomic box of async-work-ring
+
+(define make-async-work-deque
+  (lambda ()
+    (let ([slots (make-vector 32 #f)])
+      (make-async-work-deque%
+        (box 0) (box 0)
+        (box (make-async-work-ring slots (fx- (vector-length slots) 1)))))))
+
+(define async-atomic-box-set!
+  (lambda (b new)
+    (let loop ([old (unbox b)])
+      (unless (box-cas! b old new)
+        (loop (unbox b))))))
+
+(define async-atomic-box-ref
+  (lambda (b)
+    (let loop ([value (unbox b)])
+      (if (box-cas! b value value)
+          value
+          (loop (unbox b))))))
+
+(define async-work-deque-grow!
+  (lambda (deque top bottom old-ring)
+    (let* ([old-slots (async-work-ring-slots old-ring)]
+           [old-mask (async-work-ring-mask old-ring)]
+           [new-slots (make-vector (fx* 2 (vector-length old-slots)) #f)]
+           [new-mask (fx- (vector-length new-slots) 1)])
+      (let loop ([i top])
+        (when (fx< i bottom)
+          (vector-set! new-slots (fxand i new-mask)
+            (vector-ref old-slots (fxand i old-mask)))
+          (loop (fx+ i 1))))
+      (let ([ring (make-async-work-ring new-slots new-mask)])
+        (async-atomic-box-set! (async-work-deque-ring deque) ring)
+        ring))))
+
 ;;; Monotonic time in microseconds.
 (define async-monotonic-us
   (lambda ()
@@ -230,7 +282,7 @@
 ;;; ------------------------------------------------------------ records
 
 (define-record-type (async-scheduler make-async-scheduler% $async-scheduler?)
-  (nongenerative async-scheduler-layer7)
+  (nongenerative async-scheduler-layer8)
   (sealed #t)
   (fields
     (immutable prompt-tag)          ; private continuation-prompt tag
@@ -238,8 +290,7 @@
     (immutable group-index)         ; stable index within the group
     (immutable current-queue)       ; tasks run this turn
     (immutable next-queue)          ; tasks run next turn
-    (mutable work-deque)            ; migratable tasks; owner front, thieves back
-    (immutable work-mutex)
+    (immutable work-deque)          ; owner-bottom/thief-top Chase--Lev deque
     (immutable remote-queue)        ; cross-thread submissions
     (immutable remote-mutex)
     (immutable remote-cond)
@@ -281,7 +332,7 @@
     (mutable root-task)
     (mutable next-task-id)
     (mutable next-wake-index)
-    (mutable work-count)
+    (immutable work-count-box)      ; atomic exact count of ring-deque tasks
     (mutable shutdown?)
     (mutable failure)
     (mutable workers)))
@@ -351,7 +402,8 @@
   (nongenerative)
   (sealed #t)
   (fields
-    (mutable children)              ; tasks belonging to the group
+    (immutable children)            ; eq-hashtable of member tasks
+    (mutable child-count)
     (mutable subgroups)             ; linked descendant groups
     (mutable waiters)               ; list of (ss . deliver)
     (mutable unobserved)            ; unobserved child failure conditions
@@ -849,6 +901,19 @@
   (lambda (group)
     (fx> (vector-length (async-scheduler-group-schedulers group)) 1)))
 
+(define async-group-work-count
+  (lambda (group)
+    (async-atomic-box-ref (async-scheduler-group-work-count-box group))))
+
+(define async-group-work-count-add!
+  (lambda (group delta)
+    (let ([b (async-scheduler-group-work-count-box group)])
+      (let loop ([old (async-atomic-box-ref b)])
+        (let ([new (fx+ old delta)])
+          (if (box-cas! b old new)
+              new
+              (loop (async-atomic-box-ref b))))))))
+
 (define async-debug-check-owner!
   (lambda (sched)
     (when async-debug-invariants?
@@ -869,7 +934,7 @@
           (and (fx= (async-scheduler-group-task-count group) 0)
                (fx= (hashtable-size (async-scheduler-group-tasks group)) 0))
           "scheduler group retained terminal tasks" group)
-        (async-invariant (fx= (async-scheduler-group-work-count group) 0)
+        (async-invariant (fx= (async-group-work-count group) 0)
           "scheduler group retained stealable work" group))
       (with-async-mutex async-debug-runnable-mutex
         (let-values ([(tasks locations)
@@ -893,58 +958,78 @@
 
 (define async-work-push!
   (lambda (sched task)
-    (with-async-mutex (async-scheduler-work-mutex sched)
+    (async-debug-check-owner! sched)
+    (let* ([deque (async-scheduler-work-deque sched)]
+           [bottom (async-atomic-box-ref (async-work-deque-bottom deque))]
+           [top (async-atomic-box-ref (async-work-deque-top deque))]
+           [ring0 (async-atomic-box-ref (async-work-deque-ring deque))]
+           [ring
+            (if (fx>= (fx- bottom top) (async-work-ring-mask ring0))
+                (async-work-deque-grow! deque top bottom ring0)
+                ring0)])
       (async-debug-queue-claim! task 'work)
-      (async-scheduler-work-deque-set! sched
-        (cons task (async-scheduler-work-deque sched)))
-      ;; Publish the count before releasing the deque lock, so a thief cannot
-      ;; remove the task and decrement an as-yet-unpublished count.
-      (let ([group ($async-scheduler-group sched)])
-        (with-async-mutex (async-scheduler-group-mutex group)
-          (async-scheduler-group-work-count-set! group
-            (fx+ 1 (async-scheduler-group-work-count group))))))))
+      (vector-set! (async-work-ring-slots ring)
+        (fxand bottom (async-work-ring-mask ring)) task)
+      (async-group-work-count-add! ($async-scheduler-group sched) 1)
+      ;; Publish only after the exact group count is visible, so a thief can
+      ;; never decrement an unpublished item.
+      (async-atomic-box-set! (async-work-deque-bottom deque) (fx+ bottom 1)))))
 
 (define async-work-count-down!
   (lambda (group)
-    (with-async-mutex (async-scheduler-group-mutex group)
-      (async-scheduler-group-work-count-set! group
-        (fx- (async-scheduler-group-work-count group) 1))
-      (async-invariant (fx>= (async-scheduler-group-work-count group) 0)
-        "scheduler group work count became negative" group))))
+    (async-invariant (fx>= (async-group-work-count-add! group -1) 0)
+      "scheduler group work count became negative" group)))
 
 (define async-work-pop!
   (lambda (sched)
-    (let ([task
-           (with-async-mutex (async-scheduler-work-mutex sched)
-             (let ([work (async-scheduler-work-deque sched)])
-               (and (pair? work)
-                    (begin
-                      (async-scheduler-work-deque-set! sched (cdr work))
-                      (async-debug-queue-release! (car work))
-                      (car work)))))])
-      (when task
-        (async-work-count-down! ($async-scheduler-group sched)))
-      task)))
-
-(define async-list-take-last
-  (lambda (xs)
-    (if (null? (cdr xs))
-        (values (car xs) '())
-        (let-values ([(last prefix) (async-list-take-last (cdr xs))])
-          (values last (cons (car xs) prefix))))))
+    (async-debug-check-owner! sched)
+    (let* ([deque (async-scheduler-work-deque sched)]
+           [bottom0 (async-atomic-box-ref (async-work-deque-bottom deque))]
+           [bottom (fx- bottom0 1)])
+      (async-atomic-box-set! (async-work-deque-bottom deque) bottom)
+      (let* ([top (async-atomic-box-ref (async-work-deque-top deque))]
+             [task
+              (cond
+                [(fx< bottom top)
+                 (async-atomic-box-set! (async-work-deque-bottom deque) top)
+                 #f]
+                [else
+                 (let* ([ring (async-atomic-box-ref (async-work-deque-ring deque))]
+                        [slot (fxand bottom (async-work-ring-mask ring))]
+                        [task (vector-ref (async-work-ring-slots ring) slot)])
+                   (if (and (fx= top bottom)
+                            (not (box-cas! (async-work-deque-top deque)
+                                          top (fx+ top 1))))
+                       (begin
+                         (async-atomic-box-set!
+                           (async-work-deque-bottom deque) (fx+ top 1))
+                         #f)
+                       (begin
+                         (vector-set! (async-work-ring-slots ring) slot #f)
+                         (when (fx= top bottom)
+                           (async-atomic-box-set!
+                             (async-work-deque-bottom deque) (fx+ top 1)))
+                         (async-debug-queue-release! task)
+                         task)))])])
+        (when task
+          (async-work-count-down! ($async-scheduler-group sched)))
+        task))))
 
 (define async-work-steal!
   (lambda (victim)
-    (let ([task
-           (with-async-mutex (async-scheduler-work-mutex victim)
-             (let ([work (async-scheduler-work-deque victim)])
-               (if (null? work)
-                   #f
-                   (let-values ([(task remaining)
-                                 (async-list-take-last work)])
-                     (async-scheduler-work-deque-set! victim remaining)
-                     (async-debug-queue-release! task)
-                     task))))])
+    (let* ([deque (async-scheduler-work-deque victim)]
+           [top (async-atomic-box-ref (async-work-deque-top deque))]
+           [bottom (async-atomic-box-ref (async-work-deque-bottom deque))]
+           [task
+            (and (fx< top bottom)
+                 (let* ([ring (async-atomic-box-ref (async-work-deque-ring deque))]
+                        [slot (fxand top (async-work-ring-mask ring))]
+                        [task (vector-ref (async-work-ring-slots ring) slot)])
+                   (and (box-cas! (async-work-deque-top deque) top (fx+ top 1))
+                        (begin
+                          (vector-set! (async-work-ring-slots ring) slot #f)
+                          (async-debug-queue-release! task)
+                          task))))])
       (when task
         (async-work-count-down! ($async-scheduler-group victim)))
       task)))
@@ -960,26 +1045,35 @@
     (let ([local (async-work-pop! sched)])
       (if local
           (async-adopt-work! sched local)
-          (let* ([group ($async-scheduler-group sched)]
-                 [schedulers (async-scheduler-group-schedulers group)]
-                 [n (vector-length schedulers)]
-                 [start (async-scheduler-group-index sched)])
-            (let loop ([offset 1])
-              (if (fx= offset n)
-                  #f
-                  (let ([task
-                         (async-work-steal!
-                           (vector-ref schedulers
-                             (fxmod (fx+ start offset) n)))])
-                    (if task
-                        (async-adopt-work! sched task)
-                        (loop (fx+ offset 1)))))))))))
+          (let ([injected (async-group-take-ready! sched)])
+            (if injected
+                injected
+                (let* ([group ($async-scheduler-group sched)]
+                       [schedulers (async-scheduler-group-schedulers group)]
+                       [n (vector-length schedulers)]
+                       [start (async-scheduler-group-index sched)])
+                  (let loop ([offset 1])
+                    (if (fx= offset n)
+                        #f
+                        (let ([task
+                               (async-work-steal!
+                                 (vector-ref schedulers
+                                   (fxmod (fx+ start offset) n)))])
+                          (if task
+                              (async-adopt-work! sched task)
+                              (loop (fx+ offset 1)))))))))))))
 
 (define async-work-submit!
   (lambda (task preferred)
-    (async-work-push! preferred task)
-    (async-wake-scheduler
-      (async-group-next-wake-target! (async-task-scheduler-group task)))))
+    (if (and (eq? ($async-scheduler) preferred)
+             (async-scheduler-owner-thread preferred)
+             (fx= (async-scheduler-owner-thread preferred) (get-thread-id)))
+        (begin
+          (async-work-push! preferred task)
+          (async-wake-scheduler
+            (async-group-next-wake-target!
+              (async-task-scheduler-group task))))
+        (async-group-submit! task))))
 
 (define async-group-wake!
   (lambda (group)
@@ -1160,16 +1254,16 @@
 
 (define make-async-group
   (lambda (parent context)
-    (make-async-task-group% '() '() '() '() parent context
+    (make-async-task-group% (make-eq-hashtable) 0 '() '() '() parent context
       (make-async-os-mutex))))
 
 (define group-cancel-children!
   (lambda (grp reason)
     (async-context-cancel-core! (async-task-group-context grp) reason)
     (with-async-mutex (async-task-group-mutex grp)
-      (for-each
+      (vector-for-each
         (lambda (t) (task-cancel! t reason))
-        (async-task-group-children grp))
+        (hashtable-values (async-task-group-children grp)))
       (for-each
         (lambda (g) (group-cancel-children! g reason))
         (async-task-group-subgroups grp)))))
@@ -1178,13 +1272,15 @@
   (lambda (grp task)
     (let ([waiters
            (with-async-mutex (async-task-group-mutex grp)
-             (async-task-group-children-set! grp
-               (remq task (async-task-group-children grp)))
+             (when (hashtable-ref (async-task-group-children grp) task #f)
+               (hashtable-delete! (async-task-group-children grp) task)
+               (async-task-group-child-count-set! grp
+                 (fx- (async-task-group-child-count grp) 1)))
              (when (eq? (async-task-state task) 'failed)
                (async-task-group-unobserved-set! grp
                  (cons (cons task (async-task-failure-condition task))
                        (async-task-group-unobserved grp))))
-             (if (null? (async-task-group-children grp))
+             (if (fx= (async-task-group-child-count grp) 0)
                  (let ([ws (async-task-group-waiters grp)])
                    (async-task-group-waiters-set! grp '())
                    ws)
@@ -1196,11 +1292,11 @@
     (make-async-operation
       (lambda (ss)
         (with-async-mutex (async-task-group-mutex grp)
-          (and (null? (async-task-group-children grp))
+          (and (fx= (async-task-group-child-count grp) 0)
                (cons 'values '()))))
       (lambda (ss deliver)
         (with-async-mutex (async-task-group-mutex grp)
-          (if (null? (async-task-group-children grp))
+          (if (fx= (async-task-group-child-count grp) 0)
               (begin (deliver (cons 'values '())) #f)
               (begin
                 (async-task-group-waiters-set! grp
@@ -1902,7 +1998,7 @@
       (let loop ()
         (cond
           [(with-async-mutex (async-task-group-mutex grp)
-             (null? (async-task-group-children grp)))
+             (fx= (async-task-group-child-count grp) 0))
            (async-task-cancel-shield?-set! task #f)
            (cond
              [(and (eq? (car outcome) 'done)
@@ -2035,7 +2131,7 @@
       (async-scheduler-group-prompt-tag group)
       group index
       (make-async-queue) (make-async-queue)
-      '() (make-async-os-mutex)
+      (make-async-work-deque)
       (make-async-queue) (make-async-os-mutex)
       (if-feature pthreads (make-condition) #f)
       (make-eq-hashtable) 0 0 #f 'created virtual? 0 '() #f #f
@@ -2076,7 +2172,7 @@
                            (and
                              (async-queue-empty?
                                (async-scheduler-group-ready-queue group))
-                             (fx= (async-scheduler-group-work-count group) 0)
+                             (fx= (async-group-work-count group) 0)
                              (with-mutex
                                (async-scheduler-remote-mutex sched)
                                (async-queue-empty?
@@ -2096,7 +2192,7 @@
                         (and
                           (async-queue-empty?
                             (async-scheduler-group-ready-queue group))
-                          (fx= (async-scheduler-group-work-count group) 0)
+                          (fx= (async-group-work-count group) 0)
                           (not (async-scheduler-group-shutdown? group)))))
              (if (null? ts)
                  (condition-wait (async-scheduler-remote-cond sched)
@@ -3341,8 +3437,9 @@
                       (async-task-group-subgroups-set! pg
                         (cons group (async-task-group-subgroups pg))))))))
             (with-async-mutex (async-task-group-mutex grp)
-              (async-task-group-children-set! grp
-                (cons task (async-task-group-children grp))))
+              (hashtable-set! (async-task-group-children grp) task task)
+              (async-task-group-child-count-set! grp
+                (fx+ 1 (async-task-group-child-count grp))))
             (sched-registry-add! sched task)
             (if (and migratable?
                      (async-group-parallel? ($async-scheduler-group sched)))
@@ -3460,7 +3557,7 @@
                       (make-async-os-mutex)
                       (if-feature pthreads (make-condition) #f)
                       (make-async-queue) (make-eq-hashtable) 0
-                      (box (cons 0 '())) '#() #f 0 0 0 #f #f '())]
+                      (box (cons 0 '())) '#() #f 0 0 (box 0) #f #f '())]
              [schedulers (make-vector parallelism)])
         (do ([i 0 (fx+ i 1)]) ((fx= i parallelism))
           (vector-set! schedulers i
