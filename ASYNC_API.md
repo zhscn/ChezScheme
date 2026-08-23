@@ -41,8 +41,8 @@ A positive `preemption-ticks` budget enables safe-point preemption with
 one-shot fiber continuations. Preempted migratable tasks remain eligible for
 work stealing. Timer delivery is deferred while a more deeply nested
 delimited-control prompt is active. `run-async` cannot be called inside an
-active engine. A task running under a preemptive scheduler also cannot invoke
-a nested `run-async`.
+active engine, and an engine cannot be invoked from an async task. A task
+running under a preemptive scheduler also cannot invoke a nested `run-async`.
 
 ```scheme
 (spawn-task thunk option value ...) -> task

@@ -118,8 +118,8 @@ Optional configuration settings may be supplied as alternating
   a migratable task remains eligible for work stealing when it becomes ready.
   Timer delivery is deferred while a more deeply nested delimited-control
   prompt is active.  \scheme{run-async} cannot be called inside an active
-  engine.  A task running in a preemptive scheduler also cannot invoke a
-  nested \scheme{run-async}.
+  engine, and an engine cannot be invoked from an async task.  A task running
+  in a preemptive scheduler also cannot invoke a nested \scheme{run-async}.
 \end{description}
 
 \scheme{run-async} returns the values returned by \var{thunk}.  If the root

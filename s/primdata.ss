@@ -2269,6 +2269,7 @@
   ($async-io-shutdown [flags])
   ($async-monotonic-us [flags])
   ($async-new-thread-parameter [flags])
+  ($async-task-active? [flags])
   ($engine-active? [flags])
   ($async-sync-state-live? [flags])
   ($async-sync-slot-set! [flags])

@@ -83,6 +83,8 @@
 (define run-engine
  ; run a continuation as an engine
   (lambda (k ticks)
+    (when ($async-task-active?)
+      ($oops 'engine "cannot run an engine inside an async task"))
     ((call/cc
        (lambda (exit)
          (set-timer 0)

@@ -15,6 +15,7 @@
 
 (begin
 (set! $async-new-thread-parameter (lambda (index initval size) (void)))
+(set! $async-task-active? (lambda () #f))
 
 (define-who make-parameter
   (case-lambda

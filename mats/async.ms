@@ -38,6 +38,70 @@
         (proc)
         (fx+ 1 (async-test-call-at-depth (fx- depth 1) proc)))))
 
+(define async-test-spawn-stale-parameter-task
+  (lambda (parameters-box)
+    (let ([old (make-thread-parameter 'old-initial)])
+      (old 'stale-slot-value)
+      (spawn-task
+        (lambda ()
+          (map (lambda (entry) ((car entry))) (unbox parameters-box)))))))
+
+(define async-test-external-parameter-reuse
+  (lambda ()
+    (if (not (threaded?))
+        #t
+        (let ([mutex (make-mutex)]
+              [condition (make-condition)]
+              [stage 0]
+              [parameters-box (box '())]
+              [result-box (box #f)])
+          (define advance!
+            (lambda (next)
+              (with-mutex mutex
+                (set! stage next)
+                (condition-broadcast condition))))
+          (define await!
+            (lambda (target)
+              (with-mutex mutex
+                (let loop ()
+                  (unless (>= stage target)
+                    (condition-wait condition mutex)
+                    (loop))))))
+          (let ([worker
+                 (fork-thread
+                   (lambda ()
+                     (set-box! result-box
+                       (guard (c [else c])
+                         (run-async
+                           (lambda ()
+                             (let ([task
+                                    (async-test-spawn-stale-parameter-task
+                                      parameters-box)])
+                               (advance! 1)
+                               (await! 2)
+                               (task-join task))))))
+                     (advance! 3)))])
+            (await! 1)
+            ;; The old parameter procedure is unreachable, but its value is
+            ;; still present in the suspended fiber snapshot.  Allocation
+            ;; drains the slot guardian and then reuses the released slot.
+            (collect)
+            (collect)
+            (let ([entries
+                   (let loop ([i 0] [entries '()])
+                     (if (fx= i 64)
+                         (reverse entries)
+                         (let ([initial (cons 'fresh i)])
+                           (loop (fx+ i 1)
+                             (cons
+                               (cons (make-thread-parameter initial) initial)
+                               entries)))))])
+              (set-box! parameters-box entries)
+              (advance! 2)
+              (await! 3)
+              (thread-join worker)
+              (equal? (unbox result-box) (map cdr entries))))))))
+
 (mat async
 
   ;; ---- basic scheduling
@@ -299,6 +363,26 @@
      100000
      (lambda (ticks value) value)
      (lambda (next) 'expired)))
+
+  ;; Engine timer and define-threaded control state are worker-local.  Invoking
+  ;; an engine from either kind of async task is rejected before it can replace
+  ;; the task scheduler's timer handler or suspend engine state in a fiber.
+  (error?
+    (run-async
+      (lambda ()
+        ((make-engine (lambda () (task-yield)))
+         100000
+         (lambda args args)
+         (lambda (next) 'expired)))))
+  (error?
+    (run-async
+      (lambda ()
+        ((make-engine (lambda () (task-yield)))
+         100000
+         (lambda args args)
+         (lambda (next) 'expired)))
+      'parallelism 4
+      'preemption-ticks 1000))
 
   ;; A timer trap observes cancellation of CPU-bound code without requiring an
   ;; explicit async operation or cooperative yield.
@@ -1249,6 +1333,10 @@
                         'parallelism 4)
                       (cons 'creator (make-list 8 'initial)))
               (loop (fx+ i 1))))))
+
+  ;; Slot reuse is process-wide. A parameter allocated outside the scheduler
+  ;; updates snapshots belonging to every live scheduler group.
+  (async-test-external-parameter-reuse)
 
   ;; scheduler exit restores the caller's thread-parameter state
   (equal? (let ([p (make-thread-parameter 'outside)])

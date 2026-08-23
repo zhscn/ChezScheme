@@ -343,8 +343,7 @@
   (fields
     (immutable parent)
     (immutable mutex)
-    (mutable canceled? async-context-canceled?/raw
-             async-context-canceled?/raw-set!)
+    (immutable canceled-box async-context-canceled-box)
     (mutable reason async-context-reason/raw async-context-reason/raw-set!)
     (mutable children)
     (mutable waiters)                ; list of (ss . deliver)
@@ -358,7 +357,7 @@
   (fields (immutable context)))
 
 (define-record-type (async-task make-async-task $async-task?)
-  (nongenerative async-task-layer10)
+  (nongenerative async-task-layer11)
   (sealed #t)
   (fields
     (immutable id)
@@ -371,7 +370,6 @@
     (mutable scheduler)             ; current or most recent execution scheduler
     (mutable wait-scheduler)        ; scheduler that owns the current wait
     (immutable migratable?)
-    (mutable affinity-reasons)      ; scheduler-bound execution constraints
     (mutable suspension-state)      ; #f | unwinding | parking | parked | delivered
     (mutable dynamic-state)         ; saved async-dynamic-state
     (mutable exception-state)       ; exception-state record
@@ -382,13 +380,13 @@
     (mutable failure-condition)     ; failure or cancellation condition
     (mutable join-waiters)          ; list of (ss . deliver)
     (mutable observed?)             ; failure observed by a joiner
-    (mutable cancel-state)          ; #f | requested | delivered
+    (immutable cancel-state-box)    ; atomic box: #f | requested
     (mutable cancel-condition)
     (mutable current-wait)          ; wait description or #f
     (mutable nack-thunk)            ; withdraws the current wait
     (mutable payload)               ; pending delivery for a ready task
     (mutable sync-state)            ; box of the current wait, or #f
-    (mutable cancel-shield?)        ; #t in shielded internal waits
+    (immutable cancel-shield-box)   ; atomic box: cancellation temporarily masked
     (mutable termination-actions)   ; trusted hooks run exactly at termination
     (mutable owned-mutexes)         ; async locks released at termination
     (immutable mutex)))
@@ -405,6 +403,33 @@
     (mutable parent)                ; parent group or #f
     (immutable context)
     (immutable mutex)))
+
+;;; Cancellation is published across scheduler workers.  Atomic reads pair
+;;; the flag with condition/reason initialization performed before the flag is
+;;; set, while shield transitions remain visible to foreign completers.
+(define async-context-canceled?/raw
+  (lambda (context)
+    (and (async-atomic-box-ref (async-context-canceled-box context)) #t)))
+
+(define async-context-canceled?/raw-set!
+  (lambda (context value)
+    (async-atomic-box-set! (async-context-canceled-box context) value)))
+
+(define async-task-cancel-state
+  (lambda (task)
+    (async-atomic-box-ref (async-task-cancel-state-box task))))
+
+(define async-task-cancel-state-set!
+  (lambda (task value)
+    (async-atomic-box-set! (async-task-cancel-state-box task) value)))
+
+(define async-task-cancel-shield?
+  (lambda (task)
+    (and (async-atomic-box-ref (async-task-cancel-shield-box task)) #t)))
+
+(define async-task-cancel-shield?-set!
+  (lambda (task value)
+    (async-atomic-box-set! (async-task-cancel-shield-box task) value)))
 
 (define-record-type (operation make-async-operation $async-operation?)
   (nongenerative)
@@ -531,6 +556,40 @@
               config
               (loop)))))))
 
+;;; Thread-parameter slots are allocated and reused process-wide.  Keep the
+;;; update logs of all live scheduler groups registered under the same runtime
+;;; mutex used by the slot allocator, so a publication cannot miss a group
+;;; whose fibers already have saved parameter vectors.
+(define async-parameter-configs (box '()))
+
+(define async-register-parameter-config!
+  (lambda ()
+    (let ([config (box (cons 0 '()))])
+      (if-feature pthreads
+        (with-tc-mutex
+          (async-atomic-box-set! async-parameter-configs
+            (cons (weak-cons config #t)
+              (async-atomic-box-ref async-parameter-configs))))
+        (void))
+      config)))
+
+(define async-unregister-parameter-config!
+  (lambda (config)
+    (if-feature pthreads
+      (with-tc-mutex
+        (async-atomic-box-set! async-parameter-configs
+          (filter
+            (lambda (entry)
+              (let ([registered (car entry)])
+                (and (not (bwp-object? registered))
+                     (not (eq? registered config)))))
+            (async-atomic-box-ref async-parameter-configs))))
+      (void))))
+
+(define async-parameter-version
+  (lambda (group)
+    (car (async-parameter-config-ref group))))
+
 ;;; ------------------------------------------------ cancellation contexts
 
 (define async-current-context
@@ -570,11 +629,11 @@
                               [waiters (async-context-waiters context)]
                               [cancel-timer
                                (async-context-deadline-cancel context)])
-                          (async-context-canceled?/raw-set! context #t)
                           (async-context-reason/raw-set! context reason)
                           (async-context-children-set! context '())
                           (async-context-waiters-set! context '())
                           (async-context-deadline-cancel-set! context #f)
+                          (async-context-canceled?/raw-set! context #t)
                           (values #t children waiters cancel-timer))))])
       (when won?
         (async-context-detach! context)
@@ -591,7 +650,7 @@
   (lambda (parent)
     (let ([context
            (make-async-context% parent (make-async-os-mutex)
-             #f #f '() '() #f)])
+             (box #f) #f '() '() #f)])
       (when parent
         (let-values ([(canceled? reason)
                       (with-async-mutex (async-context-mutex parent)
@@ -713,33 +772,34 @@
 ;;; for reused slots.
 (define async-new-thread-parameter
   (lambda (index initval size)
+    ;; This hook runs inside the runtime's thread-context mutex, after the new
+    ;; slot has been initialized in every live thread context.  Registration
+    ;; and removal of group logs use that mutex as well.
+    (let loop ([entries (async-atomic-box-ref async-parameter-configs)]
+               [live '()])
+      (if (null? entries)
+          (async-atomic-box-set! async-parameter-configs (reverse live))
+          (let* ([entry (car entries)]
+                 [config-box (car entry)])
+            (if (bwp-object? config-box)
+                (loop (cdr entries) live)
+                (let* ([config (async-atomic-box-ref config-box)]
+                       [version (fx+ 1 (car config))]
+                       [next
+                        (cons version
+                          (cons (list version index initval size)
+                            (cdr config)))])
+                  (unless (box-cas! config-box config next)
+                    ($oops 'make-thread-parameter
+                      "concurrent parameter publication under the thread-context mutex"))
+                  (loop (cdr entries) (cons entry live)))))))
+    ;; The allocating thread already contains the initialized slot.  Mark its
+    ;; scheduler view current; the next task snapshot takes the group version
+    ;; directly and preserves any mutation made after this allocation.
     (let ([sched ($async-scheduler)])
       (when ($async-scheduler? sched)
-        (let ([group ($async-scheduler-group sched)])
-          ;; This hook runs inside the runtime's thread-context mutex, after
-          ;; the new slot has been initialized in every live thread context.
-          ;; Allocations are serialized by that mutex.  Publishing through the
-          ;; atomic box avoids a lock inversion with Scheme mutex bookkeeping,
-          ;; which can itself acquire the thread-context mutex.
-          (let* ([config-box (async-scheduler-group-parameter-config group)]
-                 [config (async-parameter-config-ref group)]
-                 [version (fx+ 1 (car config))]
-                 [next
-                  (cons version
-                    (cons (list version index initval size) (cdr config)))])
-            (unless (box-cas! config-box config next)
-              ($oops 'make-thread-parameter
-                "concurrent parameter publication under the thread-context mutex"))
-            ;; The allocating task is already running with the new slot
-            ;; initialized by the runtime.  Record the version on that task;
-            ;; other snapshots advance lazily when their task is installed.
-            (let ([task (async-scheduler-current-task sched)])
-              (when task
-                (async-task-dynamic-state-set! task
-                  (async-apply-parameter-config
-                    (async-task-dynamic-state task) next))))
-            ;; The allocating thread has already installed this slot.
-            (async-scheduler-active-dynamic-version-set! sched version)))))))
+        (async-scheduler-active-dynamic-version-set! sched
+          (async-parameter-version ($async-scheduler-group sched)))))))
 
 ;;; ------------------------------------------- scheduler/task internal helpers
 
@@ -784,27 +844,9 @@
       (and (async-scheduler? sched)
            (async-scheduler-in-switch? sched)))))
 
-(define async-task-add-affinity!
-  (lambda (task reason)
-    (with-async-mutex (async-task-mutex task)
-      (unless (memq reason (async-task-affinity-reasons task))
-        (async-task-affinity-reasons-set! task
-          (cons reason (async-task-affinity-reasons task)))))))
-
-(define async-task-remove-affinity!
-  (lambda (task reason)
-    (with-async-mutex (async-task-mutex task)
-      (async-task-affinity-reasons-set! task
-        (remq reason (async-task-affinity-reasons task))))))
-
-(define async-task-affine?
-  (lambda (task)
-    (pair? (async-task-affinity-reasons task))))
-
 (define async-task-group-runnable?
   (lambda (task)
     (and (async-task-migratable? task)
-         (not (async-task-affine? task))
          (async-group-parallel? (async-task-scheduler-group task)))))
 
 (define sched-now
@@ -818,7 +860,7 @@
     (let* ([group ($async-scheduler-group sched)]
            [ambient
             (async-snapshot-dynamic-state
-              (async-scheduler-active-dynamic-version sched))]
+              (async-parameter-version group))]
            [state (async-normalize-and-install-dynamic-state! group
                     (async-task-dynamic-state task))])
       (async-scheduler-saved-dynamic-state-set! sched ambient)
@@ -833,8 +875,7 @@
   (lambda (sched task)
     (async-task-dynamic-state-set! task
       (async-snapshot-dynamic-state
-        (async-dynamic-state-version
-          (async-task-dynamic-state task))))
+        (async-parameter-version ($async-scheduler-group sched))))
     (async-task-exception-state-set! task (current-exception-state))))
 
 (define restore-scheduler-dynamic-state!
@@ -1963,12 +2004,24 @@
                  (let ([id (async-scheduler-group-next-task-id group)])
                    (async-scheduler-group-next-task-id-set! group (fx+ 1 id))
                    id))])
-      (make-async-task id name 'ready entry #f #f group sched #f migratable? '() #f
+      (make-async-task id name 'ready entry #f #f group sched #f migratable? #f
         (async-snapshot-dynamic-state
-          (async-scheduler-active-dynamic-version sched))
+          (async-parameter-version group))
         (current-exception-state)
-        parent-group (async-make-context parent-context) #f '() #f '() #f #f
-        #f #f #f #f #f #f termination-actions '()
+        parent-group (async-make-context parent-context)
+        #f                         ; child group
+        '()                        ; result values
+        #f                         ; failure condition
+        '()                        ; join waiters
+        #f                         ; observed?
+        (box #f)                   ; cancel state
+        #f                         ; cancel condition
+        #f                         ; current wait
+        #f                         ; nack thunk
+        #f                         ; payload
+        #f                         ; sync state
+        (box #f)                   ; cancellation shield
+        termination-actions '()
         (make-async-os-mutex)))))
 
 (define ensure-child-group
@@ -2140,7 +2193,8 @@
       (make-async-queue) (make-async-os-mutex)
       (if-feature pthreads (make-condition) #f)
       (make-eq-hashtable) 0 0 #f 'created virtual? 0 '() #f #f
-      (async-snapshot-dynamic-state 0) 0 (current-exception-state)
+      (async-snapshot-dynamic-state (async-parameter-version group))
+      (async-parameter-version group) (current-exception-state)
       0 0 preemption-ticks 0 0 0 #f #f #f)))
 
 (define async-drain-remote!
@@ -3580,9 +3634,9 @@
                              (task-cancel-requested? task))
                          (values #f #f)
                          (begin
-                           (async-task-cancel-state-set! task 'requested)
                            (async-task-cancel-condition-set! task
                              (make-async-cancellation-condition reason))
+                           (async-task-cancel-state-set! task 'requested)
                            (values
                              (async-task-child-group task)
                              (and (eq? (async-task-state task) 'waiting)
@@ -3663,12 +3717,13 @@
         (if-feature pthreads
           (void)
           ($oops who "parallel scheduler groups require thread support")))
-      (let* ([group (make-async-scheduler-group
+      (let* ([parameter-config (async-register-parameter-config!)]
+             [group (make-async-scheduler-group
                       (control:make-continuation-prompt-tag 'async-scheduler-group)
                       (make-async-os-mutex)
                       (if-feature pthreads (make-condition) #f)
                       (make-async-queue) (make-eq-hashtable) 0
-                      (box (cons 0 '())) '#() #f 0 0 (box 0) #f #f '())]
+                      parameter-config '#() #f 0 0 (box 0) #f #f '())]
              [schedulers (make-vector parallelism)])
         (do ([i 0 (fx+ i 1)]) ((fx= i parallelism))
           (vector-set! schedulers i
@@ -3714,6 +3769,7 @@
           (if-feature pthreads
             (for-each thread-join workers)
             (void)))
+        (async-unregister-parameter-config! parameter-config)
         (async-debug-check-group-quiescent! group)
         (when (async-scheduler-group-failure group)
           (raise (async-scheduler-group-failure group)))
@@ -3766,6 +3822,12 @@
 ;;; Hooks consumed by asyncio.ss.  $async-io-shutdown is replaced by the io
 ;;; layer's real shutdown procedure when that file is loaded.
 (set! $async-new-thread-parameter async-new-thread-parameter)
+(set! $async-task-active?
+  (lambda ()
+    (let ([sched ($async-scheduler)])
+      (and (async-scheduler? sched)
+           (async-scheduler-current-task sched)
+           #t))))
 (set! $async-sync-state-live? async-sync-state-live?)
 (set! $async-sync-slot-set! async-sync-slot-set!)
 (set! $async-sync-slot-ref async-sync-slot-ref)

@@ -480,13 +480,16 @@ operating-system thread. A spawned task inherits the values of its parent's
 parameters, while subsequent parameter mutations are isolated between tasks.
 
 The runtime captures and activates a dynamic-state snapshot that includes
-ordinary dynamic parameter state and thread-parameter values. Snapshot
-activation preserves the normal interaction between `parameterize`,
+ordinary dynamic parameter state and thread-parameter values. Thread-parameter
+slot allocation and reuse are published to every live scheduler group before
+the allocator returns, including allocations made by ordinary Scheme threads.
+Snapshot activation preserves the normal interaction between `parameterize`,
 continuation invocation, exception state, and continuation marks.
 
-Scheduler ownership, the currently running task, and libuv callback state are
-kept in scheduler-controlled storage rather than inherited task parameters.
-Activating a task cannot replace these scheduler invariants.
+Scheduler ownership, the currently running task, exception dispatch state,
+and libuv callback state are maintained separately from the task snapshot or
+reinstalled immediately after its activation. Activating a task cannot replace
+these scheduler invariants.
 
 Each task carries a versioned dynamic-state snapshot that is activated before
 the task enters user code. Parameter changes, exception state, and
@@ -609,11 +612,11 @@ extent of a more deeply nested delimited-control prompt. The prompt runtime
 tracks the innermost activation explicitly, so a timer delivered in such an
 extent is rearmed without capturing a partially owned prompt stack.
 
-An async scheduler cannot be entered from an active engine. Engine control
-state is runtime-thread-local and is not included in the fiber-local dynamic
-state contract. A task running under a preemptive scheduler cannot invoke a
-nested scheduler because the outer task owns that thread's timer until its
-turn ends.
+An async scheduler cannot be entered from an active engine, and an engine
+cannot be invoked from an async task. Engine control state and timer ownership
+are runtime-thread-local and are not included in the fiber-local dynamic-state
+contract. A task running under a preemptive scheduler cannot invoke a nested
+scheduler because the outer task owns that thread's timer until its turn ends.
 
 Preemption is enabled per `run-async` invocation with a `preemption-ticks`
 value of at least 1000. The lower bound leaves enough runtime instructions for
