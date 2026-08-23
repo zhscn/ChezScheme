@@ -43,6 +43,8 @@ work stealing. Timer delivery is deferred while a more deeply nested
 delimited-control prompt is active. `run-async` cannot be called inside an
 active engine, and an engine cannot be invoked from an async task. A task
 running under a preemptive scheduler also cannot invoke a nested `run-async`.
+An I/O wait resumes first on its owning scheduler; later waits may make the
+task eligible for work stealing again.
 
 ```scheme
 (spawn-task thunk option value ...) -> task

@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <fcntl.h>
 #include <limits.h>
 #if !defined(_WIN32)
@@ -48,12 +49,22 @@
 typedef void (*aio_notify_t)(void *loop, int64_t id, int64_t kind,
                              int64_t status, void *aux);
 
-typedef struct {
+typedef struct aio_loop aio_loop_t;
+
+typedef struct aio_read_buffer {
+  struct aio_read_buffer *next;
+  aio_loop_t *owner;
+  char data[65536];
+} aio_read_buffer_t;
+
+struct aio_loop {
   uv_loop_t *loop;
   aio_notify_t notify;
   uv_async_t *wakeup;    /* lets foreign threads interrupt a blocking uv_run */
   uv_timer_t *bridge;    /* fires at the nearest Scheme-side timer deadline */
-} aio_loop_t;
+  aio_read_buffer_t *read_buffers;
+  unsigned int read_buffer_count;
+};
 
 /* per-request context for operations that carry C-owned data */
 typedef struct {
@@ -130,6 +141,35 @@ static aio_loop_t *aio_loop_of(uv_loop_t *loop) {
   return (aio_loop_t *)uv_loop_get_data(loop);
 }
 
+static char *aio_read_buffer_take(aio_loop_t *al) {
+  aio_read_buffer_t *buffer = al->read_buffers;
+  if (buffer) {
+    al->read_buffers = buffer->next;
+    al->read_buffer_count--;
+  } else {
+    buffer = (aio_read_buffer_t *)malloc(sizeof(*buffer));
+    if (!buffer) return NULL;
+    buffer->owner = al;
+  }
+  buffer->next = NULL;
+  return buffer->data;
+}
+
+static void aio_read_buffer_return(char *data) {
+  aio_read_buffer_t *buffer;
+  aio_loop_t *al;
+  if (!data) return;
+  buffer = (aio_read_buffer_t *)(data - offsetof(aio_read_buffer_t, data));
+  al = buffer->owner;
+  if (al->read_buffer_count < 32) {
+    buffer->next = al->read_buffers;
+    al->read_buffers = buffer;
+    al->read_buffer_count++;
+  } else {
+    free(buffer);
+  }
+}
+
 static void aio_report(uv_loop_t *loop, int64_t id, int64_t kind,
                        int64_t status, void *aux) {
   aio_loop_t *al = aio_loop_of(loop);
@@ -157,6 +197,8 @@ void *aio_loop_open(void) {
   al->notify = NULL;
   al->wakeup = NULL;
   al->bridge = NULL;
+  al->read_buffers = NULL;
+  al->read_buffer_count = 0;
   uv_loop_set_data(al->loop, al);
   (void)uv_loop_configure(al->loop, UV_METRICS_IDLE_TIME);
   return al;
@@ -184,6 +226,11 @@ int aio_loop_destroy(void *al_) {
   aio_loop_t *al = (aio_loop_t *)al_;
   int r = uv_loop_close(al->loop);
   if (r == 0) {
+    while (al->read_buffers) {
+      aio_read_buffer_t *buffer = al->read_buffers;
+      al->read_buffers = buffer->next;
+      free(buffer);
+    }
     free(al->loop);
     free(al);
   }
@@ -362,23 +409,22 @@ int aio_pipe_connect(void *h, const char *path, int64_t reqid) {
 static void aio_read_alloc_cb(uv_handle_t *h, size_t suggested,
                               uv_buf_t *buf) {
   (void)suggested;
-  buf->base = (char *)malloc(65536);
+  buf->base = aio_read_buffer_take(aio_loop_of(h->loop));
   buf->len = buf->base ? 65536 : 0;
-  (void)h;
 }
 
 static void aio_read_cb(uv_stream_t *stream, ssize_t nread,
                         const uv_buf_t *buf) {
   int64_t id = (int64_t)(intptr_t)uv_handle_get_data((uv_handle_t *)stream);
   if (nread == 0) {
-    free(buf->base);
+    aio_read_buffer_return(buf->base);
     return;
   }
   uv_read_stop(stream);
   if (nread > 0) {
     aio_report(stream->loop, id, AIO_EV_READ, nread, buf->base);
   } else {
-    free(buf->base);
+    aio_read_buffer_return(buf->base);
     aio_report(stream->loop, id, AIO_EV_READ, nread, NULL);
   }
 }
@@ -388,7 +434,7 @@ void aio_read_copy(void *buf, void *dest, int64_t n) {
   memcpy(dest, buf, (size_t)n);
 }
 
-void aio_free(void *p) { free(p); }
+void aio_free(void *p) { aio_read_buffer_return((char *)p); }
 
 int aio_read_start(void *h) {
   return uv_read_start((uv_stream_t *)h, aio_read_alloc_cb, aio_read_cb);
@@ -481,9 +527,8 @@ int aio_udp_connect(void *h, const char *host, int64_t port) {
 }
 
 static void aio_udp_alloc_cb(uv_handle_t *h, size_t suggested, uv_buf_t *buf) {
-  (void)h;
   (void)suggested;
-  buf->base = (char *)malloc(65536);
+  buf->base = aio_read_buffer_take(aio_loop_of(h->loop));
   buf->len = buf->base ? 65536 : 0;
 }
 
@@ -493,18 +538,18 @@ static void aio_udp_recv_cb(uv_udp_t *h, ssize_t nread, const uv_buf_t *buf,
   aio_udp_recv_ctx_t *ctx;
   (void)flags;
   if (nread == 0 && addr == NULL) {
-    free(buf->base);
+    aio_read_buffer_return(buf->base);
     return;
   }
   uv_udp_recv_stop(h);
   if (nread < 0) {
-    free(buf->base);
+    aio_read_buffer_return(buf->base);
     aio_report(h->loop, id, AIO_EV_UDP_RECV, nread, NULL);
     return;
   }
   ctx = (aio_udp_recv_ctx_t *)malloc(sizeof(*ctx));
   if (!ctx) {
-    free(buf->base);
+    aio_read_buffer_return(buf->base);
     aio_report(h->loop, id, AIO_EV_UDP_RECV, UV_ENOMEM, NULL);
     return;
   }
@@ -562,7 +607,7 @@ int64_t aio_udp_recv_addr(void *ctx_, char *buf, int64_t buflen) {
 void aio_udp_recv_free(void *ctx_) {
   aio_udp_recv_ctx_t *ctx = (aio_udp_recv_ctx_t *)ctx_;
   if (!ctx) return;
-  free(ctx->buf);
+  aio_read_buffer_return(ctx->buf);
   free(ctx);
 }
 

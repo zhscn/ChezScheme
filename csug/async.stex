@@ -30,6 +30,8 @@ libuv.  Tasks marked as migratable may be automatically transferred among
 schedulers in the same group via work stealing, enabling scalable
 multicore concurrency without requiring low-level thread synchronization by
 the programmer.
+An I/O wait resumes first on the scheduler that owns its registration.  The
+task becomes eligible for work stealing again after that resumed turn.
 
 The asynchronous scheduler is entered by invoking \scheme{run-async}.
 Procedures described as blocking in this chapter suspend only the calling

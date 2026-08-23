@@ -572,9 +572,10 @@ current scheduler.
 
 Idle schedulers may steal only ready, migratable tasks. Waiting tasks are not
 stolen; their completion is delivered to the scheduler that owns the wait.
-After completion, an unpinned task is eligible for migration again. A waiting
-task remains registered with the scheduler that owns its current suspension;
-only ready tasks enter the stealable work deque.
+An I/O completion resumes once on the scheduler that owns the wait; after that
+turn, the task is eligible for migration again. A waiting task remains
+registered with the scheduler that owns its current suspension; only ready
+tasks enter the stealable work deque.
 
 Cross-scheduler channels and task joins use atomic queues. Publishing remote
 work wakes the destination loop with `uv_async_send`. Scheduler-local I/O

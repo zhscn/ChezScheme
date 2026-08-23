@@ -94,6 +94,82 @@
       (when (null? (cdr h)) (async-fifo-tail-set! q '()))
       (car h))))
 
+;;; Intrusive FIFO for cancelable waiters.  A registration retains its node,
+;;; so cancellation can unlink it in O(1) without rebuilding the queue.
+(define-record-type (async-wait-node make-async-wait-node async-wait-node?)
+  (nongenerative)
+  (sealed #t)
+  (fields
+    (immutable value)
+    (mutable queue)
+    (mutable previous)
+    (mutable next)))
+
+(define-record-type (async-wait-queue make-async-wait-queue% async-wait-queue?)
+  (nongenerative)
+  (sealed #t)
+  (fields (mutable head) (mutable tail)))
+
+(define make-async-wait-queue
+  (lambda () (make-async-wait-queue% #f #f)))
+
+(define async-wait-queue-empty?
+  (lambda (queue) (not (async-wait-queue-head queue))))
+
+(define async-wait-queue-add!
+  (lambda (queue value)
+    (let* ([tail (async-wait-queue-tail queue)]
+           [node (make-async-wait-node value queue tail #f)])
+      (if tail
+          (async-wait-node-next-set! tail node)
+          (async-wait-queue-head-set! queue node))
+      (async-wait-queue-tail-set! queue node)
+      node)))
+
+(define async-wait-queue-remove!
+  (lambda (queue node)
+    (and (async-wait-node? node)
+         (eq? (async-wait-node-queue node) queue)
+         (let ([previous (async-wait-node-previous node)]
+               [next (async-wait-node-next node)])
+           (if previous
+               (async-wait-node-next-set! previous next)
+               (async-wait-queue-head-set! queue next))
+           (if next
+               (async-wait-node-previous-set! next previous)
+               (async-wait-queue-tail-set! queue previous))
+           (async-wait-node-queue-set! node #f)
+           (async-wait-node-previous-set! node #f)
+           (async-wait-node-next-set! node #f)
+           #t))))
+
+(define async-wait-queue-reinsert-front!
+  (lambda (queue node)
+    (and (not (async-wait-node-queue node))
+         (let ([head (async-wait-queue-head queue)])
+           (async-wait-node-queue-set! node queue)
+           (async-wait-node-previous-set! node #f)
+           (async-wait-node-next-set! node head)
+           (when head (async-wait-node-previous-set! head node))
+           (async-wait-queue-head-set! queue node)
+           (unless (async-wait-queue-tail queue)
+             (async-wait-queue-tail-set! queue node))
+           #t))))
+
+(define async-wait-queue-pop!
+  (lambda (queue)
+    (let ([node (async-wait-queue-head queue)])
+      (when node (async-wait-queue-remove! queue node))
+      node)))
+
+(define async-wait-queue-drain!
+  (lambda (queue)
+    (let loop ([values '()])
+      (let ([node (async-wait-queue-pop! queue)])
+        (if node
+            (loop (cons (async-wait-node-value node) values))
+            (reverse values))))))
+
 ;;; Owner-only Chase--Lev work-stealing deque.  The owner publishes and
 ;;; removes work at bottom; thieves compete for top with CAS.  Growing
 ;;; publishes a fresh ring while the old ring remains reachable by any thief
@@ -130,6 +206,14 @@
       (if (box-cas! b value value)
           value
           (loop (unbox b))))))
+
+(define async-atomic-box-add!
+  (lambda (b delta)
+    (let loop ([old (async-atomic-box-ref b)])
+      (let ([new (+ old delta)])
+        (if (box-cas! b old new)
+            new
+            (loop (async-atomic-box-ref b)))))))
 
 (define async-work-deque-grow!
   (lambda (deque top bottom old-ring)
@@ -196,20 +280,29 @@
 ;;; Completion, cancellation, and failure compete with box-cas!.
 
 (define-record-type (async-sync-state make-async-sync-state% async-sync-state?)
-  (nongenerative async-sync-state-layer6)
+  (nongenerative async-sync-state-layer7)
   (sealed #t)
   (fields
     (immutable state)               ; atomic box: waiting | claimed | (done . payload)
-    (immutable mutex)               ; protects registration metadata and slots
+    (immutable mutex-box)           ; lazily allocated registration mutex
     (mutable registration-phase)    ; new | registering | registered
     (mutable cancel-pending?)
     (mutable nack)
-    (immutable slots)))             ; operation token -> per-perform state
+    (mutable slots)))               ; lazily allocated token -> per-perform state
 
 (define make-async-sync-state
   (lambda ()
-    (make-async-sync-state% (box 'waiting) (make-async-os-mutex)
-      'new #f #f (make-eq-hashtable))))
+    (make-async-sync-state% (box 'waiting) (box #f)
+      'new #f #f #f)))
+
+(define async-sync-state-mutex
+  (lambda (ss)
+    (let ([mutex-box (async-sync-state-mutex-box ss)])
+      (or (async-atomic-box-ref mutex-box)
+          (let ([mutex (make-async-os-mutex)])
+            (if (box-cas! mutex-box #f mutex)
+                mutex
+                (async-atomic-box-ref mutex-box)))))))
 
 (define async-sync-state-live?
   (lambda (ss) (eq? (unbox (async-sync-state-state ss)) 'waiting)))
@@ -254,17 +347,23 @@
 (define async-sync-slot-set!
   (lambda (ss token value)
     (with-async-mutex (async-sync-state-mutex ss)
-      (hashtable-set! (async-sync-state-slots ss) token value))))
+      (let ([slots (or (async-sync-state-slots ss)
+                       (let ([slots (make-eq-hashtable)])
+                         (async-sync-state-slots-set! ss slots)
+                         slots))])
+        (hashtable-set! slots token value)))))
 
 (define async-sync-slot-ref
   (lambda (ss token default)
     (with-async-mutex (async-sync-state-mutex ss)
-      (hashtable-ref (async-sync-state-slots ss) token default))))
+      (let ([slots (async-sync-state-slots ss)])
+        (if slots (hashtable-ref slots token default) default)))))
 
 (define async-sync-slot-delete!
   (lambda (ss token)
     (with-async-mutex (async-sync-state-mutex ss)
-      (hashtable-delete! (async-sync-state-slots ss) token))))
+      (let ([slots (async-sync-state-slots ss)])
+        (when slots (hashtable-delete! slots token))))))
 
 ;;; ------------------------------------------------------------ records
 
@@ -289,7 +388,7 @@
     (mutable status)                ; created | running | shutdown
     (mutable virtual?)              ; deterministic virtual clock
     (mutable vtime)                 ; virtual clock, microseconds
-    (mutable timers)                ; sorted list of async-timer
+    (immutable timers)              ; indexed min-heap of async-timer
     (mutable current-task)          ; running task or #f
     (mutable in-switch?)            ; #t while unwinding/rewinding a switch
     (mutable saved-exception-state) ; ambient exception state
@@ -298,7 +397,7 @@
     (immutable preemption-ticks)   ; #f for cooperative scheduling
     (mutable preemption-count)
     (mutable suspension-count $async-scheduler-suspension-count $async-scheduler-suspension-count-set!)
-    (mutable wakeup-count $async-scheduler-wakeup-count $async-scheduler-wakeup-count-set!)
+    (immutable wakeup-count-box)
     (mutable wake-proc)             ; io layer wakeup hook, or #f
     (mutable poll-proc)             ; io layer poll hook: scheduler x block? -> void
     (mutable io-state)))            ; io layer data
@@ -316,16 +415,33 @@
     (mutable schedulers)
     (mutable root-task)
     (mutable next-task-id)
-    (mutable next-wake-index)
-    (immutable work-count-box)      ; atomic exact count of ring-deque tasks
+    (mutable idle-schedulers)       ; schedulers that may block waiting for work
     (mutable shutdown?)
     (mutable failure)
     (mutable workers)))
 
 (define-record-type (async-timer make-async-timer async-timer?)
+  (nongenerative async-timer-layer2)
+  (sealed #t)
+  (fields
+    (immutable deadline)
+    (immutable sequence)
+    (immutable deliver-box)
+    (mutable heap async-timer-owner-heap async-timer-owner-heap-set!)
+    (mutable index)))
+
+(define-record-type (async-timer-heap make-async-timer-heap% async-timer-heap?)
   (nongenerative)
   (sealed #t)
-  (fields (immutable deadline) (immutable deliver-box)))
+  (fields
+    (mutable items)
+    (mutable size)
+    (mutable next-sequence)
+    (immutable mutex)))
+
+(define make-async-timer-heap
+  (lambda ()
+    (make-async-timer-heap% (make-vector 16 #f) 0 0 (make-async-os-mutex))))
 
 (define-record-type (async-context make-async-context% $async-context?)
   (nongenerative)
@@ -335,19 +451,12 @@
     (immutable mutex)
     (immutable canceled-box async-context-canceled-box)
     (mutable reason async-context-reason/raw async-context-reason/raw-set!)
-    (mutable children)
-    (mutable waiters)                ; list of (ss . deliver)
+    (mutable children)               ; context -> context
+    (mutable waiters)                ; sync state -> deliver
     (mutable deadline-cancel)))
 
-(define-record-type (async-context-cancel-result
-                      make-async-context-cancel-result
-                      async-context-cancel-result?)
-  (nongenerative)
-  (sealed #t)
-  (fields (immutable context)))
-
 (define-record-type (async-task make-async-task $async-task?)
-  (nongenerative async-task-layer12)
+  (nongenerative async-task-layer13)
   (sealed #t)
   (fields
     (immutable id)
@@ -360,6 +469,7 @@
     (mutable scheduler)             ; current or most recent execution scheduler
     (mutable wait-scheduler)        ; scheduler that owns the current wait
     (immutable migratable?)
+    (mutable resume-pinned?)        ; next I/O resumption stays on wait owner
     (mutable suspension-state)      ; #f | unwinding | parking | parked | delivered
     ;; Chez exception-handler state is VM dynamic state.  It is activated
     ;; separately at scheduler boundaries.
@@ -530,15 +640,18 @@
     (when timer
       (let* ([deliver-box (async-timer-deliver-box timer)]
              [deliver (unbox deliver-box)])
-        (when deliver (box-cas! deliver-box deliver #f))))))
+        (when (and deliver (box-cas! deliver-box deliver #f))
+          (let ([heap (async-timer-owner-heap timer)])
+            (when heap
+              (with-async-mutex (async-timer-heap-mutex heap)
+                (async-timer-heap-remove/raw! heap timer)))))))))
 
 (define async-context-detach!
   (lambda (context)
     (let ([parent (async-context-parent context)])
       (when parent
         (with-async-mutex (async-context-mutex parent)
-          (async-context-children-set! parent
-            (remq context (async-context-children parent))))))))
+          (hashtable-delete! (async-context-children parent) context))))))
 
 (define async-context-cancel-core!
   (lambda (context reason)
@@ -546,23 +659,27 @@
                   (with-async-mutex (async-context-mutex context)
                     (if (async-context-canceled?/locked context)
                         (values #f '() '() #f)
-                        (let ([children (async-context-children context)]
-                              [waiters (async-context-waiters context)]
+                        (let ([children
+                               (hashtable-values
+                                 (async-context-children context))]
+                              [waiters
+                               (hashtable-values
+                                 (async-context-waiters context))]
                               [cancel-timer
                                (async-context-deadline-cancel context)])
                           (async-context-reason/raw-set! context reason)
-                          (async-context-children-set! context '())
-                          (async-context-waiters-set! context '())
+                          (hashtable-clear! (async-context-children context))
+                          (hashtable-clear! (async-context-waiters context))
                           (async-context-deadline-cancel-set! context #f)
                           (async-context-canceled?/raw-set! context #t)
                           (values #t children waiters cancel-timer))))])
       (when won?
         (async-context-detach! context)
         (when cancel-timer (cancel-timer))
-        (for-each
-          (lambda (waiter) ((cdr waiter) (cons 'values '())))
+        (vector-for-each
+          (lambda (deliver) (deliver (cons 'values '())))
           waiters)
-        (for-each
+        (vector-for-each
           (lambda (child) (async-context-cancel-core! child reason))
           children))
       won?)))
@@ -571,16 +688,16 @@
   (lambda (parent)
     (let ([context
            (make-async-context% parent (make-async-os-mutex)
-             (box #f) #f '() '() #f)])
+             (box #f) #f (make-eq-hashtable) (make-eq-hashtable) #f)])
       (when parent
         (let-values ([(canceled? reason)
                       (with-async-mutex (async-context-mutex parent)
                         (if (async-context-canceled?/locked parent)
                             (values #t (async-context-reason/raw parent))
                             (begin
-                              (async-context-children-set! parent
-                                (cons context
-                                  (async-context-children parent)))
+                              (hashtable-set!
+                                (async-context-children parent)
+                                context context)
                               (values #f #f))))])
           (when canceled?
             (async-context-cancel-core! context reason))))
@@ -599,9 +716,8 @@
                  (if (async-context-canceled?/locked context)
                      #t
                      (begin
-                       (async-context-waiters-set! context
-                         (cons (cons ss deliver)
-                           (async-context-waiters context)))
+                       (hashtable-set! (async-context-waiters context)
+                         ss deliver)
                        #f)))])
           (if ready?
               (begin (deliver (cons 'values '())) #f)
@@ -609,18 +725,22 @@
       (lambda (vals) vals)
       (lambda (ss)
         (with-async-mutex (async-context-mutex context)
-          (async-context-waiters-set! context
-            (let loop ([waiters (async-context-waiters context)])
-              (cond
-                [(null? waiters) '()]
-                [(eq? (caar waiters) ss) (cdr waiters)]
-                [else (cons (car waiters) (loop (cdr waiters)))]))))))))
+          (hashtable-delete! (async-context-waiters context) ss))))))
 
-(define async-context-choice
-  (lambda (context op)
-    (choice-operation op
-      (wrap-operation (async-context-operation context)
-        (lambda () (make-async-context-cancel-result context))))))
+(define async-context-register-waiter!
+  (lambda (context ss deliver)
+    (with-async-mutex (async-context-mutex context)
+      (cond
+        [(not (async-sync-state-live? ss)) #f]
+        [(async-context-canceled?/locked context) 'canceled]
+        [else
+         (hashtable-set! (async-context-waiters context) ss deliver)
+         #t]))))
+
+(define async-context-unregister-waiter!
+  (lambda (context ss)
+    (with-async-mutex (async-context-mutex context)
+      (hashtable-delete! (async-context-waiters context) ss))))
 
 (define async-context-cancellation-condition
   (lambda (context)
@@ -762,18 +882,17 @@
   (lambda (group)
     (fx> (vector-length (async-scheduler-group-schedulers group)) 1)))
 
-(define async-group-work-count
+(define async-group-has-work?
   (lambda (group)
-    (async-atomic-box-ref (async-scheduler-group-work-count-box group))))
-
-(define async-group-work-count-add!
-  (lambda (group delta)
-    (let ([b (async-scheduler-group-work-count-box group)])
-      (let loop ([old (async-atomic-box-ref b)])
-        (let ([new (fx+ old delta)])
-          (if (box-cas! b old new)
-              new
-              (loop (async-atomic-box-ref b))))))))
+    (let ([schedulers (async-scheduler-group-schedulers group)])
+      (let loop ([i 0])
+        (and (fx< i (vector-length schedulers))
+             (let* ([deque
+                     (async-scheduler-work-deque (vector-ref schedulers i))]
+                    [top (async-atomic-box-ref (async-work-deque-top deque))]
+                    [bottom
+                     (async-atomic-box-ref (async-work-deque-bottom deque))])
+               (or (fx< top bottom) (loop (fx+ i 1)))))))))
 
 (define async-debug-check-owner!
   (lambda (sched)
@@ -795,7 +914,7 @@
           (and (fx= (async-scheduler-group-task-count group) 0)
                (fx= (hashtable-size (async-scheduler-group-tasks group)) 0))
           "scheduler group retained terminal tasks" group)
-        (async-invariant (fx= (async-group-work-count group) 0)
+        (async-invariant (not (async-group-has-work? group))
           "scheduler group retained stealable work" group))
       (with-async-mutex async-debug-runnable-mutex
         (let-values ([(tasks locations)
@@ -807,15 +926,34 @@
                 "scheduler group retained a runnable task" task))
             tasks))))))
 
+(define async-group-take-idle/raw!
+  (lambda (group)
+    (let ([idle (async-scheduler-group-idle-schedulers group)])
+      (if (null? idle)
+          #f
+          (begin
+            (async-scheduler-group-idle-schedulers-set! group (cdr idle))
+            (car idle))))))
+
 (define async-group-next-wake-target!
   (lambda (group)
     (with-async-mutex (async-scheduler-group-mutex group)
-      (let* ([schedulers (async-scheduler-group-schedulers group)]
-             [n (vector-length schedulers)]
-             [i (async-scheduler-group-next-wake-index group)])
-        (async-scheduler-group-next-wake-index-set! group
-          (fxmod (fx+ i 1) n))
-        (vector-ref schedulers i)))))
+      (async-group-take-idle/raw! group))))
+
+(define async-group-mark-idle!
+  (lambda (sched)
+    (let ([group ($async-scheduler-group sched)])
+      (with-async-mutex (async-scheduler-group-mutex group)
+        (unless (memq sched (async-scheduler-group-idle-schedulers group))
+          (async-scheduler-group-idle-schedulers-set! group
+            (cons sched (async-scheduler-group-idle-schedulers group))))))))
+
+(define async-group-unmark-idle!
+  (lambda (sched)
+    (let ([group ($async-scheduler-group sched)])
+      (with-async-mutex (async-scheduler-group-mutex group)
+        (async-scheduler-group-idle-schedulers-set! group
+          (remq sched (async-scheduler-group-idle-schedulers group)))))))
 
 (define async-work-push!
   (lambda (sched task)
@@ -831,15 +969,8 @@
       (async-debug-queue-claim! task 'work)
       (vector-set! (async-work-ring-slots ring)
         (fxand bottom (async-work-ring-mask ring)) task)
-      (async-group-work-count-add! ($async-scheduler-group sched) 1)
-      ;; Publish only after the exact group count is visible, so a thief can
-      ;; never decrement an unpublished item.
+      ;; Publish only after the ring slot is visible to thieves.
       (async-atomic-box-set! (async-work-deque-bottom deque) (fx+ bottom 1)))))
-
-(define async-work-count-down!
-  (lambda (group)
-    (async-invariant (fx>= (async-group-work-count-add! group -1) 0)
-      "scheduler group work count became negative" group)))
 
 (define async-work-pop!
   (lambda (sched)
@@ -872,8 +1003,6 @@
                              (async-work-deque-bottom deque) (fx+ top 1)))
                          (async-debug-queue-release! task)
                          task)))])])
-        (when task
-          (async-work-count-down! ($async-scheduler-group sched)))
         task))))
 
 (define async-work-steal!
@@ -891,8 +1020,6 @@
                           (vector-set! (async-work-ring-slots ring) slot #f)
                           (async-debug-queue-release! task)
                           task))))])
-      (when task
-        (async-work-count-down! ($async-scheduler-group victim)))
       task)))
 
 (define async-adopt-work!
@@ -931,9 +1058,10 @@
              (fx= (async-scheduler-owner-thread preferred) (get-thread-id)))
         (begin
           (async-work-push! preferred task)
-          (async-wake-scheduler
-            (async-group-next-wake-target!
-              (async-task-scheduler-group task))))
+          (let ([target
+                 (async-group-next-wake-target!
+                   (async-task-scheduler-group task))])
+            (when target (async-wake-scheduler target))))
         (async-group-submit! task))))
 
 (define async-group-wake!
@@ -959,13 +1087,8 @@
              (with-async-mutex (async-scheduler-group-mutex group)
                (async-debug-queue-claim! task 'group-ready)
                (async-queue-push! (async-scheduler-group-ready-queue group) task)
-               (let* ([schedulers (async-scheduler-group-schedulers group)]
-                      [n (vector-length schedulers)]
-                      [i (async-scheduler-group-next-wake-index group)])
-                 (async-scheduler-group-next-wake-index-set! group
-                   (fxmod (fx+ i 1) n))
-                 (vector-ref schedulers i)))])
-        (async-wake-scheduler target)))))
+               (async-group-take-idle/raw! group))])
+        (when target (async-wake-scheduler target))))))
 
 (define async-group-take-ready!
   (lambda (sched)
@@ -998,6 +1121,7 @@
 (define async-publish-ready!
   (lambda (task completion-sched)
     (if (and (async-task-group-runnable? task)
+             (not (async-task-resume-pinned? task))
              ;; Raising through a captured suspension is entered on the
              ;; scheduler that owns the wait.  Normal values remain free to
              ;; migrate before resumption.
@@ -1035,9 +1159,7 @@
                           (begin
                             (async-task-suspension-state-set! task 'delivered)
                             (values completion-sched #f)))))])
-      (with-async-mutex (async-scheduler-remote-mutex completion-sched)
-        ($async-scheduler-wakeup-count-set! completion-sched
-          (fx+ 1 ($async-scheduler-wakeup-count completion-sched))))
+      (async-atomic-box-add! (async-scheduler-wakeup-count-box completion-sched) 1)
       (when publish?
         (async-publish-ready! task completion-sched)))))
 
@@ -1089,15 +1211,74 @@
 
 ;;; The single claim point for completing a suspended task.  Returns #t when
 ;;; the claim succeeded.
+(define-record-type (async-delivery-reservation
+                      make-async-delivery-reservation
+                      async-delivery-reservation?)
+  (nongenerative)
+  (sealed #t)
+  (fields
+    (immutable sync-state)
+    (immutable task)
+    (immutable payload)
+    (immutable active-box)
+    (mutable prepare-actions)))
+
+(define async-delivery-reserve
+  (lambda (ss task payload)
+    (and (async-sync-state-claim! ss)
+         (make-async-delivery-reservation ss task payload (box #t) '()))))
+
+(define async-delivery-add-action!
+  (lambda (reservation action)
+    (async-delivery-reservation-prepare-actions-set! reservation
+      (cons action (async-delivery-reservation-prepare-actions reservation)))
+    reservation))
+
+(define async-delivery-prepare!
+  (lambda (reservation)
+    (and (box-cas! (async-delivery-reservation-active-box reservation) #t #f)
+         (begin
+           (async-sync-state-complete!
+             (async-delivery-reservation-sync-state reservation)
+             (async-delivery-reservation-payload reservation))
+           (lambda ()
+             (for-each
+               (lambda (action) (action))
+               (reverse
+                 (async-delivery-reservation-prepare-actions reservation)))
+             ($async-deliver-task
+               (async-delivery-reservation-task reservation)
+               (async-delivery-reservation-payload reservation)))))))
+
+(define async-delivery-rollback!
+  (lambda (reservation)
+    (and (box-cas! (async-delivery-reservation-active-box reservation) #t #f)
+         (box-cas!
+           (async-sync-state-state
+             (async-delivery-reservation-sync-state reservation))
+           'claimed 'waiting))))
+
+(define async-delivery-prepare-all!
+  (lambda (reservations)
+    (map async-delivery-prepare! reservations)))
+
+(define async-delivery-publish-all!
+  (lambda (publications)
+    (for-each (lambda (publish) (when publish (publish))) publications)))
+
 (define $async-make-deliver
   (lambda (ss task)
-    (lambda (payload)
-      (if (async-sync-state-claim! ss)
-          (begin
-            (async-sync-state-complete! ss payload)
-            ($async-deliver-task task payload)
-            #t)
-          #f))))
+    (case-lambda
+      [(payload)
+       (let ([reservation (async-delivery-reserve ss task payload)])
+         (and reservation
+              (let ([publish (async-delivery-prepare! reservation)])
+                (publish)
+                #t)))]
+      [(command payload)
+       (case command
+         [(reserve) (async-delivery-reserve ss task payload)]
+         [else ($oops 'async-deliver "invalid delivery command ~s" command)])])))
 
 ;;; Cancellation of a waiting task: claim, nack, resume with condition.
 (define $async-cancel-waiting-task
@@ -1115,19 +1296,24 @@
 
 (define make-async-group
   (lambda (parent context)
-    (make-async-task-group% (make-eq-hashtable) 0 '() '() '() parent context
+    (make-async-task-group% (make-eq-hashtable) 0 '()
+      (make-async-wait-queue) '() parent context
       (make-async-os-mutex))))
 
 (define group-cancel-children!
   (lambda (grp reason)
     (async-context-cancel-core! (async-task-group-context grp) reason)
-    (with-async-mutex (async-task-group-mutex grp)
+    (let-values ([(children subgroups)
+                  (with-async-mutex (async-task-group-mutex grp)
+                    (values
+                      (hashtable-values (async-task-group-children grp))
+                      (async-task-group-subgroups grp)))])
       (vector-for-each
         (lambda (t) (task-cancel! t reason))
-        (hashtable-values (async-task-group-children grp)))
+        children)
       (for-each
         (lambda (g) (group-cancel-children! g reason))
-        (async-task-group-subgroups grp)))))
+        subgroups))))
 
 (define group-child-terminated!
   (lambda (grp task)
@@ -1142,36 +1328,39 @@
                  (cons (cons task (async-task-failure-condition task))
                        (async-task-group-unobserved grp))))
              (if (fx= (async-task-group-child-count grp) 0)
-                 (let ([ws (async-task-group-waiters grp)])
-                   (async-task-group-waiters-set! grp '())
-                   ws)
+                 (async-wait-queue-drain! (async-task-group-waiters grp))
                  '()))])
       (for-each (lambda (w) ((cdr w) (cons 'values '()))) waiters))))
 
 (define group-empty-operation
   (lambda (grp)
-    (make-async-operation
+    (let ([token (list 'task-group-empty-operation)])
+      (make-async-operation
       (lambda (ss)
         (with-async-mutex (async-task-group-mutex grp)
           (and (fx= (async-task-group-child-count grp) 0)
                (cons 'values '()))))
       (lambda (ss deliver)
-        (with-async-mutex (async-task-group-mutex grp)
-          (if (fx= (async-task-group-child-count grp) 0)
-              (begin (deliver (cons 'values '())) #f)
-              (begin
-                (async-task-group-waiters-set! grp
-                  (cons (cons ss deliver) (async-task-group-waiters grp)))
-                (list 'task-group)))))
+        (let ([blocked?
+               (with-async-mutex (async-task-group-mutex grp)
+                 (if (fx= (async-task-group-child-count grp) 0)
+                     #f
+                     (begin
+                       (async-sync-slot-set! ss token
+                         (async-wait-queue-add!
+                           (async-task-group-waiters grp)
+                           (cons ss deliver)))
+                       #t)))])
+          (if blocked?
+              (list 'task-group)
+              (begin (deliver (cons 'values '())) #f))))
       (lambda (vals) vals)
       (lambda (ss)
         (with-async-mutex (async-task-group-mutex grp)
-          (async-task-group-waiters-set! grp
-            (let loop ([ws (async-task-group-waiters grp)])
-              (cond
-                [(null? ws) '()]
-                [(eq? (caar ws) ss) (cdr ws)]
-                [else (cons (car ws) (loop (cdr ws)))]))))))))
+          (let ([node (async-sync-slot-ref ss token #f)])
+            (when node
+              (async-wait-queue-remove! (async-task-group-waiters grp) node)
+              (async-sync-slot-delete! ss token)))))))))
 
 
 
@@ -1238,16 +1427,7 @@
 
 (define async-deliver-operation-result
   (lambda (op payload)
-    (call-with-values
-      (lambda () (async-deliver-operation-payload op payload))
-      (lambda vals
-        (if (and (pair? vals)
-                 (null? (cdr vals))
-                 (async-context-cancel-result? (car vals)))
-            (raise
-              (async-context-cancellation-condition
-                (async-context-cancel-result-context (car vals))))
-            (apply values vals))))))
+    (async-deliver-operation-payload op payload)))
 
 ;;; --------------------------------------------------------------- operations
 
@@ -1259,34 +1439,136 @@
 
 ;;; ------------------------------------------------------------------ timers
 
+(define async-timer-before?
+  (lambda (a b)
+    (or (< (async-timer-deadline a) (async-timer-deadline b))
+        (and (= (async-timer-deadline a) (async-timer-deadline b))
+             (< (async-timer-sequence a) (async-timer-sequence b))))))
+
+(define async-timer-heap-swap!
+  (lambda (heap i j)
+    (let* ([items (async-timer-heap-items heap)]
+           [a (vector-ref items i)]
+           [b (vector-ref items j)])
+      (vector-set! items i b)
+      (vector-set! items j a)
+      (async-timer-index-set! a j)
+      (async-timer-index-set! b i))))
+
+(define async-timer-heap-sift-up!
+  (lambda (heap index)
+    (let loop ([i index])
+      (unless (fx= i 0)
+        (let* ([parent (fxquotient (fx- i 1) 2)]
+               [items (async-timer-heap-items heap)])
+          (when (async-timer-before?
+                  (vector-ref items i) (vector-ref items parent))
+            (async-timer-heap-swap! heap i parent)
+            (loop parent)))))))
+
+(define async-timer-heap-sift-down!
+  (lambda (heap index)
+    (let ([size (async-timer-heap-size heap)])
+      (let loop ([i index])
+        (let ([left (fx+ (fx* i 2) 1)])
+          (when (fx< left size)
+            (let* ([right (fx+ left 1)]
+                   [items (async-timer-heap-items heap)]
+                   [child
+                    (if (and (fx< right size)
+                             (async-timer-before?
+                               (vector-ref items right)
+                               (vector-ref items left)))
+                        right
+                        left)])
+              (when (async-timer-before?
+                      (vector-ref items child) (vector-ref items i))
+                (async-timer-heap-swap! heap i child)
+                (loop child)))))))))
+
+(define async-timer-heap-grow!
+  (lambda (heap)
+    (let* ([old (async-timer-heap-items heap)]
+           [new (make-vector (fx* 2 (vector-length old)) #f)])
+      (vector-copy! old 0 new 0 (vector-length old))
+      (async-timer-heap-items-set! heap new))))
+
+(define async-timer-heap-push/raw!
+  (lambda (heap timer)
+    (let ([size (async-timer-heap-size heap)])
+      (when (fx= size (vector-length (async-timer-heap-items heap)))
+        (async-timer-heap-grow! heap))
+      (vector-set! (async-timer-heap-items heap) size timer)
+      (async-timer-heap-size-set! heap (fx+ size 1))
+      (async-timer-owner-heap-set! timer heap)
+      (async-timer-index-set! timer size)
+      (async-timer-heap-sift-up! heap size))))
+
+(define async-timer-heap-remove/raw!
+  (lambda (heap timer)
+    (let ([index (async-timer-index timer)]
+          [size (async-timer-heap-size heap)])
+      (when (and (async-timer-owner-heap timer)
+                 (eq? (async-timer-owner-heap timer) heap)
+                 (fx>= index 0)
+                 (fx< index size)
+                 (eq? (vector-ref (async-timer-heap-items heap) index) timer))
+        (let* ([items (async-timer-heap-items heap)]
+               [last-index (fx- size 1)]
+               [last (vector-ref items last-index)])
+          (vector-set! items last-index #f)
+          (async-timer-heap-size-set! heap last-index)
+          (async-timer-owner-heap-set! timer #f)
+          (async-timer-index-set! timer -1)
+          (unless (fx= index last-index)
+            (vector-set! items index last)
+            (async-timer-index-set! last index)
+            (if (and (fx> index 0)
+                     (async-timer-before? last
+                       (vector-ref items (fxquotient (fx- index 1) 2))))
+                (async-timer-heap-sift-up! heap index)
+                (async-timer-heap-sift-down! heap index)))
+          #t)))))
+
+(define async-timer-heap-peek
+  (lambda (heap)
+    (with-async-mutex (async-timer-heap-mutex heap)
+      (and (fx> (async-timer-heap-size heap) 0)
+           (vector-ref (async-timer-heap-items heap) 0)))))
+
+(define async-timer-heap-pop-due!
+  (lambda (heap now)
+    (with-async-mutex (async-timer-heap-mutex heap)
+      (let ([timer
+             (and (fx> (async-timer-heap-size heap) 0)
+                  (vector-ref (async-timer-heap-items heap) 0))])
+        (and timer
+             (<= (async-timer-deadline timer) now)
+             (begin
+               (async-timer-heap-remove/raw! heap timer)
+               timer))))))
+
 (define async-schedule-timer!
   (lambda (sched deadline deliver)
-    (let ([timer (make-async-timer deadline (box deliver))])
-      (let loop ([ts (async-scheduler-timers sched)] [acc '()])
-        (if (and (pair? ts) (<= (async-timer-deadline (car ts)) deadline))
-            (loop (cdr ts) (cons (car ts) acc))
-            (async-scheduler-timers-set! sched
-              (append-reverse acc (cons timer ts)))))
-      timer)))
-
-(define append-reverse
-  (lambda (ls tail)
-    (if (null? ls) tail (append-reverse (cdr ls) (cons (car ls) tail)))))
+    (let ([heap (async-scheduler-timers sched)])
+      (with-async-mutex (async-timer-heap-mutex heap)
+        (let* ([sequence (async-timer-heap-next-sequence heap)]
+               [timer (make-async-timer deadline sequence (box deliver) #f -1)])
+          (async-timer-heap-next-sequence-set! heap (fx+ sequence 1))
+          (async-timer-heap-push/raw! heap timer)
+          timer)))))
 
 (define async-fire-due-timers!
   (lambda (sched)
-    (let ([now (sched-now sched)])
+    (let ([now (sched-now sched)] [heap (async-scheduler-timers sched)])
       (let loop ()
-        (let ([ts (async-scheduler-timers sched)])
-          (when (and (pair? ts)
-                     (<= (async-timer-deadline (car ts)) now))
-            (let ([timer (car ts)])
-              (async-scheduler-timers-set! sched (cdr ts))
-              (let* ([deliver-box (async-timer-deliver-box timer)]
-                     [deliver (unbox deliver-box)])
-                (when (and deliver (box-cas! deliver-box deliver #f))
-                  (deliver (cons 'values '()))))
-              (loop))))))))
+        (let ([timer (async-timer-heap-pop-due! heap now)])
+          (when timer
+            (let* ([deliver-box (async-timer-deliver-box timer)]
+                   [deliver (unbox deliver-box)])
+              (when (and deliver (box-cas! deliver-box deliver #f))
+                (deliver (cons 'values '()))))
+            (loop)))))))
 
 
 
@@ -1299,8 +1581,8 @@
            (with-async-mutex (async-future-mutex f)
              (unless (box-cas! (async-future-state f) 'waiting 'claimed)
                ($oops 'future-fulfil! "future is already fulfilled"))
-             (let ([waiters (async-future-waiters f)])
-               (async-future-waiters-set! f '())
+             (let ([waiters
+                    (async-wait-queue-drain! (async-future-waiters f))])
                (set-box! (async-future-state f) (cons 'done payload))
                waiters))])
       (for-each (lambda (w) ((cdr w) payload)) waiters))))
@@ -1319,13 +1601,6 @@
         ($oops who "outside of an async task"))
       (async-scheduler-current-task sched))))
 
-(define async-mutex-prune!
-  (lambda (mutex)
-    (async-fiber-mutex-waiters-set! mutex
-      (filter
-        (lambda (waiter) (async-sync-state-live? (cadr waiter)))
-        (async-fiber-mutex-waiters mutex)))))
-
 (define async-task-add-owned-mutex!
   (lambda (task mutex)
     (with-async-mutex (async-task-mutex task)
@@ -1342,90 +1617,93 @@
 ;;; Ownership is published before a waiter can resume on another scheduler.
 (define async-mutex-handoff!
   (lambda (mutex)
-    (let loop ([waiters (async-fiber-mutex-waiters mutex)])
-      (cond
-        [(null? waiters)
-         (async-fiber-mutex-waiters-set! mutex '())
-         (async-fiber-mutex-owner-set! mutex #f)]
-        [else
-         (let* ([waiter (car waiters)]
-                [rest (cdr waiters)]
-                [task (car waiter)]
-                [ss (cadr waiter)]
-                [deliver (cddr waiter)])
-           (async-fiber-mutex-waiters-set! mutex rest)
-           (if (async-sync-state-live? ss)
-               (begin
-                 (async-fiber-mutex-owner-set! mutex task)
-                 (async-task-add-owned-mutex! task mutex)
-                 (unless (deliver (cons 'values '()))
-                   (async-task-remove-owned-mutex! task mutex)
-                   (async-fiber-mutex-owner-set! mutex #f)
-                   (loop rest)))
-               (loop rest)))])
-      (void))))
+    (let loop ()
+      (let ([node (async-wait-queue-pop!
+                    (async-fiber-mutex-waiters mutex))])
+        (if (not node)
+            (begin (async-fiber-mutex-owner-set! mutex #f) #f)
+            (let* ([waiter (async-wait-node-value node)]
+                   [task (car waiter)]
+                   [ss (cadr waiter)]
+                   [deliver (cddr waiter)])
+              (let ([reservation
+                     (and (async-sync-state-live? ss)
+                          (deliver 'reserve (cons 'values '())))])
+                (if reservation
+                    (let ([publish
+                           (async-delivery-prepare! reservation)])
+                      (async-fiber-mutex-owner-set! mutex task)
+                      (lambda ()
+                        (async-task-add-owned-mutex! task mutex)
+                        (publish)))
+                    (loop)))))))))
 
 (define async-fiber-mutex-acquire-operation
   (lambda (mutex)
-    (let ([token (list 'async-mutex-acquire-operation)])
+    (let ([token (list 'async-mutex-acquire-operation)]
+          [node-token (list 'async-mutex-acquire-waiter)])
       (make-async-operation
         (lambda (ss)
           (let ([task (async-mutex-current-task
                         'async-mutex-acquire-operation)])
             (async-sync-slot-set! ss token task)
-            (with-async-mutex (async-fiber-mutex-mutex mutex)
-              (async-mutex-prune! mutex)
-              (cond
-                [(not (async-fiber-mutex-owner mutex))
-                 (async-fiber-mutex-owner-set! mutex task)
-                 (async-task-add-owned-mutex! task mutex)
-                 (cons 'values '())]
-                [(eq? (async-fiber-mutex-owner mutex) task)
-                 ($oops 'async-mutex-acquire-operation
-                   "mutex is not recursive")]
-                [else #f]))))
+            (let ([result
+                   (with-async-mutex (async-fiber-mutex-mutex mutex)
+                     (cond
+                       [(not (async-fiber-mutex-owner mutex))
+                        (async-fiber-mutex-owner-set! mutex task)
+                        'acquired]
+                       [(eq? (async-fiber-mutex-owner mutex) task)
+                        ($oops 'async-mutex-acquire-operation
+                          "mutex is not recursive")]
+                       [else #f]))])
+              (when result (async-task-add-owned-mutex! task mutex))
+              (and result (cons 'values '())))))
         (lambda (ss deliver)
           (let ([task (async-sync-slot-ref ss token #f)])
             (unless task
               ($oops 'async-mutex-acquire-operation
                 "acquire operation has no current task"))
-            (with-async-mutex (async-fiber-mutex-mutex mutex)
-              (async-mutex-prune! mutex)
-              (cond
-                [(not (async-fiber-mutex-owner mutex))
-                 (async-fiber-mutex-owner-set! mutex task)
-                 (async-task-add-owned-mutex! task mutex)
-                 (unless (deliver (cons 'values '()))
-                   (async-task-remove-owned-mutex! task mutex)
-                   (async-fiber-mutex-owner-set! mutex #f)
-                   (async-mutex-handoff! mutex))
-                 #f]
-                [(eq? (async-fiber-mutex-owner mutex) task)
-                 ($oops 'async-mutex-acquire-operation
-                   "mutex is not recursive")]
-                [else
-                 (async-fiber-mutex-waiters-set! mutex
-                   (append (async-fiber-mutex-waiters mutex)
-                     (list (cons task (cons ss deliver)))))
-                 (list 'async-mutex)]))))
+            (let-values ([(descriptor action)
+                          (with-async-mutex
+                            (async-fiber-mutex-mutex mutex)
+                            (cond
+                              [(not (async-fiber-mutex-owner mutex))
+                               (let ([reservation
+                                      (deliver 'reserve (cons 'values '()))])
+                                 (if reservation
+                                     (let ([publish
+                                            (async-delivery-prepare!
+                                              reservation)])
+                                       (async-fiber-mutex-owner-set! mutex task)
+                                       (values #f
+                                         (lambda ()
+                                           (async-task-add-owned-mutex!
+                                             task mutex)
+                                           (publish))))
+                                     (values #f (async-mutex-handoff! mutex))))]
+                              [(eq? (async-fiber-mutex-owner mutex) task)
+                               ($oops 'async-mutex-acquire-operation
+                                 "mutex is not recursive")]
+                              [else
+                               (async-sync-slot-set! ss node-token
+                                 (async-wait-queue-add!
+                                   (async-fiber-mutex-waiters mutex)
+                                   (cons task (cons ss deliver))))
+                               (values (list 'async-mutex) #f)]))])
+              (when action (action))
+              descriptor)))
         (lambda (values) values)
         (lambda (ss)
           (with-async-mutex (async-fiber-mutex-mutex mutex)
-            (async-fiber-mutex-waiters-set! mutex
-              (filter
-                (lambda (waiter) (not (eq? (cadr waiter) ss)))
-                (async-fiber-mutex-waiters mutex)))))))))
+            (let ([node (async-sync-slot-ref ss node-token #f)])
+              (when node
+                (async-wait-queue-remove!
+                  (async-fiber-mutex-waiters mutex) node)
+                (async-sync-slot-delete! ss node-token)))))))))
 
 
 ;;; ----------------------------------------------------------- read/write mutexes
-
-(define async-rw-mutex-prune!
-  (lambda (mutex)
-    (async-rw-mutex-waiters-set! mutex
-      (filter
-        (lambda (waiter)
-          (async-sync-state-live? (vector-ref waiter 2)))
-        (async-rw-mutex-waiters mutex)))))
 
 (define async-rw-mutex-reader-count
   (lambda (mutex task)
@@ -1461,55 +1739,63 @@
 ;;; state is installed before delivery so resumed tasks observe ownership.
 (define async-rw-mutex-handoff!
   (lambda (mutex)
-    (let writer-loop ((waiters (async-rw-mutex-waiters mutex)))
-      (cond
-        ((null? waiters)
-         (async-rw-mutex-waiters-set! mutex '()))
-        (else
-         (let ([waiter (car waiters)])
-           (if (not (async-sync-state-live? (vector-ref waiter 2)))
-               (begin
-                 (async-rw-mutex-waiters-set! mutex (cdr waiters))
-                 (writer-loop (cdr waiters)))
-               (case (vector-ref waiter 0)
-                 ((write)
-                  (let ([task (vector-ref waiter 1)]
-                        [deliver (vector-ref waiter 3)]
-                        [rest (cdr waiters)])
-                    (async-rw-mutex-waiters-set! mutex rest)
-                    (async-rw-mutex-writer-set! mutex task)
-                    (async-task-add-owned-mutex! task mutex)
-                    (unless (deliver (cons 'values '()))
-                      (async-task-remove-owned-mutex! task mutex)
-                      (async-rw-mutex-writer-set! mutex #f)
-                      (writer-loop rest))))
-                 ((read)
-                  (let reader-loop ((pending waiters) (granted? #f))
-                    (cond
-                      ((or (null? pending)
-                           (eq? (vector-ref (car pending) 0) 'write))
-                       (async-rw-mutex-waiters-set! mutex pending)
-                       (unless granted? (writer-loop pending)))
-                      (else
-                       (let* ([reader (car pending)]
-                              [rest (cdr pending)]
-                              [task (vector-ref reader 1)]
-                              [ss (vector-ref reader 2)]
-                              [deliver (vector-ref reader 3)])
-                         (if (async-sync-state-live? ss)
+    (let writer-loop ()
+      (let ([node (async-wait-queue-pop! (async-rw-mutex-waiters mutex))])
+        (if node
+            (let ([waiter (async-wait-node-value node)])
+              (cond
+              [(not (async-sync-state-live? (vector-ref waiter 2)))
+               (writer-loop)]
+              [(eq? (vector-ref waiter 0) 'write)
+               (let ([task (vector-ref waiter 1)]
+                     [deliver (vector-ref waiter 3)])
+                 (let ([reservation
+                        (deliver 'reserve (cons 'values '()))])
+                   (if reservation
+                       (let ([publish
+                              (async-delivery-prepare! reservation)])
+                         (async-rw-mutex-writer-set! mutex task)
+                         (async-task-add-owned-mutex! task mutex)
+                         publish)
+                       (writer-loop))))]
+              [else
+               (let reader-loop ([reader waiter] [publications '()])
+                 (let* ([task (vector-ref reader 1)]
+                        [ss (vector-ref reader 2)]
+                        [deliver (vector-ref reader 3)]
+                        [reservation
+                         (and (async-sync-state-live? ss)
+                              (deliver 'reserve (cons 'values '())))]
+                        [publications
+                         (if reservation
                              (begin
                                (async-rw-mutex-add-reader! mutex task)
-                               (if (deliver (cons 'values '()))
-                                   (reader-loop rest #t)
-                                   (begin
-                                     (async-rw-mutex-remove-reader! mutex task)
-                                     (reader-loop rest granted?))))
-                             (reader-loop rest granted?))))))))))))
-      (void))))
+                               (cons (async-delivery-prepare! reservation)
+                                 publications))
+                             publications)]
+                        [next
+                         (async-wait-queue-head
+                           (async-rw-mutex-waiters mutex))])
+                   (if (and next
+                            (eq? (vector-ref
+                                   (async-wait-node-value next) 0)
+                                 'read))
+                       (reader-loop
+                         (async-wait-node-value
+                           (async-wait-queue-pop!
+                             (async-rw-mutex-waiters mutex)))
+                         publications)
+                       (if (null? publications)
+                           (writer-loop)
+                           (lambda ()
+                             (async-delivery-publish-all!
+                               (reverse publications)))))))]))
+            #f)))))
 
 (define async-rw-mutex-acquire-operation/raw
   (lambda (mutex mode)
-    (let ([token (list 'async-rw-mutex-acquire-operation mode)])
+    (let ([token (list 'async-rw-mutex-acquire-operation mode)]
+          [node-token (list 'async-rw-mutex-acquire-waiter mode)])
       (make-async-operation
         (lambda (ss)
           (let ([task (async-mutex-current-task
@@ -1518,7 +1804,6 @@
                             'async-rw-mutex-acquire-operation))])
             (async-sync-slot-set! ss token task)
             (with-async-mutex (async-rw-mutex-mutex mutex)
-              (async-rw-mutex-prune! mutex)
               (cond
                 [(eq? mode 'read)
                  (cond
@@ -1529,7 +1814,8 @@
                     (async-rw-mutex-add-reader! mutex task)
                     (cons 'values '())]
                    [(and (not (async-rw-mutex-writer mutex))
-                         (null? (async-rw-mutex-waiters mutex)))
+                         (async-wait-queue-empty?
+                           (async-rw-mutex-waiters mutex)))
                     (async-rw-mutex-add-reader! mutex task)
                     (cons 'values '())]
                    [else #f])]
@@ -1542,7 +1828,8 @@
                     ($oops 'async-rw-mutex-acquire-operation
                       "read-to-write upgrade is not supported")]
                    [(and (async-rw-mutex-idle? mutex)
-                         (null? (async-rw-mutex-waiters mutex)))
+                         (async-wait-queue-empty?
+                           (async-rw-mutex-waiters mutex)))
                     (async-rw-mutex-writer-set! mutex task)
                     (async-task-add-owned-mutex! task mutex)
                     (cons 'values '())]
@@ -1552,100 +1839,114 @@
             (unless task
               ($oops 'async-rw-mutex-acquire-operation
                 "acquire operation has no current task"))
-            (with-async-mutex (async-rw-mutex-mutex mutex)
-              (async-rw-mutex-prune! mutex)
-              (cond
-                [(and (eq? mode 'read)
-                      (not (async-rw-mutex-writer mutex))
-                      (null? (async-rw-mutex-waiters mutex)))
-                 (async-rw-mutex-add-reader! mutex task)
-                 (unless (deliver (cons 'values '()))
-                   (async-rw-mutex-remove-reader! mutex task)
-                   (when (async-rw-mutex-idle? mutex)
-                     (async-rw-mutex-handoff! mutex)))
-                 #f]
-                [(and (eq? mode 'write)
-                      (async-rw-mutex-idle? mutex)
-                      (null? (async-rw-mutex-waiters mutex)))
-                 (async-rw-mutex-writer-set! mutex task)
-                 (async-task-add-owned-mutex! task mutex)
-                 (unless (deliver (cons 'values '()))
-                   (async-task-remove-owned-mutex! task mutex)
-                   (async-rw-mutex-writer-set! mutex #f)
-                   (async-rw-mutex-handoff! mutex))
-                 #f]
-                [else
-                 (async-rw-mutex-waiters-set! mutex
-                   (append (async-rw-mutex-waiters mutex)
-                     (list (vector mode task ss deliver))))
-                 (list 'async-rw-mutex mode)]))))
+            (let-values ([(descriptor action)
+                          (with-async-mutex (async-rw-mutex-mutex mutex)
+                            (cond
+                              [(and (eq? mode 'read)
+                                    (not (async-rw-mutex-writer mutex))
+                                    (async-wait-queue-empty?
+                                      (async-rw-mutex-waiters mutex)))
+                               (let ([reservation
+                                      (deliver 'reserve (cons 'values '()))])
+                                 (if reservation
+                                     (begin
+                                       (async-rw-mutex-add-reader! mutex task)
+                                       (values #f
+                                         (async-delivery-prepare! reservation)))
+                                     (values #f
+                                       (and (async-rw-mutex-idle? mutex)
+                                            (async-rw-mutex-handoff! mutex)))))]
+                              [(and (eq? mode 'write)
+                                    (async-rw-mutex-idle? mutex)
+                                    (async-wait-queue-empty?
+                                      (async-rw-mutex-waiters mutex)))
+                               (let ([reservation
+                                      (deliver 'reserve (cons 'values '()))])
+                                 (if reservation
+                                     (begin
+                                       (async-rw-mutex-writer-set! mutex task)
+                                       (async-task-add-owned-mutex! task mutex)
+                                       (values #f
+                                         (async-delivery-prepare! reservation)))
+                                     (values #f
+                                       (async-rw-mutex-handoff! mutex))))]
+                              [else
+                               (async-sync-slot-set! ss node-token
+                                 (async-wait-queue-add!
+                                   (async-rw-mutex-waiters mutex)
+                                   (vector mode task ss deliver)))
+                               (values (list 'async-rw-mutex mode) #f)]))])
+              (when action (action))
+              descriptor)))
         (lambda (values) values)
         (lambda (ss)
           (with-async-mutex (async-rw-mutex-mutex mutex)
-            (async-rw-mutex-waiters-set! mutex
-              (filter
-                (lambda (waiter)
-                  (not (eq? (vector-ref waiter 2) ss)))
-                (async-rw-mutex-waiters mutex)))))))))
+            (let ([node (async-sync-slot-ref ss node-token #f)])
+              (when node
+                (async-wait-queue-remove! (async-rw-mutex-waiters mutex) node)
+                (async-sync-slot-delete! ss node-token)))))))))
 
 
 ;;; ------------------------------------------------ wait groups, once, conditions
 
-(define async-wait-group-prune!
-  (lambda (group)
-    (async-wait-group-waiters-set! group
-      (filter
-        (lambda (waiter) (async-sync-state-live? (car waiter)))
-        (async-wait-group-waiters group)))))
-
 (define async-wait-group-wait-operation/raw
   (lambda (group)
-    (make-async-operation
+    (let ([token (list 'async-wait-group-wait-operation)])
+      (make-async-operation
       (lambda (ss)
         (with-async-mutex (async-wait-group-mutex group)
           (and (= (async-wait-group-count group) 0)
                (cons 'values '()))))
       (lambda (ss deliver)
-        (with-async-mutex (async-wait-group-mutex group)
-          (async-wait-group-prune! group)
-          (if (= (async-wait-group-count group) 0)
-              (begin (deliver (cons 'values '())) #f)
-              (begin
-                (async-wait-group-waiters-set! group
-                  (append (async-wait-group-waiters group)
-                    (list (cons ss deliver))))
-                (list 'async-wait-group)))))
+        (let ([blocked?
+               (with-async-mutex (async-wait-group-mutex group)
+                 (if (= (async-wait-group-count group) 0)
+                     #f
+                     (begin
+                       (async-sync-slot-set! ss token
+                         (async-wait-queue-add!
+                           (async-wait-group-waiters group)
+                           (cons ss deliver)))
+                       #t)))])
+          (if blocked?
+              (list 'async-wait-group)
+              (begin (deliver (cons 'values '())) #f))))
       (lambda (values) values)
       (lambda (ss)
         (with-async-mutex (async-wait-group-mutex group)
-          (async-wait-group-waiters-set! group
-            (filter
-              (lambda (waiter) (not (eq? (car waiter) ss)))
-              (async-wait-group-waiters group))))))))
+          (let ([node (async-sync-slot-ref ss token #f)])
+            (when node
+              (async-wait-queue-remove! (async-wait-group-waiters group) node)
+              (async-sync-slot-delete! ss token)))))))))
 
 (define async-once-wait-operation
   (lambda (once)
-    (make-async-operation
+    (let ([token (list 'async-once-wait-operation)])
+      (make-async-operation
       (lambda (ss)
         (with-async-mutex (async-once-mutex once)
           (and (eq? (async-once-state once) 'done)
                (cons 'values '()))))
       (lambda (ss deliver)
-        (with-async-mutex (async-once-mutex once)
-          (if (eq? (async-once-state once) 'done)
-              (begin (deliver (cons 'values '())) #f)
-              (begin
-                (async-once-waiters-set! once
-                  (append (async-once-waiters once)
-                    (list (cons ss deliver))))
-                (list 'async-once)))))
+        (let ([blocked?
+               (with-async-mutex (async-once-mutex once)
+                 (if (eq? (async-once-state once) 'done)
+                     #f
+                     (begin
+                       (async-sync-slot-set! ss token
+                         (async-wait-queue-add! (async-once-waiters once)
+                           (cons ss deliver)))
+                       #t)))])
+          (if blocked?
+              (list 'async-once)
+              (begin (deliver (cons 'values '())) #f))))
       (lambda (values) values)
       (lambda (ss)
         (with-async-mutex (async-once-mutex once)
-          (async-once-waiters-set! once
-            (filter
-              (lambda (waiter) (not (eq? (car waiter) ss)))
-              (async-once-waiters once))))))))
+          (let ([node (async-sync-slot-ref ss token #f)])
+            (when node
+              (async-wait-queue-remove! (async-once-waiters once) node)
+              (async-sync-slot-delete! ss token)))))))))
 
 (define async-lock-owned-by?
   (lambda (lock task)
@@ -1672,19 +1973,28 @@
 
 (define async-condition-wait-operation
   (lambda (condition lock task released-box)
-    (make-async-operation
+    (let ([token (list 'async-condition-wait-operation)])
+      (make-async-operation
       (lambda (ss) #f)
       (lambda (ss deliver)
         (with-async-mutex (async-condition-guard condition)
           (let ([shielded-deliver
-                 (lambda (payload)
-                   ;; Publish the shield before making the task runnable, so
-                   ;; cancellation cannot overtake lock reacquisition.
-                   (async-task-cancel-shield?-set! task #t)
-                   (deliver payload))])
-            (async-condition-waiters-set! condition
-              (append (async-condition-waiters condition)
-                (list (cons ss shielded-deliver)))))
+                 (case-lambda
+                   [(payload)
+                    ;; Publish the shield before making the task runnable, so
+                    ;; cancellation cannot overtake lock reacquisition.
+                    (async-task-cancel-shield?-set! task #t)
+                    (deliver payload)]
+                   [(command payload)
+                    (let ([reservation (deliver command payload)])
+                      (when reservation
+                        (async-delivery-add-action! reservation
+                          (lambda ()
+                            (async-task-cancel-shield?-set! task #t))))
+                      reservation)])])
+            (async-sync-slot-set! ss token
+              (async-wait-queue-add! (async-condition-waiters condition)
+                (cons ss shielded-deliver))))
           ;; Registration precedes unlock. A conventional signaler that owns
           ;; the same lock cannot pass this point early and lose the wakeup.
           (async-lock-release! lock)
@@ -1693,34 +2003,39 @@
       (lambda (values) values)
       (lambda (ss)
         (with-async-mutex (async-condition-guard condition)
-          (async-condition-waiters-set! condition
-            (filter
-              (lambda (waiter) (not (eq? (car waiter) ss)))
-              (async-condition-waiters condition)))
+          (let ([node (async-sync-slot-ref ss token #f)])
+            (when node
+              (async-wait-queue-remove! (async-condition-waiters condition) node)
+              (async-sync-slot-delete! ss token)))
           ;; The only chooser around this private operation is the current
           ;; cancellation context. Shield before its cancellation payload can
           ;; resume the task.
           (when (unbox released-box)
-            (async-task-cancel-shield?-set! task #t)))))))
+            (async-task-cancel-shield?-set! task #t))))))))
 
 (define async-release-task-lock!
   (lambda (lock task)
     (cond
       [($async-mutex? lock)
-       (with-async-mutex (async-fiber-mutex-mutex lock)
-         (when (eq? (async-fiber-mutex-owner lock) task)
-           (async-task-remove-owned-mutex! task lock)
-           (async-fiber-mutex-owner-set! lock #f)
-           (async-mutex-handoff! lock)))]
-      [($async-rw-mutex? lock)
-       (with-async-mutex (async-rw-mutex-mutex lock)
-         (when (eq? (async-rw-mutex-writer lock) task)
-           (async-rw-mutex-writer-set! lock #f))
-         (when (fx> (async-rw-mutex-reader-count lock task) 0)
-           (hashtable-delete! (async-rw-mutex-readers lock) task))
+       (let ([action
+              (with-async-mutex (async-fiber-mutex-mutex lock)
+                (and (eq? (async-fiber-mutex-owner lock) task)
+                     (begin
+                       (async-fiber-mutex-owner-set! lock #f)
+                       (async-mutex-handoff! lock))))])
          (async-task-remove-owned-mutex! task lock)
-         (when (async-rw-mutex-idle? lock)
-           (async-rw-mutex-handoff! lock)))]
+         (when action (action)))]
+      [($async-rw-mutex? lock)
+       (let ([action
+              (with-async-mutex (async-rw-mutex-mutex lock)
+                (when (eq? (async-rw-mutex-writer lock) task)
+                  (async-rw-mutex-writer-set! lock #f))
+                (when (fx> (async-rw-mutex-reader-count lock task) 0)
+                  (hashtable-delete! (async-rw-mutex-readers lock) task))
+                (and (async-rw-mutex-idle? lock)
+                     (async-rw-mutex-handoff! lock)))])
+         (async-task-remove-owned-mutex! task lock)
+         (when action (action)))]
       [else (void)])))
 
 (define async-call-with-rw-lock
@@ -1755,14 +2070,6 @@
 (define async-waiter-dead?
   (lambda (ss) (not (async-sync-state-live? ss))))
 
-(define async-channel-prune!
-  (lambda (ch)
-    ;; bounded pruning: drop dead waiters while scanning
-    (async-channel-gets-set! ch
-      (filter (lambda (w) (not (async-waiter-dead? (car w)))) (async-channel-gets ch)))
-    (async-channel-puts-set! ch
-      (filter (lambda (w) (not (async-waiter-dead? (cadr w)))) (async-channel-puts ch)))))
-
 (define async-channel-closed-condition
   (lambda (ch)
     ($make-channel-closed-condition (async-channel-close-reason ch))))
@@ -1774,30 +2081,35 @@
 (define async-channel-receive-closed-payload
   (lambda () (cons 'values '(#f #f))))
 
-;;; Deliver value to the first live getter; returns #t on rendezvous.
-(define async-channel-deliver-to-getter!
+;;; Reserve the first live getter.  The caller prepares the reservation while
+;;; holding the channel mutex and publishes it after releasing the mutex.
+(define async-channel-reserve-getter!
   (lambda (ch v)
-    (let loop ([gs (async-channel-gets ch)])
-      (cond
-        [(null? gs) (async-channel-gets-set! ch '()) #f]
-        [(async-waiter-dead? (caar gs)) (loop (cdr gs))]
-        [((cdar gs) (cons 'values (list v #t)))
-         (async-channel-gets-set! ch (cdr gs))
-         #t]
-        [else (loop (cdr gs))]))))
+    (let loop ()
+      (let ([node (async-wait-queue-pop! (async-channel-gets ch))])
+        (and node
+             (let ([waiter (async-wait-node-value node)])
+               (let ([reservation
+                      (and (not (async-waiter-dead? (car waiter)))
+                           ((cdr waiter) 'reserve
+                             (cons 'values (list v #t))))])
+                 (if reservation
+                   (cons node reservation)
+                   (loop)))))))))
 
-;;; Take a value from the first live putter; returns #t on rendezvous.
-(define async-channel-take-from-putter!
-  (lambda (ch k)  ; k: (value -> boolean delivered?)
-    (let loop ([ps (async-channel-puts ch)])
-      (cond
-        [(null? ps) (async-channel-puts-set! ch '()) #f]
-        [(async-waiter-dead? (cadr (car ps))) (loop (cdr ps))]
-        [else
-         (let ([v (car (car ps))] [deliver (caddr (car ps))])
-           (if (k v deliver)
-               (begin (async-channel-puts-set! ch (cdr ps)) #t)
-               (loop (cdr ps))))]))))
+;;; Reserve the first live putter and return (value . reservation).
+(define async-channel-reserve-putter!
+  (lambda (ch)
+    (let loop ()
+      (let ([node (async-wait-queue-pop! (async-channel-puts ch))])
+        (and node
+             (let ([waiter (async-wait-node-value node)])
+               (let ([reservation
+                      (and (not (async-waiter-dead? (cadr waiter)))
+                           ((caddr waiter) 'reserve (cons 'values '())))])
+                 (if reservation
+                     (vector (car waiter) node reservation)
+                     (loop)))))))))
 
 (define async-buffer-push!
   (lambda (ch v)
@@ -1832,13 +2144,13 @@
                  (let ([id (async-scheduler-group-next-task-id group)])
                    (async-scheduler-group-next-task-id-set! group (fx+ 1 id))
                    id))])
-      (make-async-task id name 'ready entry #f #f group sched #f migratable? #f
+      (make-async-task id name 'ready entry #f #f group sched #f migratable? #f #f
         (current-exception-state)
         parent-group (async-make-context parent-context) #f
         #f                         ; child group
         '()                        ; result values
         #f                         ; failure condition
-        '()                        ; join waiters
+        (make-async-wait-queue)    ; join waiters
         #f                         ; observed?
         (box #f)                   ; cancel state
         #f                         ; cancel condition
@@ -1929,10 +2241,11 @@
              (case state
                [(completed) (async-task-result-values-set! task (cdr outcome))]
                [else (async-task-failure-condition-set! task (cdr outcome))])
-             (let ([waiters (async-task-join-waiters task)])
+             (let ([waiters
+                    (async-wait-queue-drain!
+                      (async-task-join-waiters task))])
                (when (and (eq? state 'failed) (pair? waiters))
                  (async-task-observed?-set! task #t))
-               (async-task-join-waiters-set! task '())
                waiters))])
       (sched-registry-remove! sched task)
       (let ([join-payload
@@ -1961,7 +2274,8 @@
 
 (define async-task-join-operation
   (lambda (task)
-    (make-async-operation
+    (let ([token (list 'task-join-operation)])
+      (make-async-operation
       (lambda (ss)
         (let ([sched ($async-scheduler)])
           (when (and (async-scheduler? sched)
@@ -1982,8 +2296,10 @@
                          (async-task-observed?-set! task #t))
                        (task-join-payload task))
                      (begin
-                       (async-task-join-waiters-set! task
-                         (cons (cons ss deliver) (async-task-join-waiters task)))
+                       (async-sync-slot-set! ss token
+                         (async-wait-queue-add!
+                           (async-task-join-waiters task)
+                           (cons ss deliver)))
                        #f)))])
           (if payload
               (begin (deliver payload) #f)
@@ -1991,12 +2307,10 @@
       (lambda (vals) vals)
       (lambda (ss)
         (with-async-mutex (async-task-mutex task)
-          (async-task-join-waiters-set! task
-            (let loop ([ws (async-task-join-waiters task)])
-              (cond
-                [(null? ws) '()]
-                [(eq? (caar ws) ss) (cdr ws)]
-                [else (cons (car ws) (loop (cdr ws)))]))))))))
+          (let ([node (async-sync-slot-ref ss token #f)])
+            (when node
+              (async-wait-queue-remove! (async-task-join-waiters task) node)
+              (async-sync-slot-delete! ss token)))))))))
 
 
 ;;; ------------------------------------------------------------- cancellation
@@ -2018,9 +2332,9 @@
       (make-async-work-deque)
       (make-async-queue) (make-async-os-mutex)
       (if-feature pthreads (make-condition) #f)
-      (make-eq-hashtable) 0 0 #f 'created virtual? 0 '() #f #f
+      (make-eq-hashtable) 0 0 #f 'created virtual? 0 (make-async-timer-heap) #f #f
       (current-exception-state)
-      0 0 preemption-ticks 0 0 0 #f #f #f)))
+      0 0 preemption-ticks 0 0 (box 0) #f #f #f)))
 
 (define async-drain-remote!
   (lambda (sched)
@@ -2036,13 +2350,16 @@
 
 (define async-idle-wait
   (lambda (sched)
-    (cond
+    (dynamic-wind
+      (lambda () (async-group-mark-idle! sched))
+      (lambda ()
+        (cond
       [(async-scheduler-virtual? sched)
-       (let ([ts (async-scheduler-timers sched)])
-         (if (null? ts)
+       (let ([timer (async-timer-heap-peek (async-scheduler-timers sched))])
+         (if (not timer)
              ($oops 'run-async
                "async deadlock: no runnable tasks and no pending timers")
-             (async-scheduler-vtime-set! sched (async-timer-deadline (car ts)))))]
+             (async-scheduler-vtime-set! sched (async-timer-deadline timer))))]
       [(async-scheduler-poll-proc sched)
        => (lambda (poll)
             ;; The preceding nonblocking poll may consume a remote wakeup
@@ -2056,7 +2373,7 @@
                            (and
                              (async-queue-empty?
                                (async-scheduler-group-ready-queue group))
-                             (fx= (async-group-work-count group) 0)
+                             (not (async-group-has-work? group))
                              (with-mutex
                                (async-scheduler-remote-mutex sched)
                                (async-queue-empty?
@@ -2069,19 +2386,19 @@
                     (when idle? (poll sched #t))))))]
       [(async-group-parallel? ($async-scheduler-group sched))
        (let ([group ($async-scheduler-group sched)]
-             [ts (async-scheduler-timers sched)])
+             [timer (async-timer-heap-peek (async-scheduler-timers sched))])
          (with-mutex (async-scheduler-remote-mutex sched)
            (when (and (async-queue-empty? (async-scheduler-remote-queue sched))
                       (with-mutex (async-scheduler-group-mutex group)
                         (and
                           (async-queue-empty?
                             (async-scheduler-group-ready-queue group))
-                          (fx= (async-group-work-count group) 0)
+                          (not (async-group-has-work? group))
                           (not (async-scheduler-group-shutdown? group)))))
-             (if (null? ts)
+             (if (not timer)
                  (condition-wait (async-scheduler-remote-cond sched)
                                  (async-scheduler-remote-mutex sched))
-                 (let* ([deadline (async-timer-deadline (car ts))]
+                 (let* ([deadline (async-timer-deadline timer)]
                         [delta (max 0 (- deadline (async-monotonic-us)))]
                         [timeout (add-duration (current-time)
                                    (make-time 'time-duration
@@ -2092,13 +2409,13 @@
                                    timeout))))))]
       [else
        (if-feature pthreads
-         (let ([ts (async-scheduler-timers sched)])
+         (let ([timer (async-timer-heap-peek (async-scheduler-timers sched))])
            (with-mutex (async-scheduler-remote-mutex sched)
              (when (async-queue-empty? (async-scheduler-remote-queue sched))
-               (if (null? ts)
+               (if (not timer)
                    (condition-wait (async-scheduler-remote-cond sched)
                                    (async-scheduler-remote-mutex sched))
-                   (let* ([deadline (async-timer-deadline (car ts))]
+                   (let* ([deadline (async-timer-deadline timer)]
                           [delta (max 0 (fx- deadline (async-monotonic-us)))]
                           [timeout (add-duration (current-time)
                                      (make-time 'time-duration
@@ -2107,13 +2424,14 @@
                      (condition-wait (async-scheduler-remote-cond sched)
                                      (async-scheduler-remote-mutex sched)
                                      timeout))))))
-         (let ([ts (async-scheduler-timers sched)])
-           (unless (null? ts)
-             (let* ([deadline (async-timer-deadline (car ts))]
+         (let ([timer (async-timer-heap-peek (async-scheduler-timers sched))])
+           (when timer
+             (let* ([deadline (async-timer-deadline timer)]
                     [delta (max 0 (fx- deadline (async-monotonic-us)))])
                (sleep (make-time 'time-duration
                         (* (remainder delta 1000000) 1000)
-                        (quotient delta 1000000)))))))])))
+                        (quotient delta 1000000)))))))]))
+      (lambda () (async-group-unmark-idle! sched)))))
 
 (define async-preemption-token (list 'async-preempted))
 (define async-minimum-preemption-ticks 1000)
@@ -2258,20 +2576,36 @@
     (async-invariant (eq? (async-task-scheduler-group task)
                           ($async-scheduler-group sched))
       "scheduler selected a task from another group" task)
-    (with-async-mutex (async-scheduler-group-mutex
-                        ($async-scheduler-group sched))
-      (async-invariant
-        (eq? (hashtable-ref
-               (async-scheduler-group-tasks ($async-scheduler-group sched))
-               (async-task-id task) #f)
-             task)
-        "scheduler selected a task missing from the registry" task))
+    (when async-debug-invariants?
+      (with-async-mutex (async-scheduler-group-mutex
+                          ($async-scheduler-group sched))
+        (async-invariant
+          (eq? (hashtable-ref
+                 (async-scheduler-group-tasks ($async-scheduler-group sched))
+                 (async-task-id task) #f)
+               task)
+          "scheduler selected a task missing from the registry" task)))
     (async-scheduler-exec-count-set! sched (fx+ 1 (async-scheduler-exec-count sched)))
-    (let ([wait-owner (async-task-wait-scheduler task)])
-      (if (and wait-owner
-               (not (eq? wait-owner sched))
-               (async-task-resumption task)
-               (task-cancel-requested? task))
+    ;; Selection and cancellation form one handshake.  Once the task is
+    ;; marked running, a later cancellation is observed at its next explicit
+    ;; cancellation point; it must not replace a normal resumption payload on
+    ;; a foreign worker after the owner check has already passed.
+    (let-values ([(wait-owner cancel-at-selection? reroute?)
+                  (with-async-mutex (async-task-mutex task)
+                    (let* ([wait-owner (async-task-wait-scheduler task)]
+                           [cancel? (task-cancel-requested? task)]
+                           [reroute?
+                            (and wait-owner
+                                 (not (eq? wait-owner sched))
+                                 (async-task-resumption task)
+                                 cancel?)])
+                      (unless reroute?
+                        (async-task-current-wait-set! task #f)
+                        (async-task-wait-scheduler-set! task #f)
+                        (async-task-resume-pinned?-set! task #f)
+                        (async-task-suspension-state-set! task #f))
+                      (values wait-owner cancel? reroute?)))])
+      (if reroute?
           (begin
             ;; A normal completion may have published the task globally just
             ;; before cancellation.  Return it to the suspension owner before
@@ -2280,10 +2614,7 @@
             (async-remote-submit wait-owner task)
             #f)
           (begin
-            (async-task-current-wait-set! task #f)
-            (async-task-wait-scheduler-set! task #f)
-            (async-task-suspension-state-set! task #f)
-            (if (and (async-task-entry task) (task-cancel-requested? task))
+            (if (and (async-task-entry task) cancel-at-selection?)
                 ;; A ready task observes cancellation before running user code.
               (begin
                 (terminate-task! sched task 'canceled
@@ -2291,7 +2622,7 @@
                 #f)
               (begin
                 (when (and (not (async-task-entry task))
-                           (task-cancel-requested? task)
+                           cancel-at-selection?
                            (not (async-task-cancel-shield? task)))
                   (unless (async-task-preempted? task)
                     (async-task-payload-set! task
@@ -2558,7 +2889,8 @@
     (unless (async-context? context)
       ($oops who "~s is not an async context" context))
     (unless (operation? op) ($oops who "~s is not an operation" op))
-    (perform-operation (async-context-choice context op))))
+    (call-with-async-context context
+      (lambda () (perform-operation op)))))
 
 (record-writer (type-descriptor async-task)
   (lambda (r p wr)
@@ -2661,7 +2993,8 @@
 
 (set-who! make-async-mutex
   (lambda ()
-    (make-async-fiber-mutex% (make-async-os-mutex) #f '())))
+    (make-async-fiber-mutex% (make-async-os-mutex) #f
+      (make-async-wait-queue))))
 
 (set-who! async-mutex-acquire-operation
   (lambda (mutex)
@@ -2680,12 +3013,14 @@
     (unless (async-mutex? mutex)
       ($oops who "~s is not an async mutex" mutex))
     (let ([task (async-mutex-current-task who)])
-      (with-async-mutex (async-fiber-mutex-mutex mutex)
-        (unless (eq? (async-fiber-mutex-owner mutex) task)
-          ($oops who "current task does not own the mutex"))
+      (let ([action
+             (with-async-mutex (async-fiber-mutex-mutex mutex)
+               (unless (eq? (async-fiber-mutex-owner mutex) task)
+                 ($oops who "current task does not own the mutex"))
+               (async-fiber-mutex-owner-set! mutex #f)
+               (async-mutex-handoff! mutex))])
         (async-task-remove-owned-mutex! task mutex)
-        (async-fiber-mutex-owner-set! mutex #f)
-        (async-mutex-handoff! mutex)))
+        (when action (action))))
     (void)))
 
 (set-who! call-with-async-mutex
@@ -2713,7 +3048,7 @@
 (set-who! make-async-rw-mutex
   (lambda ()
     (make-async-rw-mutex% (make-async-os-mutex)
-      #f (make-eq-hashtable) '())))
+      #f (make-eq-hashtable) (make-async-wait-queue))))
 
 (set-who! async-rw-mutex-acquire-operation
   (lambda (mutex)
@@ -2744,12 +3079,14 @@
     (unless (async-rw-mutex? mutex)
       ($oops who "~s is not an async rw mutex" mutex))
     (let ([task (async-mutex-current-task who)])
-      (with-async-mutex (async-rw-mutex-mutex mutex)
-        (unless (eq? (async-rw-mutex-writer mutex) task)
-          ($oops who "current task does not own the write lock"))
-        (async-rw-mutex-writer-set! mutex #f)
+      (let ([action
+             (with-async-mutex (async-rw-mutex-mutex mutex)
+               (unless (eq? (async-rw-mutex-writer mutex) task)
+                 ($oops who "current task does not own the write lock"))
+               (async-rw-mutex-writer-set! mutex #f)
+               (async-rw-mutex-handoff! mutex))])
         (async-task-remove-owned-mutex! task mutex)
-        (async-rw-mutex-handoff! mutex)))
+        (when action (action))))
     (void)))
 
 (set-who! async-rw-mutex-read-release!
@@ -2757,11 +3094,13 @@
     (unless (async-rw-mutex? mutex)
       ($oops who "~s is not an async rw mutex" mutex))
     (let ([task (async-mutex-current-task who)])
-      (with-async-mutex (async-rw-mutex-mutex mutex)
-        (unless (async-rw-mutex-remove-reader! mutex task)
-          ($oops who "current task does not own a read lock"))
-        (when (async-rw-mutex-idle? mutex)
-          (async-rw-mutex-handoff! mutex))))
+      (let ([action
+             (with-async-mutex (async-rw-mutex-mutex mutex)
+               (unless (async-rw-mutex-remove-reader! mutex task)
+                 ($oops who "current task does not own a read lock"))
+               (and (async-rw-mutex-idle? mutex)
+                    (async-rw-mutex-handoff! mutex)))])
+        (when action (action))))
     (void)))
 
 (set-who! call-with-async-rw-mutex
@@ -2776,7 +3115,8 @@
     [(count)
      (unless (and (integer? count) (exact? count) (>= count 0))
        ($oops who "~s is not a nonnegative exact integer" count))
-     (make-async-wait-group% (make-async-os-mutex) count '())]))
+     (make-async-wait-group% (make-async-os-mutex) count
+       (make-async-wait-queue))]))
 
 (set-who! async-wait-group-add!
   (lambda (group delta)
@@ -2791,9 +3131,8 @@
                  ($oops who "wait group counter would become negative"))
                (async-wait-group-count-set! group count)
                (if (= count 0)
-                   (let ([waiters (async-wait-group-waiters group)])
-                     (async-wait-group-waiters-set! group '())
-                     waiters)
+                   (async-wait-queue-drain!
+                     (async-wait-group-waiters group))
                    '())))])
       (for-each
         (lambda (waiter) ((cdr waiter) (cons 'values '())))
@@ -2849,7 +3188,8 @@
 
 (set-who! make-async-once
   (lambda ()
-    (make-async-once% (make-async-os-mutex) 'pending #f '())))
+    (make-async-once% (make-async-os-mutex) 'pending #f
+      (make-async-wait-queue))))
 
 (set-who! async-once-run!
   (lambda (once thunk)
@@ -2893,9 +3233,8 @@
                                 (with-async-mutex (async-once-mutex once)
                                   (async-once-state-set! once 'done)
                                   (async-once-owner-set! once #f)
-                                  (let ([waiters (async-once-waiters once)])
-                                    (async-once-waiters-set! once '())
-                                    waiters))])
+                                  (async-wait-queue-drain!
+                                    (async-once-waiters once)))])
                            (for-each
                              (lambda (waiter)
                                ((cdr waiter) (cons 'values '())))
@@ -2917,7 +3256,8 @@
   (lambda (lock)
     (unless (or (async-mutex? lock) (async-rw-mutex? lock))
       ($oops who "~s is not an async mutex or async rw mutex" lock))
-    (make-async-condition% (make-async-os-mutex) lock '())))
+    (make-async-condition% (make-async-os-mutex) lock
+      (make-async-wait-queue))))
 
 (set! async-condition-mutex
   (lambda (condition)
@@ -2958,16 +3298,19 @@
   (lambda (condition)
     (unless (async-condition? condition)
       ($oops who "~s is not an async condition" condition))
-    (with-async-mutex (async-condition-guard condition)
-      (let loop ([waiters (async-condition-waiters condition)])
-        (cond
-          [(null? waiters)
-           (async-condition-waiters-set! condition '())]
-          [else
-           (let ([waiter (car waiters)])
-             (async-condition-waiters-set! condition (cdr waiters))
-             (unless ((cdr waiter) (cons 'values '()))
-               (loop (cdr waiters))))])))
+    (let ([publish
+           (with-async-mutex (async-condition-guard condition)
+             (let loop ()
+               (let ([node (async-wait-queue-pop!
+                             (async-condition-waiters condition))])
+                 (and node
+                      (let* ([waiter (async-wait-node-value node)]
+                             [reservation
+                              ((cdr waiter) 'reserve (cons 'values '()))])
+                        (if reservation
+                            (async-delivery-prepare! reservation)
+                            (loop)))))))])
+      (when publish (publish)))
     (void)))
 
 (set-who! async-condition-broadcast!
@@ -2976,9 +3319,8 @@
       ($oops who "~s is not an async condition" condition))
     (let ([waiters
            (with-async-mutex (async-condition-guard condition)
-             (let ([waiters (async-condition-waiters condition)])
-               (async-condition-waiters-set! condition '())
-               waiters))])
+             (async-wait-queue-drain!
+               (async-condition-waiters condition)))])
       (for-each
         (lambda (waiter) ((cdr waiter) (cons 'values '())))
         waiters))
@@ -3068,23 +3410,37 @@
                                     [desc
                                      (and (async-sync-state-live? ss)
                                           ((operation-block op) ss
-                                            (lambda (payload)
-                                              (let ([won?
-                                                     (deliver
-                                                       (if (eq? (car payload) 'values)
-                                                           (cons 'values
-                                                             (list
-                                                               (make-async-choice-result
-                                                                 op (cdr payload))))
-                                                           payload))])
-                                                (when won?
-                                                  (do ([j 0 (fx+ j 1)])
-                                                      ((fx= j n))
-                                                    (unless (fx= i j)
-                                                      ((operation-nack
-                                                         (vector-ref ops j))
-                                                       ss))))
-                                                won?))))])
+                                            (let ([transform
+                                                   (lambda (payload)
+                                                     (if (eq? (car payload) 'values)
+                                                         (cons 'values
+                                                           (list
+                                                             (make-async-choice-result
+                                                               op (cdr payload))))
+                                                         payload))]
+                                                  [nack-losers
+                                                   (lambda ()
+                                                     (do ([j 0 (fx+ j 1)])
+                                                         ((fx= j n))
+                                                       (unless (fx= i j)
+                                                         ((operation-nack
+                                                            (vector-ref ops j))
+                                                          ss))))])
+                                              (case-lambda
+                                                [(payload)
+                                                 (let ([won?
+                                                        (deliver
+                                                          (transform payload))])
+                                                   (when won? (nack-losers))
+                                                   won?)]
+                                                [(command payload)
+                                                 (let ([reservation
+                                                        (deliver command
+                                                          (transform payload))])
+                                                   (when reservation
+                                                     (async-delivery-add-action!
+                                                       reservation nack-losers))
+                                                   reservation)]))))])
                                (cons desc (f (fx+ i 1))))))])
                   (list 'choice (filter (lambda (d) d) descs))))))
         (lambda (vals)
@@ -3112,22 +3468,67 @@
         (async-check-cancellation! task)
         (let* ([context (and (not (async-task-cancel-shield? task))
                              (async-current-context))]
-               [op (if context (async-context-choice context op) op)]
                [ss (make-async-sync-state)])
+          (when (and context (async-context-canceled?/raw context))
+            (raise (async-context-cancellation-condition context)))
           (let ([r ((operation-try op) ss)])
             (if r
                 (async-deliver-operation-result op r)
                 (async-deliver-operation-result op
                   ($async-suspend sched task ss
                     (lambda (ss*)
-                      (let ([nack (lambda () ((operation-nack op) ss))])
+                      (let* ([op-deliver #f]
+                             [context-deliver #f]
+                             [nack
+                              (lambda ()
+                                ((operation-nack op) ss)
+                                (when context
+                                  (async-context-unregister-waiter!
+                                    context ss)))])
                         (async-task-nack-thunk-set! task nack)
                         (async-sync-begin-registration! ss nack)
-                        (let ([desc ((operation-block op) ss
-                                      ($async-make-deliver ss task))])
+                        (let* ([deliver ($async-make-deliver ss task)]
+                               [op-deliver
+                                (case-lambda
+                                  [(payload)
+                                   (let ([won? (deliver payload)])
+                                     (when (and won? context)
+                                       (async-context-unregister-waiter!
+                                         context ss))
+                                     won?)]
+                                  [(command payload)
+                                   (let ([reservation
+                                          (deliver command payload)])
+                                     (when (and reservation context)
+                                       (async-delivery-add-action! reservation
+                                         (lambda ()
+                                           (async-context-unregister-waiter!
+                                             context ss))))
+                                     reservation)])]
+                               [desc ((operation-block op) ss op-deliver)]
+                               [context-registration
+                                (and context
+                                     (begin
+                                       (set! context-deliver
+                                         (lambda (payload)
+                                           (let ([won?
+                                                  (deliver
+                                                    (cons 'raise
+                                                      (async-context-cancellation-condition
+                                                        context)))])
+                                             (when won?
+                                               ((operation-nack op) ss))
+                                             won?)))
+                                       (async-context-register-waiter!
+                                         context ss context-deliver)))])
+                          (when (eq? context-registration 'canceled)
+                            (context-deliver #f))
                           (when (async-sync-end-registration! ss)
                             ($async-cancel-waiting-task task))
-                          desc))))))))))))
+                          (if context
+                              (list 'choice
+                                (list desc (list 'context context)))
+                              desc)))))))))))))
 
 (set-who! sleep-operation
   (lambda (seconds)
@@ -3148,9 +3549,7 @@
           (let ([timer (async-sync-slot-ref ss token #f)])
             (when timer
               (async-sync-slot-delete! ss token)
-              (let* ([deliver-box (async-timer-deliver-box timer)]
-                     [deliver (unbox deliver-box)])
-                (when deliver (box-cas! deliver-box deliver #f))))))))))
+              (async-cancel-timer! timer))))))))
 
 (set-who! async-sleep
   (lambda (seconds)
@@ -3161,7 +3560,8 @@
 
 (set-who! make-future
   (lambda ()
-    (make-async-future% (box 'waiting) '() (make-async-os-mutex))))
+    (make-async-future% (box 'waiting) (make-async-wait-queue)
+      (make-async-os-mutex))))
 
 (set-who! future-fulfil!
   (lambda (f . vals)
@@ -3176,7 +3576,8 @@
 (set-who! future-operation
   (lambda (f)
     (unless (future? f) ($oops who "~s is not a future" f))
-    (make-async-operation
+    (let ([token (list 'future-operation)])
+      (make-async-operation
       (lambda (ss)
         (let ([state (unbox (async-future-state f))])
           (and (pair? state) (eq? (car state) 'done) (cdr state))))
@@ -3186,17 +3587,17 @@
             (if (and (pair? state) (eq? (car state) 'done))
                 (begin (deliver (cdr state)) #f)
                 (begin
-                  (async-future-waiters-set! f (cons (cons ss deliver) (async-future-waiters f)))
+                  (async-sync-slot-set! ss token
+                    (async-wait-queue-add! (async-future-waiters f)
+                      (cons ss deliver)))
                   (list 'future))))))
       (lambda (vals) vals)
       (lambda (ss)
         (with-async-mutex (async-future-mutex f)
-          (async-future-waiters-set! f
-            (let loop ([ws (async-future-waiters f)])
-              (cond
-                [(null? ws) '()]
-                [(eq? (caar ws) ss) (cdr ws)]
-                [else (cons (car ws) (loop (cdr ws)))]))))))))
+          (let ([node (async-sync-slot-ref ss token #f)])
+            (when node
+              (async-wait-queue-remove! (async-future-waiters f) node)
+              (async-sync-slot-delete! ss token)))))))))
 
 (set-who! future-get
   (lambda (f)
@@ -3204,12 +3605,14 @@
 
 (set-who! make-channel
   (case-lambda
-    [() (make-async-channel% 0 (make-async-os-mutex) #f 0 0 '() '() #f #f)]
+    [() (make-async-channel% 0 (make-async-os-mutex) #f 0 0
+          (make-async-wait-queue) (make-async-wait-queue) #f #f)]
     [(capacity)
      (unless (and (fixnum? capacity) (fx>= capacity 0))
        ($oops who "~s is not a nonnegative fixnum" capacity))
      (make-async-channel% capacity (make-async-os-mutex)
-       (and (fx> capacity 0) (make-vector capacity)) 0 0 '() '() #f #f)]))
+       (and (fx> capacity 0) (make-vector capacity)) 0 0
+       (make-async-wait-queue) (make-async-wait-queue) #f #f)]))
 
 (set-who! channel-close!
   (case-lambda
@@ -3223,19 +3626,22 @@
                          (begin
                            (async-channel-closed?-set! ch #t)
                            (async-channel-close-reason-set! ch reason)
-                           (async-channel-prune! ch)
                            (async-invariant
                              (or (fx= (async-channel-bcount ch) 0)
-                                 (null? (async-channel-gets ch)))
+                                 (async-wait-queue-empty?
+                                   (async-channel-gets ch)))
                              "buffered channel has a live receiver at close"
                              ch)
-                           (let ([puts (async-channel-puts ch)]
-                                 [gets (if (fx= (async-channel-bcount ch) 0)
-                                           (async-channel-gets ch)
-                                           '())])
-                             (async-channel-puts-set! ch '())
-                             (async-channel-gets-set! ch '())
-                             (values puts gets)))))])
+                           (let ([puts
+                                  (async-wait-queue-drain!
+                                    (async-channel-puts ch))]
+                                 [all-gets
+                                  (async-wait-queue-drain!
+                                    (async-channel-gets ch))])
+                             (values puts
+                               (if (fx= (async-channel-bcount ch) 0)
+                                   all-gets
+                                   '()))))))])
        (let ([payload (async-channel-put-closed-payload ch)])
          (for-each (lambda (p) ((caddr p) payload)) puts))
        (let ([payload (async-channel-receive-closed-payload)])
@@ -3251,105 +3657,181 @@
 (set-who! channel-put-operation
   (lambda (ch v)
     (unless (channel? ch) ($oops who "~s is not a channel" ch))
-    (make-async-operation
-      (lambda (ss)
-        (with-async-mutex (async-channel-mutex ch)
-          (async-channel-prune! ch)
-          (if (async-channel-closed? ch)
-              (async-channel-put-closed-payload ch)
-              (if (async-channel-deliver-to-getter! ch v)
-              (cons 'values '())
-              (if (and (fx> (async-channel-capacity ch) 0)
-                       (fx< (async-channel-bcount ch) (async-channel-capacity ch)))
-                  (begin (async-buffer-push! ch v) (cons 'values '()))
-                  #f)))))
-      (lambda (ss deliver)
-        (with-async-mutex (async-channel-mutex ch)
-          (async-channel-prune! ch)
-          (if (async-channel-closed? ch)
-              (begin (deliver (async-channel-put-closed-payload ch)) #f)
-              (if (async-channel-deliver-to-getter! ch v)
-              (begin (deliver (cons 'values '())) #f)
-              (if (and (fx> (async-channel-capacity ch) 0)
-                       (fx< (async-channel-bcount ch) (async-channel-capacity ch)))
-                  (begin
-                    (async-buffer-push! ch v)
-                    (deliver (cons 'values '()))
-                    #f)
-                  (begin
-                    (async-channel-puts-set! ch
-                      (append (async-channel-puts ch) (list (list v ss deliver))))
-                    (list 'channel-put ch)))))))
-      (lambda (vals) vals)
-      (lambda (ss)
-        (with-async-mutex (async-channel-mutex ch)
-          (async-channel-puts-set! ch
-            (filter (lambda (p) (not (eq? (cadr p) ss)))
-              (async-channel-puts ch))))))))
+    (let ([token (list 'channel-put-operation)])
+      (make-async-operation
+        (lambda (ss)
+          (let-values ([(payload publications)
+                        (with-async-mutex (async-channel-mutex ch)
+                          (cond
+                            [(async-channel-closed? ch)
+                             (values (async-channel-put-closed-payload ch) '())]
+                            [(async-channel-reserve-getter! ch v)
+                             => (lambda (reservation)
+                                  (values (cons 'values '())
+                                    (async-delivery-prepare-all!
+                                      (list (cdr reservation)))))]
+                            [(and (fx> (async-channel-capacity ch) 0)
+                                  (fx< (async-channel-bcount ch)
+                                    (async-channel-capacity ch)))
+                             (async-buffer-push! ch v)
+                             (values (cons 'values '()) '())]
+                            [else (values #f '())]))])
+            (async-delivery-publish-all! publications)
+            payload))
+        (lambda (ss deliver)
+          (let-values ([(descriptor publications)
+                        (with-async-mutex (async-channel-mutex ch)
+                          (cond
+                            [(async-channel-closed? ch)
+                             (let ([reservation
+                                    (deliver 'reserve
+                                      (async-channel-put-closed-payload ch))])
+                               (values #f
+                                 (if reservation
+                                     (async-delivery-prepare-all!
+                                       (list reservation))
+                                     '())))]
+                            [(async-channel-reserve-getter! ch v)
+                             => (lambda (getter)
+                                  (let ([putter
+                                         (deliver 'reserve
+                                           (cons 'values '()))])
+                                    (if putter
+                                        (values #f
+                                          (async-delivery-prepare-all!
+                                            (list (cdr getter) putter)))
+                                        (begin
+                                          (async-delivery-rollback! (cdr getter))
+                                          (async-wait-queue-reinsert-front!
+                                            (async-channel-gets ch) (car getter))
+                                          (values #f '())))))]
+                            [(and (fx> (async-channel-capacity ch) 0)
+                                  (fx< (async-channel-bcount ch)
+                                    (async-channel-capacity ch)))
+                             (let ([putter
+                                    (deliver 'reserve (cons 'values '()))])
+                               (when putter (async-buffer-push! ch v))
+                               (values #f
+                                 (if putter
+                                     (async-delivery-prepare-all!
+                                       (list putter))
+                                     '())))]
+                            [else
+                             (async-sync-slot-set! ss token
+                               (async-wait-queue-add! (async-channel-puts ch)
+                                 (list v ss deliver)))
+                             (values (list 'channel-put ch) '())]))])
+            (async-delivery-publish-all! publications)
+            descriptor))
+        (lambda (vals) vals)
+        (lambda (ss)
+          (with-async-mutex (async-channel-mutex ch)
+            (let ([node (async-sync-slot-ref ss token #f)])
+              (when node
+                (async-wait-queue-remove! (async-channel-puts ch) node)
+                (async-sync-slot-delete! ss token)))))))))
 
 (set-who! channel-receive-operation
   (lambda (ch)
     (unless (channel? ch) ($oops who "~s is not a channel" ch))
-    (make-async-operation
-      (lambda (ss)
-        (with-async-mutex (async-channel-mutex ch)
-          (async-channel-prune! ch)
-          (cond
-            [(and (fx> (async-channel-capacity ch) 0)
-                  (fx> (async-channel-bcount ch) 0))
-             (let ([v (async-buffer-pop! ch)])
-               ;; move a waiting put into the buffer
-               (async-channel-take-from-putter! ch
-                 (lambda (pv deliver)
-                   (if (deliver (cons 'values '()))
-                       (begin (async-buffer-push! ch pv) #t)
-                       #f)))
-               (cons 'values (list v #t)))]
-            [else
-             (let ([got (box #f)])
-               (if (async-channel-take-from-putter! ch
-                     (lambda (pv deliver)
-                       (if (deliver (cons 'values '()))
-                           (begin (set-box! got pv) #t)
-                           #f)))
-                   (cons 'values (list (unbox got) #t))
-                   (and (async-channel-closed? ch)
-                        (async-channel-receive-closed-payload))))])))
-      (lambda (ss deliver)
-        (with-async-mutex (async-channel-mutex ch)
-          (async-channel-prune! ch)
-          (let ([got (box #f)] [done? (box #f)])
-            (cond
-              [(and (fx> (async-channel-capacity ch) 0)
-                    (fx> (async-channel-bcount ch) 0))
-               (let ([v (async-buffer-pop! ch)])
-                 (async-channel-take-from-putter! ch
-                   (lambda (pv pdeliver)
-                     (if (pdeliver (cons 'values '()))
-                         (begin (async-buffer-push! ch pv) #t)
-                         #f)))
-                 (deliver (cons 'values (list v #t)))
-                 #f)]
-              [(async-channel-take-from-putter! ch
-                 (lambda (pv pdeliver)
-                   (if (pdeliver (cons 'values '()))
-                       (begin (set-box! got pv) #t)
-                       #f)))
-               (deliver (cons 'values (list (unbox got) #t)))
-               #f]
-              [(async-channel-closed? ch)
-               (deliver (async-channel-receive-closed-payload))
-               #f]
-              [else
-               (async-channel-gets-set! ch
-                 (append (async-channel-gets ch) (list (cons ss deliver))))
-               (list 'channel-receive ch)]))))
-      (lambda (vals) vals)
-      (lambda (ss)
-        (with-async-mutex (async-channel-mutex ch)
-          (async-channel-gets-set! ch
-            (filter (lambda (g) (not (eq? (car g) ss)))
-              (async-channel-gets ch))))))))
+    (let ([token (list 'channel-receive-operation)])
+      (make-async-operation
+        (lambda (ss)
+          (let-values ([(payload publications)
+                        (with-async-mutex (async-channel-mutex ch)
+                          (cond
+                            [(and (fx> (async-channel-capacity ch) 0)
+                                  (fx> (async-channel-bcount ch) 0))
+                             (let* ([v (async-buffer-pop! ch)]
+                                    [putter (async-channel-reserve-putter! ch)])
+                               (when putter
+                                 (async-buffer-push! ch (vector-ref putter 0)))
+                               (values (cons 'values (list v #t))
+                                 (if putter
+                                     (async-delivery-prepare-all!
+                                       (list (vector-ref putter 2)))
+                                     '())))]
+                            [(async-channel-reserve-putter! ch)
+                             => (lambda (putter)
+                                  (values
+                                    (cons 'values
+                                      (list (vector-ref putter 0) #t))
+                                    (async-delivery-prepare-all!
+                                      (list (vector-ref putter 2)))))]
+                            [(async-channel-closed? ch)
+                             (values
+                               (async-channel-receive-closed-payload) '())]
+                            [else (values #f '())]))])
+            (async-delivery-publish-all! publications)
+            payload))
+        (lambda (ss deliver)
+          (let-values ([(descriptor publications)
+                        (with-async-mutex (async-channel-mutex ch)
+                          (cond
+                            [(and (fx> (async-channel-capacity ch) 0)
+                                  (fx> (async-channel-bcount ch) 0))
+                             (let ([receiver
+                                    (deliver 'reserve
+                                      (cons 'values
+                                        (list
+                                          (vector-ref
+                                            (async-channel-buffer ch)
+                                            (async-channel-bstart ch))
+                                          #t)))])
+                               (if receiver
+                                   (let* ([v (async-buffer-pop! ch)]
+                                          [putter
+                                           (async-channel-reserve-putter! ch)])
+                                     (when putter
+                                       (async-buffer-push! ch
+                                         (vector-ref putter 0)))
+                                     (values #f
+                                       (async-delivery-prepare-all!
+                                         (append
+                                           (if putter
+                                               (list (vector-ref putter 2)) '())
+                                           (list receiver)))))
+                                   (values #f '())))]
+                            [(async-channel-reserve-putter! ch)
+                             => (lambda (putter)
+                                  (let ([receiver
+                                         (deliver 'reserve
+                                           (cons 'values
+                                             (list (vector-ref putter 0) #t)))])
+                                    (if receiver
+                                        (values #f
+                                          (async-delivery-prepare-all!
+                                            (list (vector-ref putter 2) receiver)))
+                                        (begin
+                                          (async-delivery-rollback!
+                                            (vector-ref putter 2))
+                                          (async-wait-queue-reinsert-front!
+                                            (async-channel-puts ch)
+                                            (vector-ref putter 1))
+                                          (values #f '())))))]
+                            [(async-channel-closed? ch)
+                             (let ([receiver
+                                    (deliver 'reserve
+                                      (async-channel-receive-closed-payload))])
+                               (values #f
+                                 (if receiver
+                                     (async-delivery-prepare-all!
+                                       (list receiver))
+                                     '())))]
+                            [else
+                             (async-sync-slot-set! ss token
+                               (async-wait-queue-add! (async-channel-gets ch)
+                                 (cons ss deliver)))
+                             (values (list 'channel-receive ch) '())]))])
+            (async-delivery-publish-all! publications)
+            descriptor))
+        (lambda (vals) vals)
+        (lambda (ss)
+          (with-async-mutex (async-channel-mutex ch)
+            (let ([node (async-sync-slot-ref ss token #f)])
+              (when node
+                (async-wait-queue-remove! (async-channel-gets ch) node)
+                (async-sync-slot-delete! ss token)))))))))
 
 (set-who! channel-get-operation
   (lambda (ch)
@@ -3550,7 +4032,7 @@
                       (make-async-os-mutex)
                       (if-feature pthreads (make-condition) #f)
                       (make-async-queue) (make-eq-hashtable) 0
-                      '#() #f 0 0 (box 0) #f #f '())]
+                      '#() #f 0 '() #f #f '())]
              [schedulers (make-vector parallelism)])
         (do ([i 0 (fx+ i 1)]) ((fx= i parallelism))
           (vector-set! schedulers i
@@ -3641,7 +4123,7 @@
 (set-who! async-scheduler-wakeup-count
   (lambda (sched)
     (unless (async-scheduler? sched) ($oops who "~s is not a scheduler" sched))
-    ($async-scheduler-wakeup-count sched)))
+    (async-atomic-box-ref (async-scheduler-wakeup-count-box sched))))
 
 ;;; ------------------------------------------------- io layer integration
 
@@ -3653,6 +4135,16 @@
       (and (async-scheduler? sched)
            (async-scheduler-current-task sched)
            #t))))
+(set! $async-pin-current-wait!
+  (lambda ()
+    (let* ([sched ($async-scheduler)]
+           [task
+            (and (async-scheduler? sched)
+                 (async-scheduler-current-task sched))])
+      (unless task
+        ($oops '$async-pin-current-wait! "outside of an async task"))
+      (with-async-mutex (async-task-mutex task)
+        (async-task-resume-pinned?-set! task #t)))))
 (set! $async-sync-state-live? async-sync-state-live?)
 (set! $async-sync-slot-set! async-sync-slot-set!)
 (set! $async-sync-slot-ref async-sync-slot-ref)
@@ -3681,7 +4173,8 @@
   (lambda (sched v) (async-scheduler-wake-proc-set! sched v)))
 
 (set! $async-scheduler-timers
-  (lambda (sched) (async-scheduler-timers sched)))
+  (lambda (sched)
+    (async-timer-heap-peek (async-scheduler-timers sched))))
 
 (set! $async-scheduler-virtual?
   (lambda (sched) (async-scheduler-virtual? sched)))

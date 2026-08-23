@@ -2270,6 +2270,7 @@
   ($async-monotonic-us [flags])
   ($async-new-thread-parameter [flags])
   ($async-task-active? [flags])
+  ($async-pin-current-wait! [flags])
   ($engine-active? [flags])
   ($async-sync-state-live? [flags])
   ($async-sync-slot-set! [flags])

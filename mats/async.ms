@@ -429,6 +429,46 @@
             'clock 'virtual)
     '(1 2 3))
 
+  ;; Heap growth preserves stable ordering for a large equal-deadline batch.
+  (equal? (run-async
+            (lambda ()
+              (let* ([log (box '())]
+                    [tasks
+                     (let loop ([i 0] [tasks '()])
+                       (if (fx= i 128)
+                           (reverse tasks)
+                           (loop (fx+ i 1)
+                             (cons
+                               (spawn-task
+                                 (lambda ()
+                                   (async-sleep 1)
+                                   (set-box! log (cons i (unbox log)))))
+                               tasks))))])
+                (for-each task-join tasks)
+                (reverse (unbox log))))
+            'clock 'virtual)
+    (let loop ([i 0])
+      (if (fx= i 128) '() (cons i (loop (fx+ i 1))))))
+
+  ;; Canceling many sleeping tasks removes their exact heap entries.
+  (equal? (run-async
+            (lambda ()
+              (let ([tasks
+                     (let loop ([i 0] [tasks '()])
+                       (if (fx= i 256)
+                           tasks
+                           (loop (fx+ i 1)
+                             (cons (spawn-task (lambda () (async-sleep 1000)))
+                               tasks))))])
+                (task-yield)
+                (for-each (lambda (task) (task-cancel! task 'stop)) tasks)
+                (for-each
+                  (lambda (task) (guard (c [else (void)]) (task-join task)))
+                  tasks)
+                'canceled))
+            'clock 'virtual)
+    'canceled)
+
   ;; ---- operations
 
   (equal? (run-async (lambda () (perform-operation (always-operation 'x)))) 'x)
@@ -885,6 +925,31 @@
                       (call-with-values
                         (lambda () (perform-operation done)) list)))))
     '(() ()))
+
+  ;; Cancellation detaches and wakes a large context waiter set exactly once.
+  (equal? (run-async
+            (lambda ()
+              (let* ([context (make-async-context)]
+                     [started (make-async-wait-group 128)]
+                     [tasks
+                      (let loop ([i 0] [tasks '()])
+                        (if (fx= i 128)
+                            tasks
+                            (loop (fx+ i 1)
+                              (cons
+                                (spawn-task
+                                  (lambda ()
+                                    (async-wait-group-done! started)
+                                    (perform-operation
+                                      (async-context-done-operation context))
+                                    i))
+                                tasks))))])
+                (async-wait-group-wait started)
+                (async-context-cancel! context 'fanout)
+                (let ([values (map task-join tasks)])
+                  (and (fx= (length values) 128)
+                       (fx= (apply + values) 8128))))))
+    #t)
 
   ;; An explicit context cancels an operation and runs the operation's nack.
   (equal? (run-async

@@ -15,6 +15,7 @@
 (import (chezscheme async))
 (import (chezscheme async operations))
 (import (chezscheme async context))
+(import (chezscheme async sync))
 (import (chezscheme async io errors))
 (import (chezscheme async io stream))
 (import (chezscheme async io dns))
@@ -351,6 +352,22 @@
                (list? (system-interface-info))
                (pair? (assq 'user-time usage))
                (pair? (assq 'loop-count metrics)))))))
+
+  ;; A completion burst larger than one dispatch batch remains lossless.
+  (equal? (run-async
+            (lambda ()
+              (let ([tasks
+                     (let loop ([i 0] [tasks '()])
+                       (if (fx= i 320)
+                           tasks
+                           (loop (fx+ i 1)
+                             (cons
+                               (spawn-task
+                                 (lambda ()
+                                   (bytevector-length (random-bytevector 8))))
+                               tasks))))])
+                (apply + (map task-join tasks)))))
+    2560)
 
   ;; child stdio pipes use the ordinary stream protocol.
   (run-async
@@ -897,6 +914,45 @@
                      (list canceled received))))))])
       (asyncio-delete-if-present path)
       (equal? result '(context-canceled "after-context"))))
+
+  ;; Canceling a large stream waiter set unlinks each registration without
+  ;; consuming the next live reader's bytes.
+  (let ([path (asyncio-temp-path "cancel-fanout")])
+    (asyncio-delete-if-present path)
+    (let ([result
+           (run-async
+             (lambda ()
+               (let* ([listener (pipe-listen path)]
+                      [connector (spawn-task (lambda () (pipe-connect path)))]
+                      [server (tcp-accept listener)]
+                      [client (task-join connector)]
+                      [started (make-async-wait-group 64)]
+                      [readers
+                       (let loop ([i 0] [tasks '()])
+                         (if (fx= i 64)
+                             tasks
+                             (loop (fx+ i 1)
+                               (cons
+                                 (spawn-task
+                                   (lambda ()
+                                     (async-wait-group-done! started)
+                                     (guard (c [else 'canceled])
+                                       (stream-read server))))
+                                 tasks))))])
+                 (async-wait-group-wait started)
+                 (task-yield)
+                 (for-each (lambda (reader) (task-cancel! reader 'stop)) readers)
+                 (for-each
+                   (lambda (reader) (guard (c [else (void)]) (task-join reader)))
+                   readers)
+                 (stream-write client (string->utf8 "live"))
+                 (let ([received (utf8->string (stream-read server))])
+                   (stream-close server)
+                   (stream-close client)
+                   (tcp-listener-close listener)
+                   received))))])
+      (asyncio-delete-if-present path)
+      (string=? result "live")))
 
   ;; TCP streams use the same operation and ownership protocol
 
