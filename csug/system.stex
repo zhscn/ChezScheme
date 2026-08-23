@@ -423,8 +423,12 @@ prompt when handling a matching \scheme{shift0} or \scheme{shift0-at}.
 \entryheader
 \formdef{shift}{\categorysyntax}{(shift \var{k} \var{body_1} \var{body_2} \dots)}
 \formdef{shift-at}{\categorysyntax}{(shift-at \var{tag} \var{k} \var{body_1} \var{body_2} \dots)}
+\formdef{shift/1}{\categorysyntax}{(shift/1 \var{k} \var{body_1} \var{body_2} \dots)}
+\formdef{shift/1-at}{\categorysyntax}{(shift/1-at \var{tag} \var{k} \var{body_1} \var{body_2} \dots)}
 \formdef{shift0}{\categorysyntax}{(shift0 \var{k} \var{body_1} \var{body_2} \dots)}
 \formdef{shift0-at}{\categorysyntax}{(shift0-at \var{tag} \var{k} \var{body_1} \var{body_2} \dots)}
+\formdef{shift0/1}{\categorysyntax}{(shift0/1 \var{k} \var{body_1} \var{body_2} \dots)}
+\formdef{shift0/1-at}{\categorysyntax}{(shift0/1-at \var{tag} \var{k} \var{body_1} \var{body_2} \dots)}
 \listlibraries
 \endentryheader
 
@@ -435,11 +439,19 @@ sequence.  The \scheme{-at} forms select \var{tag}; the untagged forms select
 the default continuation-prompt tag.  A tagged shift with no matching prompt
 raises an exception.
 
-The continuation procedure accepts any number of arguments and may be
-invoked any number of times.  Its arguments become the values of the shift
-expression.  Invoking a continuation captured by \scheme{shift} or
-\scheme{shift-at} installs a matching prompt around the resumed computation;
-invoking one captured by \scheme{shift0} or \scheme{shift0-at} does not.
+The continuation procedure accepts any number of arguments.  Its arguments
+become the values of the shift expression.  Continuations captured by
+\scheme{shift}, \scheme{shift-at}, \scheme{shift0}, and \scheme{shift0-at}
+may be invoked any number of times.  Continuations captured by
+\scheme{shift/1}, \scheme{shift/1-at}, \scheme{shift0/1}, and
+\scheme{shift0/1-at} may be invoked at most once; a later invocation raises an
+exception.  The one-shot forms permit the implementation to transfer an
+exclusively owned continuation instead of copying it.
+
+Invoking a continuation captured by \scheme{shift}, \scheme{shift-at},
+\scheme{shift/1}, or \scheme{shift/1-at} installs a matching prompt around
+the resumed computation; invoking one captured by \scheme{shift0},
+\scheme{shift0-at}, \scheme{shift0/1}, or \scheme{shift0/1-at} does not.
 Captured and invoking dynamic environments compose according to
 \scheme{dynamic-wind}, parameter bindings, and continuation marks.
 

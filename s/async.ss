@@ -1326,7 +1326,14 @@
     (snapshot-task-dynamic-state! sched task)
     (set-sched-switch! sched #t)
     (let ([payload
-            ($control-shift-at (async-scheduler-prompt-tag sched) #t
+            ;; call/1cc transfers ownership of its active stack.  A preemption
+            ;; engine retains an enclosing continuation for that stack, so
+            ;; engine-backed schedulers use the non-transferring capture.  The
+            ;; async resumption itself remains linearly owned and consumed.
+            ((if (async-scheduler-preemption-ticks sched)
+                 $control-shift-linear-at
+                 $control-shift1-at)
+              (async-scheduler-prompt-tag sched) #t
               (lambda (k)
                 (set-sched-switch! sched #f)
                 (with-async-mutex (async-task-mutex task)
@@ -2244,6 +2251,11 @@
           ($control-reset-at (async-scheduler-prompt-tag sched) #t entry))
         (let ([resumption (async-task-resumption task)]
               [payload (async-task-payload task)])
+          ;; A native one-shot transfers the stack out of this field.  An
+          ;; enclosing engine retains the call/cc-based resumption until the
+          ;; engine turn completes or another suspension replaces it.
+          (unless (async-scheduler-preemption-ticks sched)
+            (async-task-resumption-set! task #f))
           (async-task-payload-set! task #f)
           ;; Rewinding captured dynamic-winds is part of the scheduling
           ;; switch, not a user-level wind entry.

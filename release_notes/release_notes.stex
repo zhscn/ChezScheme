@@ -6,10 +6,15 @@
 \pubyear{2026}
 
 \iflatex
-\usepackage{enumitem}
-\setitemize{noitemsep,topsep=0pt,parsep=0pt,partopsep=0pt}
+\newcommand{\compactitemizespacing}{%
+  \setlength{\itemsep}{0pt}%
+  \setlength{\topsep}{0pt}%
+  \setlength{\parsep}{0pt}%
+  \setlength{\partopsep}{0pt}}
+\let\defaultitemize\itemize
+\renewcommand{\itemize}{\defaultitemize\compactitemizespacing}
 \newenvironment{itemizeC}%
-  {\begin{itemize}[noitemsep,topsep=0pt,parsep=0pt,partopsep=0pt]}%
+  {\begin{itemize}}%
   {\end{itemize}}
 \fi
 \ifhtml

@@ -363,6 +363,7 @@ extern void S_put_scheme_arg(ptr tc, iptr n, ptr x);
 extern iptr S_continuation_depth(ptr k);
 extern ptr S_single_continuation(ptr k, iptr n);
 extern ptr S_compose_continuation(ptr k, ptr boundary, ptr tail);
+extern ptr S_compose_continuation_oneshot(ptr k, ptr boundary, ptr tail);
 extern void S_promote_to_multishot(ptr k);
 extern void S_split_and_resize(void);
 extern void S_handle_overflow(void);

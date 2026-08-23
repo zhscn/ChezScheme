@@ -1148,6 +1148,7 @@
           (list
             '(rnrs)
             '(only (chezscheme)
+               collect
                create-exception-state
                current-exception-state
                with-unwind-handler))
@@ -1207,6 +1208,70 @@
       '(let ([tag (make-continuation-prompt-tag 'tag)])
          (reset-at tag
            (+ 10 (shift-at tag k (k 7)))))))
+  (equal? '(0 11 caught)
+    ($control-eval
+      '(let ([saved #f])
+         (list
+           (reset
+             (+ 10
+               (shift/1 k
+                 (set! saved k)
+                 0)))
+           (saved 1)
+           (guard (condition [else 'caught])
+             (saved 2))))))
+  (equal? '(1 2 3)
+    ($control-eval
+      '(reset
+         (call-with-values
+           (lambda () (shift/1 k (k 1 2 3)))
+           list))))
+  ;; Promotion before the first invocation uses the copying fallback while
+  ;; retaining the public one-shot contract.
+  (equal? '(0 11 caught)
+    ($control-eval
+      '(let ([saved #f])
+         (let ([first
+                (reset
+                  (+ 10
+                    (shift/1 k
+                      (set! saved k)
+                      0)))])
+           (collect)
+           (list
+             first
+             (saved 1)
+             (guard (condition [else 'caught])
+               (saved 2)))))))
+  (equal? '(enter exit body enter exit)
+    ($control-eval
+      '(let ([events '()])
+         (define (record! event)
+           (set! events (cons event events)))
+         (reset
+           (dynamic-wind
+             (lambda () (record! 'enter))
+             (lambda ()
+               (shift/1 k
+                 (k (begin (record! 'body) 0))))
+             (lambda () (record! 'exit))))
+         (reverse events))))
+  (eqv? 17
+    ($control-eval
+      '(let ([tag (make-continuation-prompt-tag 'tag)])
+         (reset-at tag
+           (+ 10 (shift/1-at tag k (k 7)))))))
+  (eqv? 105
+    ($control-eval
+      '(reset
+         (+ 100
+           (reset
+             (+ 1 (shift0/1 k (shift0/1 k2 5))))))))
+  (eqv? 5
+    ($control-eval
+      '(let ([tag (make-continuation-prompt-tag 'tag)])
+         (reset0-at tag
+           (+ 1 (shift0/1-at tag k (k 4)))))))
   (eqv? 11
     ($control-eval
       '(let ([outer (make-continuation-prompt-tag 'outer)]

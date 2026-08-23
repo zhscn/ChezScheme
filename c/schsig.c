@@ -643,53 +643,103 @@ static void compose_continuation_stack(compose_context *context,
     }
 }
 
-/* Copy the segment from k up to but not including boundary, then splice the
- * copy onto tail. The copied dynamic context has the same captured prefix
- * followed by tail's winders and attachments.
- * Each copied continuation owns its stack storage, since both the captured
- * segment and every composition of it can be entered independently.
- * GC safety: find_room may queue but never run a collection, and collection
- * only happens at Scheme event checks, which cannot occur while this thread
- * is inside a non-collect-safe foreign procedure. */
-static ptr compose_continuation(ptr k,
-                                ptr boundary,
-                                ptr tail) {
-    ptr head, last, next, source, stack, winders, attachments;
-    ptr old_winders, new_winders, old_attachments, new_attachments;
-    ptr tc = get_thread_context();
-    compose_context context;
-    iptr length;
+/* Rebase dynamic-state pointers in an exclusively owned generation-0
+ * one-shot stack.  Inactive stack storage is untyped space_data and is not a
+ * valid dirty-card target, so callers must copy promoted stacks instead. */
+static void compose_continuation_stack_in_place(compose_context *context,
+                                                ptr stack,
+                                                iptr length,
+                                                ptr return_address) {
+    ptr live_mask, value, replacement;
+    ptr *base, *frame, *slot;
+    uptr mask;
+    iptr index;
+    INT bits;
+    bigit big_mask;
 
-    S_promote_to_multishot(k);
-    old_winders = CONTWINDERS(boundary);
-    new_winders = CONTWINDERS(tail);
-    old_attachments = CONTATTACHMENTS(boundary);
-    new_attachments = CONTATTACHMENTS(tail);
-    compose_context_init(&context,
-                         old_winders,
-                         new_winders,
-                         old_attachments,
-                         new_attachments);
+    base = TO_VOIDP(stack);
+    frame = TO_VOIDP((uptr)stack + length);
+    while (frame != base) {
+        if (frame < base)
+            S_error_abort("compose one-shot continuation: malformed stack");
+        frame = TO_VOIDP((uptr)TO_PTR(frame)
+                         - ENTRYFRAMESIZE(return_address));
+        live_mask = ENTRYLIVEMASK(return_address);
+        slot = frame;
+        return_address = *slot;
+        if (Sfixnump(live_mask)) {
+            mask = UNFIX(live_mask);
+            while (mask != 0) {
+                slot += 1;
+                if (mask & 1) {
+                    value = *slot;
+                    replacement = compose_continuation_stack_value(context,
+                                                                    value);
+                    if (replacement != value)
+                        *slot = replacement;
+                }
+                mask >>= 1;
+            }
+        } else {
+            index = BIGLEN(live_mask);
+            while (index != 0) {
+                index -= 1;
+                bits = bigit_bits;
+                big_mask = BIGIT(live_mask, index);
+                while (bits > 0) {
+                    bits -= 1;
+                    slot += 1;
+                    if (big_mask & 1) {
+                        value = *slot;
+                        replacement = compose_continuation_stack_value(context,
+                                                                        value);
+                        if (replacement != value)
+                            *slot = replacement;
+                    }
+                    big_mask >>= 1;
+                }
+            }
+        }
+    }
+}
 
-    /* Populate all dynamic-state mappings before rewriting any copied stack,
-     * since a frame can refer to state recorded on another continuation in
-     * the segment. */
-    source = k;
+/* Populate all dynamic-state mappings before rewriting any stack, since a
+ * frame can refer to state recorded on another continuation in the segment. */
+static void compose_continuation_prepare(compose_context *context,
+                                         ptr k,
+                                         ptr boundary) {
+    ptr source = k;
+
     while (source != boundary) {
         if (CONTATTACHMENTS(source) != Sfalse) {
-            (void)compose_continuation_winders(&context,
+            (void)compose_continuation_winders(context,
                                                CONTWINDERS(source),
-                                               old_winders,
-                                               new_winders,
-                                               old_attachments,
-                                               new_attachments);
-            (void)compose_continuation_list(&context,
+                                               context->old_winders,
+                                               context->new_winders,
+                                               context->old_attachments,
+                                               context->new_attachments);
+            (void)compose_continuation_list(context,
                                             CONTATTACHMENTS(source),
-                                            old_attachments,
-                                            new_attachments);
+                                            context->old_attachments,
+                                            context->new_attachments);
         }
         source = CONTLINK(source);
     }
+}
+
+/* Copy the segment from k up to but not including boundary, then splice the
+ * copy onto tail using mappings prepared for the complete composition.  Each
+ * copied continuation owns its stack storage, since the source and copy can
+ * be entered independently.  GC safety: find_room may queue but never run a
+ * collection, and collection only happens at Scheme event checks, which
+ * cannot occur inside a non-collect-safe foreign procedure. */
+static ptr compose_continuation_copy(compose_context *context,
+                                     ptr k,
+                                     ptr boundary,
+                                     ptr tail) {
+    ptr head, last, next, source, stack, winders, attachments;
+    ptr tc = get_thread_context();
+    iptr length;
 
     head = last = Snil;
     source = k;
@@ -701,18 +751,18 @@ static ptr compose_continuation(ptr k,
             winders = CONTWINDERS(source);
             attachments = Sfalse;
         } else {
-            winders = compose_continuation_winders(&context,
+            winders = compose_continuation_winders(context,
                                                    CONTWINDERS(source),
-                                                   old_winders,
-                                                   new_winders,
-                                                   old_attachments,
-                                                   new_attachments);
-            attachments = compose_continuation_list(&context,
+                                                   context->old_winders,
+                                                   context->new_winders,
+                                                   context->old_attachments,
+                                                   context->new_attachments);
+            attachments = compose_continuation_list(context,
                                                     CONTATTACHMENTS(source),
-                                                    old_attachments,
-                                                    new_attachments);
+                                                    context->old_attachments,
+                                                    context->new_attachments);
         }
-        compose_continuation_stack(&context,
+        compose_continuation_stack(context,
                                    stack,
                                    length,
                                    CONTRET(source));
@@ -733,12 +783,107 @@ static ptr compose_continuation(ptr k,
         last = next;
         source = CONTLINK(source);
     }
-    compose_context_destroy(&context);
     return head;
+}
+
+static ptr compose_continuation(ptr k,
+                                ptr boundary,
+                                ptr tail) {
+    ptr result;
+    compose_context context;
+
+    S_promote_to_multishot(k);
+    compose_context_init(&context,
+                         CONTWINDERS(boundary),
+                         CONTWINDERS(tail),
+                         CONTATTACHMENTS(boundary),
+                         CONTATTACHMENTS(tail));
+    compose_continuation_prepare(&context, k, boundary);
+    result = compose_continuation_copy(&context, k, boundary, tail);
+    compose_context_destroy(&context);
+    return result;
 }
 
 ptr S_compose_continuation(ptr k, ptr boundary, ptr tail) {
     return compose_continuation(k, boundary, tail);
+}
+
+static IBOOL continuation_oneshot_owned(ptr k) {
+    return CONTLENGTH(k) > CONTCLENGTH(k)
+           && SegInfo(ptr_get_segment(k))->generation == 0
+           && SegInfo(ptr_get_segment(CONTSTACK(k)))->generation == 0;
+}
+
+/* Consume the exclusively owned prefix of a one-shot segment by rebasing its
+ * dynamic context and replacing its final link in place.  A general one-shot
+ * continuation has spare stack capacity (length > clength).  Continuation
+ * records below that prefix can be shared with prompt and exception machinery;
+ * compose only that suffix, then link the consumed prefix to its copy. */
+ptr S_compose_continuation_oneshot(ptr k, ptr boundary, ptr tail) {
+    ptr source, next, last, exclusive_limit, composed_tail;
+    ptr winders, attachments;
+    ptr old_winders, new_winders, old_attachments, new_attachments;
+    compose_context context;
+
+    if (k == boundary)
+        return tail;
+
+    if (!continuation_oneshot_owned(k))
+        return compose_continuation(k, boundary, tail);
+
+    source = k;
+    while (source != boundary
+           && continuation_oneshot_owned(source))
+        source = CONTLINK(source);
+    exclusive_limit = source;
+    if (source != boundary)
+        S_promote_to_multishot(source);
+
+    old_winders = CONTWINDERS(boundary);
+    new_winders = CONTWINDERS(tail);
+    old_attachments = CONTATTACHMENTS(boundary);
+    new_attachments = CONTATTACHMENTS(tail);
+    compose_context_init(&context,
+                         old_winders,
+                         new_winders,
+                         old_attachments,
+                         new_attachments);
+    compose_continuation_prepare(&context, k, boundary);
+    composed_tail = exclusive_limit == boundary
+                    ? tail
+                    : compose_continuation_copy(&context,
+                                                exclusive_limit,
+                                                boundary,
+                                                tail);
+
+    last = Snil;
+    source = k;
+    while (source != exclusive_limit) {
+        next = CONTLINK(source);
+        if (CONTATTACHMENTS(source) != Sfalse) {
+            winders = compose_continuation_winders(&context,
+                                                   CONTWINDERS(source),
+                                                   old_winders,
+                                                   new_winders,
+                                                   old_attachments,
+                                                   new_attachments);
+            attachments = compose_continuation_list(&context,
+                                                    CONTATTACHMENTS(source),
+                                                    old_attachments,
+                                                    new_attachments);
+            CONTWINDERS(source) = winders;
+            CONTATTACHMENTS(source) = attachments;
+        }
+        compose_continuation_stack_in_place(&context,
+                                            CONTSTACK(source),
+                                            CONTCLENGTH(source),
+                                            CONTRET(source));
+        last = source;
+        source = next;
+    }
+    CONTLINK(last) = composed_tail;
+    compose_context_destroy(&context);
+    return k;
 }
 
 void S_handle_overflow() {

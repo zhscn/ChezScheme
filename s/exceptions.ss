@@ -206,6 +206,11 @@ TODO:
       (scheme-object scheme-object scheme-object)
       scheme-object))
 
+  (define compose-continuation-oneshot
+    (foreign-procedure "(cs)compose_continuation_oneshot"
+      (scheme-object scheme-object scheme-object)
+      scheme-object))
+
   (define-record-type unwind-handler-info
     (nongenerative)
     (opaque #t)
@@ -283,6 +288,7 @@ TODO:
     (parent &condition)
     (fields (immutable tag)
             (immutable zero?)
+            (immutable one-shot?)
             (immutable proc)))
 
   (define empty-delimited-continuation-info
@@ -381,6 +387,30 @@ TODO:
             -1
             nonempty-delimited-continuation-info)))))
 
+  ;; A one-shot delimited continuation transfers ownership of its captured
+  ;; stack to the first caller.  The kernel splices an exclusively owned
+  ;; one-shot prefix in place and otherwise performs one safe composition.
+  (define make-one-shot-delimited-continuation
+    (lambda (inner boundary info empty?)
+      (let ([fresh? (box #t)])
+        (make-wrapper-procedure
+          (lambda args
+            (unless (box-cas! fresh? #t #f)
+              ($oops 'one-shot-delimited-continuation
+                "attempt to invoke a shot one-shot continuation"))
+            (if empty?
+                (#2%apply values args)
+                (#3%call/1cc
+                  (lambda (tail)
+                    (register-unwind-target! info tail)
+                    (#2%apply
+                      (compose-continuation-oneshot inner boundary tail)
+                      args)))))
+          -1
+          (if empty?
+              empty-delimited-continuation-info
+              nonempty-delimited-continuation-info)))))
+
   (define unwind-handler?
     (lambda (handler)
       (and (wrapper-procedure? handler)
@@ -455,13 +485,16 @@ TODO:
                                             (raise-context-attachment context)))
                                         #t
                                         #f)])
-                               ;; Build the independent segment after leaving
-                               ;; its dynamic extent, so unwinding observes the
+                               ;; Construct the resumption after leaving its
+                               ;; dynamic extent, so rebasing observes the
                                ;; original winder attachments.
                                ($call-in-continuation target
                                  (lambda ()
                                    (handler obj
-                                     (make-delimited-continuation
+                                     ((if (and (control-shift-request? obj)
+                                               (control-shift-request-one-shot? obj))
+                                          make-one-shot-delimited-continuation
+                                          make-delimited-continuation)
                                        inner limit info empty?)))))))))
                      2
                      info)]
@@ -631,7 +664,49 @@ TODO:
               (lambda (inner)
                 (invoke-handler
                   (control-prompt-activation-handler activation)
-                  (make-control-shift-request tag zero? proc)
+                  (make-control-shift-request tag zero? #f proc)
+                  (make-raise-context #t attachment inner)))))))))
+
+  ;; Capture through call/cc for an enclosing runtime facility that retains
+  ;; the active stack, while preserving linear resumption ownership.
+  (set-who! $control-shift-linear-at
+    (lambda (tag zero? proc)
+      (unless (control-prompt-tag? tag)
+        ($oops who "~s is not a continuation prompt tag" tag))
+      (unless (procedure? proc)
+        ($oops who "~s is not a procedure" proc))
+      (let ([activation (find-control-prompt-activation tag)])
+        (unless activation
+          ($oops who "no matching continuation prompt for ~s" tag))
+        ($call-getting-continuation-attachment
+          no-continuation-attachment
+          (lambda (attachment)
+            (#3%call/cc
+              (lambda (inner)
+                (invoke-handler
+                  (control-prompt-activation-handler activation)
+                  (make-control-shift-request tag zero? #t proc)
+                  (make-raise-context #t attachment inner)))))))))
+
+  ;; Internal one-shot variant used by fibers.  Its resumption has linear
+  ;; ownership and signals an error if invoked more than once.
+  (set-who! $control-shift1-at
+    (lambda (tag zero? proc)
+      (unless (control-prompt-tag? tag)
+        ($oops who "~s is not a continuation prompt tag" tag))
+      (unless (procedure? proc)
+        ($oops who "~s is not a procedure" proc))
+      (let ([activation (find-control-prompt-activation tag)])
+        (unless activation
+          ($oops who "no matching continuation prompt for ~s" tag))
+        ($call-getting-continuation-attachment
+          no-continuation-attachment
+          (lambda (attachment)
+            (#3%call/1cc
+              (lambda (inner)
+                (invoke-handler
+                  (control-prompt-activation-handler activation)
+                  (make-control-shift-request tag zero? #t proc)
                   (make-raise-context #t attachment inner)))))))))
 
   (set-who! raise
@@ -790,6 +865,26 @@ TODO:
            #f
            (lambda (continuation) body1 body2 ...))])))
 
+(define-syntax control:shift/1
+  (lambda (x)
+    (syntax-case x ()
+      [(_ continuation body1 body2 ...)
+       (identifier? #'continuation)
+       #'($control-shift1-at
+           (control:default-continuation-prompt-tag)
+           #f
+           (lambda (continuation) body1 body2 ...))])))
+
+(define-syntax control:shift/1-at
+  (lambda (x)
+    (syntax-case x ()
+      [(_ tag continuation body1 body2 ...)
+       (identifier? #'continuation)
+       #'($control-shift1-at
+           tag
+           #f
+           (lambda (continuation) body1 body2 ...))])))
+
 (define-syntax control:shift0
   (lambda (x)
     (syntax-case x ()
@@ -806,6 +901,26 @@ TODO:
       [(_ tag continuation body1 body2 ...)
        (identifier? #'continuation)
        #'($control-shift-at
+           tag
+           #t
+           (lambda (continuation) body1 body2 ...))])))
+
+(define-syntax control:shift0/1
+  (lambda (x)
+    (syntax-case x ()
+      [(_ continuation body1 body2 ...)
+       (identifier? #'continuation)
+       #'($control-shift1-at
+           (control:default-continuation-prompt-tag)
+           #t
+           (lambda (continuation) body1 body2 ...))])))
+
+(define-syntax control:shift0/1-at
+  (lambda (x)
+    (syntax-case x ()
+      [(_ tag continuation body1 body2 ...)
+       (identifier? #'continuation)
+       #'($control-shift1-at
            tag
            #t
            (lambda (continuation) body1 body2 ...))])))

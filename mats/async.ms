@@ -26,6 +26,18 @@
       (unless (fx= i n)
         (loop (fx+ i 1))))))
 
+(define async-test-deep-yield
+  (lambda (depth)
+    (if (fx= depth 0)
+        (begin (task-yield) 0)
+        (fx+ 1 (async-test-deep-yield (fx- depth 1))))))
+
+(define async-test-call-at-depth
+  (lambda (depth proc)
+    (if (fx= depth 0)
+        (proc)
+        (fx+ 1 (async-test-call-at-depth (fx- depth 1) proc)))))
+
 (mat async
 
   ;; ---- basic scheduling
@@ -1147,6 +1159,82 @@
     'from-thread)
 
   ;; ---- scheduler groups
+
+  ;; Deep one-shot resumptions preserve every live frame when work is
+  ;; published to, and potentially resumed by, another scheduler thread.
+  (or (not (threaded?))
+      (equal?
+        (run-async
+          (lambda ()
+            (let* ([n 48]
+                   [depth 96]
+                   [gate (make-future)]
+                   [tasks
+                    (let loop ([i 0] [tasks '()])
+                      (if (fx= i n)
+                          tasks
+                          (loop (fx+ i 1)
+                            (cons
+                              (spawn-task
+                                (lambda ()
+                                  (future-get gate)
+                                  (async-test-deep-yield depth))
+                                'migratable? #t)
+                              tasks))))])
+              (task-yield)
+              (future-fulfil! gate)
+              (let loop ([tasks tasks] [sum 0])
+                (if (null? tasks)
+                    sum
+                    (loop (cdr tasks)
+                      (fx+ sum (task-join (car tasks))))))))
+          'parallelism 4)
+        (fx* 48 96)))
+
+  ;; Repeated unbuffered rendezvous resumes both fibers beneath the same deep
+  ;; live stack.  The protocol alternates exactly, so every round exercises a
+  ;; suspension and resumption in each direction.
+  (or (not (threaded?))
+      (equal?
+        (run-async
+          (lambda ()
+            (let* ([depth 128]
+                   [rounds 512]
+                   [ping (make-channel)]
+                   [pong (make-channel)]
+                   [pinger
+                    (spawn-task
+                      (lambda ()
+                        (async-test-call-at-depth depth
+                          (lambda ()
+                            (let loop ([i 0])
+                              (if (fx= i rounds)
+                                  i
+                                  (begin
+                                    (channel-put ping i)
+                                    (unless (fx= (channel-get pong) i)
+                                      (error 'async-test-ping-pong
+                                        "unexpected pong"))
+                                    (loop (fx+ i 1))))))))
+                      'migratable? #t)]
+                   [ponger
+                    (spawn-task
+                      (lambda ()
+                        (async-test-call-at-depth depth
+                          (lambda ()
+                            (let loop ([i 0])
+                              (if (fx= i rounds)
+                                  i
+                                  (let ([value (channel-get ping)])
+                                    (unless (fx= value i)
+                                      (error 'async-test-ping-pong
+                                        "unexpected ping"))
+                                    (channel-put pong value)
+                                    (loop (fx+ i 1))))))))
+                      'migratable? #t)])
+              (list (task-join pinger) (task-join ponger))))
+          'parallelism 2)
+        '(640 640)))
 
   (or (not (threaded?))
       (equal?
