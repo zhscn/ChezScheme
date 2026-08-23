@@ -1693,6 +1693,79 @@
    (void))
 )
 
+(mat native-fiber-parallel-collector
+  (let* ([n 4]
+         [m (make-mutex)]
+         [c (make-condition)]
+         [ready 0]
+         [resume? #f]
+         [tasks (make-vector n #f)]
+         [announced (make-vector n #f)]
+         [results (make-vector n #f)])
+    (define (worker i)
+      (define (announce)
+        (with-mutex m
+          (unless (vector-ref announced i)
+            (vector-set! announced i #t)
+            (set! ready (fx+ ready 1))
+            (condition-broadcast c))))
+      (guard (condition
+               [else
+                (vector-set! results i condition)
+                (announce)])
+        (let ([scheduler (#3%$native-fiber-adopt 0)]
+              [task #f])
+          (set! task
+            (#3%$native-fiber-create
+              (lambda ()
+                (let down ([depth 3000])
+                  (if (fx= depth 0)
+                      (begin
+                        (#3%$native-fiber-try-claim! scheduler)
+                        (#3%$native-fiber-switch task scheduler i)
+                        i)
+                      (fx+ 1 (down (fx- depth 1))))))
+              (lambda (fiber outcome)
+                (#3%$native-fiber-try-claim! scheduler)
+                (#3%$native-fiber-finish fiber scheduler outcome))
+              #b100))
+          (#3%$native-fiber-try-claim! task)
+          (let ([yielded (#3%$native-fiber-switch scheduler task 'start)])
+            (vector-set! tasks i task)
+            (announce)
+            (with-mutex m
+              (let wait ()
+                (unless resume?
+                  (condition-wait c m)
+                  (wait))))
+            (and (eq? (car yielded) task)
+                 (fx= (cdr yielded) i)
+                 (#3%$native-fiber-try-claim! task)
+                 (let ([finished
+                        (#3%$native-fiber-switch scheduler task 'resume)])
+                   (vector-set! results i
+                     (and (eq? (car finished) task)
+                          (equal? (cdr finished) (cons 'return (fx+ 3000 i)))
+                          (eq? (#3%$native-fiber-state task) 'finished)))))))))
+    (let ([threads
+           (let loop ([i 0])
+             (if (fx= i n)
+                 '()
+                 (cons (fork-thread (lambda () (worker i)))
+                       (loop (fx+ i 1)))))])
+      (with-mutex m
+        (let wait ()
+          (unless (fx= ready n)
+            (condition-wait c m)
+            (wait))))
+      (parameterize ([#%$enable-check-heap #t])
+        (collect (collect-maximum-generation)))
+      (with-mutex m
+        (set! resume? #t)
+        (condition-broadcast c))
+      (for-each thread-join threads)
+      (andmap (lambda (result) (eq? result #t)) (vector->list results)))))
+
 (mat wait-for-threads
   (begin
     ;; To avoid breaking later tests that use `(collect)`,

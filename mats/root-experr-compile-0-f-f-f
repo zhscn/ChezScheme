@@ -115,6 +115,16 @@ primvars.mo:Expected error in mat print-radix: "print-radix: 37 is not between 2
 primvars.mo:Expected error in mat print-radix: "print-radix: 1 is not between 2 and 36".
 primvars.mo:Expected error in mat timer-interrupt-handler: "timer-interrupt-handler: midnight is not a procedure".
 primvars.mo:Expected error in mat trace-output-port: "trace-output-port: #<input port string> is not a textual output port".
+primvars.mo:Expected error in mat native-fiber-representation: "$native-fiber-adopt: the current native thread already has an active fiber".
+primvars.mo:Expected error in mat native-fiber-representation: "$native-fiber-adopt: invalid native-fiber flags -1".
+primvars.mo:Expected error in mat native-fiber-representation: "$native-fiber-adopt: invalid native-fiber flags 4".
+primvars.mo:Expected error in mat native-fiber-representation: "$native-fiber-adopt: invalid native-fiber flags 16".
+primvars.mo:Expected error in mat native-fiber-representation: "$native-fiber-adopt: invalid native-fiber flags debug".
+primvars.mo:Expected error in mat native-fiber-single-thread-switch: "$native-fiber-create: invalid native-fiber task flags 0".
+primvars.mo:Expected error in mat native-fiber-single-thread-switch: "$native-fiber-create: invalid native-fiber task flags 5".
+primvars.mo:Expected error in mat native-fiber-single-thread-switch: "$native-fiber-create: invalid native-fiber task flags 2".
+primvars.mo:Expected error in mat native-fiber-single-thread-switch: "$native-fiber-create: #f is not a procedure".
+primvars.mo:Expected error in mat native-fiber-single-thread-switch: "$native-fiber-create: #f is not a procedure".
 3.mo:Expected error in mat matrest1: "incorrect number of arguments 0 to #<procedure matrestf>".
 3.mo:Expected error in mat matrest2: "incorrect number of arguments 1 to #<procedure matrestf>".
 3.mo:Expected error in mat matrest2: "incorrect number of arguments 0 to #<procedure matrestf>".

@@ -843,7 +843,10 @@ static ptr copy_stack(thread_gc *tgc, ptr old, iptr *length, iptr clength) {
     return (ptr)0;
   } else {
     find_gc_room(tgc, space_data, newg, type_untyped, n, new);
-    n = ptr_align(clength);
+    /* Preserve the return slot at the base of an otherwise empty stack.
+       A continuation can later install that stack as an active execution
+       context, where the slot terminates stack walking. */
+    n = ptr_align(clength == 0 ? ptr_bytes : clength);
     /* warning: stack may have been left non-double-aligned by split_and_resize */
     memcpy_aligned(TO_VOIDP(new), TO_VOIDP(old), n);
 

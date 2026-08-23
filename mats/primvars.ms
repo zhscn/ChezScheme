@@ -1093,6 +1093,66 @@
               (eq? (#3%$native-fiber-state task) 'finished)
               (eq? (#3%$native-fiber-state scheduler) 'running))]))))
 
+(mat native-fiber-collector-stack
+  (parameterize ([#%$enable-check-heap #t]
+                 [collect-trip-bytes 256])
+    (let* ([scheduler (#3%$current-native-fiber)]
+           [task #f]
+           [depth 12000]
+           [rounds 16]
+           [descend
+            (lambda ()
+              (let down ([n depth])
+                (if (fx= n 0)
+                    (let ping ([i 0] [sum 0])
+                      (if (fx= i rounds)
+                          sum
+                          (let ([marker (vector i (make-list 64 i))])
+                            (collect (if (fxeven? i)
+                                         0
+                                         (collect-maximum-generation)))
+                            (with-exception-handler
+                              (lambda (condition)
+                                (error 'native-fiber-collector-stack
+                                  "unexpected condition" condition))
+                              (lambda ()
+                                (#3%$native-fiber-try-claim! scheduler)
+                                (#3%$native-fiber-switch task scheduler marker)))
+                            (and (fx= (vector-ref marker 0) i)
+                                 (fx= (car (vector-ref marker 1)) i)
+                                 (ping (fx+ i 1) (fx+ sum i))))))
+                    (fx+ 1 (down (fx- n 1))))))])
+      (set! task
+        (#3%$native-fiber-create
+          (lambda () (descend))
+          (lambda (fiber outcome)
+            (#3%$native-fiber-try-claim! scheduler)
+            (#3%$native-fiber-finish fiber scheduler outcome))
+          #b100))
+      ;; Promote the record and initial context.  Each later park attaches a
+      ;; newly allocated descriptor and handler stack to this old record.
+      (collect (collect-maximum-generation))
+      (#3%$native-fiber-try-claim! task)
+      (let loop ([i 0]
+                 [transfer (#3%$native-fiber-switch scheduler task 'start)])
+        (cond
+          [(fx< i rounds)
+           (let ([marker (cdr transfer)])
+             (and (eq? (car transfer) task)
+                  (vector? marker)
+                  (fx= (vector-ref marker 0) i)
+                  (or (not (fx= i 0)) (fxpositive? (compute-size task)))
+                  (begin (collect (collect-maximum-generation)) #t)
+                  (#3%$native-fiber-try-claim! task)
+                  (loop (fx+ i 1)
+                        (#3%$native-fiber-switch scheduler task i))))]
+          [else
+           (and (eq? (car transfer) task)
+                (equal? (cdr transfer)
+                  (cons 'return (fx+ depth (fxquotient (fx* rounds (fx- rounds 1)) 2))))
+                (eq? (#3%$native-fiber-state task) 'finished)
+                (eq? (#3%$native-fiber-state scheduler) 'running))])))))
+
 (when (threaded?)
   (mat native-fiber-thread-state
     (let ([result #f])
