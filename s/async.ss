@@ -14,13 +14,13 @@
 
 ;;; Fiber-based asynchronous execution facility (ASYNC.md).
 ;;;
-;;; A scheduler owns a private continuation-prompt tag and runs lightweight
-;;; tasks on one operating-system thread.  Tasks suspend with shift0-at and
-;;; are resumed through one-shot resumptions.  Waitables (timers, channels,
+;;; A scheduler establishes a private continuation prompt for each task turn
+;;; and runs lightweight tasks on one operating-system thread.  Tasks suspend
+;;; with one-shot delimited continuations.  Waitables (timers, channels,
 ;;; futures, joins) are expressed as operations with try/block/wrap/nack
-;;; components.  The cooperative scheduler optionally bounds user task turns
-;;; with Chez Scheme engines.  libuv-backed I/O plugs in through the
-;;; scheduler's io fields (asyncio.ss).
+;;; components.  Optional tick preemption captures the same one-shot fiber
+;;; continuation directly at a runtime safe point.  libuv-backed I/O plugs in
+;;; through the scheduler's io fields (asyncio.ss).
 
 ;;; ----------------------------------------------------------- utilities
 
@@ -183,12 +183,6 @@
 (define $async-scheduler
   ($make-thread-parameter #f (lambda (x) x)))
 
-;;; True only while a preemptive scheduler is executing a task engine.  It is
-;;; scheduler-owned state rather than fiber dynamic state, and prevents a
-;;; nested run-async from attempting to nest engines.
-(define $async-engine-active
-  ($make-thread-parameter #f (lambda (x) x)))
-
 ;;; A dynamically scoped context override is part of the fiber's saved thread
 ;;; parameter state.  Tasks still retain their own immutable context so task
 ;;; cancellation never cancels a caller-supplied shared context.
@@ -282,10 +276,11 @@
 ;;; ------------------------------------------------------------ records
 
 (define-record-type (async-scheduler make-async-scheduler% $async-scheduler?)
-  (nongenerative async-scheduler-layer8)
+  (nongenerative async-scheduler-layer13)
   (sealed #t)
   (fields
-    (immutable prompt-tag)          ; private continuation-prompt tag
+    (immutable prompt-tag)          ; shared one-shot suspension prompt
+    (mutable preemption-exit)       ; escape from the active preemptive turn
     (immutable group $async-scheduler-group) ; owning scheduler group
     (immutable group-index)         ; stable index within the group
     (immutable current-queue)       ; tasks run this turn
@@ -363,15 +358,15 @@
   (fields (immutable context)))
 
 (define-record-type (async-task make-async-task $async-task?)
-  (nongenerative async-task-layer9)
+  (nongenerative async-task-layer10)
   (sealed #t)
   (fields
     (immutable id)
     (immutable name)
     (mutable state)                 ; ready running waiting completed failed canceled
     (mutable entry)                 ; thunk before first run, #f after
-    (mutable resumption)            ; resumption procedure while waiting/ready
-    (mutable engine)                ; suspended engine after timed preemption
+    (mutable resumption)            ; one-shot procedure or raw timer capture
+    (mutable preempted?)             ; resume first, then rearm the task timer
     (immutable scheduler-group)     ; scheduler group in which the task runs
     (mutable scheduler)             ; current or most recent execution scheduler
     (mutable wait-scheduler)        ; scheduler that owns the current wait
@@ -820,8 +815,7 @@
 
 (define install-task-dynamic-state!
   (lambda (sched task)
-    (let* ([engine-was-active? ($engine-active?)]
-           [group ($async-scheduler-group sched)]
+    (let* ([group ($async-scheduler-group sched)]
            [ambient
             (async-snapshot-dynamic-state
               (async-scheduler-active-dynamic-version sched))]
@@ -832,9 +826,7 @@
       (async-task-dynamic-state-set! task state)
       (async-scheduler-active-dynamic-version-set! sched
         (async-dynamic-state-version state))
-      (unless engine-was-active? ($engine-reset-thread-state!))
       (current-exception-state (async-task-exception-state task)))
-    ($async-engine-active #f)
     ($async-scheduler sched)))
 
 (define snapshot-task-dynamic-state!
@@ -1318,6 +1310,19 @@
 
 (define async-suspend-token (list 'async-suspended))
 
+;;; Capture the active task at the scheduler group's private prompt.  The raw
+;;; one-shot continuation and its prompt boundary are later spliced directly
+;;; onto the worker that claims the task.
+(define async-shift1-to-scheduler
+  (lambda (sched proc)
+    ($control-shift-native1-at
+      (async-scheduler-prompt-tag sched) #t
+      (lambda (resumption)
+        (let ([exit (async-scheduler-preemption-exit sched)])
+          (async-invariant exit
+            "preemption capture has no active scheduler escape" sched)
+          (exit (proc resumption)))))))
+
 ;;; One checked suspension operation: capture through the scheduler prompt,
 ;;; transition running->waiting, publish the wait, return to the scheduler.
 (define $async-suspend
@@ -1326,19 +1331,13 @@
     (snapshot-task-dynamic-state! sched task)
     (set-sched-switch! sched #t)
     (let ([payload
-            ;; call/1cc transfers ownership of its active stack.  A preemption
-            ;; engine retains an enclosing continuation for that stack, so
-            ;; engine-backed schedulers use the non-transferring capture.  The
-            ;; async resumption itself remains linearly owned and consumed.
-            ((if (async-scheduler-preemption-ticks sched)
-                 $control-shift-linear-at
-                 $control-shift1-at)
+            ($control-shift1-at
               (async-scheduler-prompt-tag sched) #t
-              (lambda (k)
+              (lambda (resumption)
                 (set-sched-switch! sched #f)
                 (with-async-mutex (async-task-mutex task)
                   (async-task-state-set! task 'waiting)
-                  (async-task-resumption-set! task k)
+                  (async-task-resumption-set! task resumption)
                   (async-task-wait-scheduler-set! task sched)
                   (async-task-suspension-state-set! task 'unwinding)
                   (async-task-sync-state-set! task ss)
@@ -2047,7 +2046,7 @@
              (async-task-wait-scheduler-set! task #f)
              (async-task-suspension-state-set! task #f)
              (async-task-resumption-set! task #f)
-             (async-task-engine-set! task #f)
+             (async-task-preempted?-set! task #f)
              (case state
                [(completed) (async-task-result-values-set! task (cdr outcome))]
                [else (async-task-failure-condition-set! task (cdr outcome))])
@@ -2135,8 +2134,7 @@
 (define async-make-scheduler
   (lambda (virtual? group index preemption-ticks)
     (make-async-scheduler%
-      (async-scheduler-group-prompt-tag group)
-      group index
+      (async-scheduler-group-prompt-tag group) #f group index
       (make-async-queue) (make-async-queue)
       (make-async-work-deque)
       (make-async-queue) (make-async-os-mutex)
@@ -2238,52 +2236,138 @@
                         (* (remainder delta 1000000) 1000)
                         (quotient delta 1000000)))))))])))
 
-(define async-engine-expiration-token (list 'async-engine-expired))
+(define async-preemption-token (list 'async-preempted))
+(define async-minimum-preemption-ticks 1000)
 
-;;; Enter only the user task continuation under an engine.  Scheduler queue
-;;; maintenance, polling, callbacks, and dynamic-state installation remain
-;;; outside the engine and therefore cannot be preempted.
+(define call-with-async-task-prompt
+  (lambda (sched thunk)
+    (let ([outcome
+           (#3%call/1cc
+             (lambda (exit)
+               (async-scheduler-preemption-exit-set! sched exit)
+               ($control-reset-at
+                 (async-scheduler-prompt-tag sched) #t thunk)))])
+      (async-scheduler-preemption-exit-set! sched #f)
+      outcome)))
+
+;;; The timer handler runs at a Scheme safe point inside the scheduler prompt.
+;;; It captures only the current fiber, publishes no wait, and returns a token
+;;; to the scheduler.  Resumption returns here and continues the interrupted
+;;; computation.  The handler is scheduler-independent so a task snapshot can
+;;; migrate to another worker without retaining the old worker's state.
+(define async-preemption-handler
+  (lambda ()
+    (let* ([sched ($async-scheduler)]
+           [task
+            (and (async-scheduler? sched)
+                 (async-scheduler-current-task sched))])
+      (unless (and task
+                   (eq? (async-task-state task) 'running)
+                   (async-scheduler-preemption-ticks sched))
+        ($oops 'async-preemption-handler
+          "timer interrupt outside a running preemptive task"))
+      (let ([ticks (async-scheduler-preemption-ticks sched)])
+        (if (not ($control-native1-capture-ready-at?
+                   (async-scheduler-prompt-tag sched)))
+            ;; An ordinary delimited-control transfer owns the continuation
+            ;; while its shift handler may splice it. Finish that atomic extent
+            ;; before splicing the surrounding scheduler prompt.
+            (set-timer ticks)
+            (begin
+              ;; Cancellation of CPU-bound code is observed at the same native
+              ;; safe point as preemption, without first capturing another
+              ;; continuation.
+              (async-check-cancellation! task)
+              (snapshot-task-dynamic-state! sched task)
+              (set-sched-switch! sched #t)
+              ;; set-timer directly consumes the value returned when the
+              ;; continuation is resumed.  This is the final operation in the
+              ;; handler, so the timer cannot expire in a Scheme resumption
+              ;; wrapper before user code makes progress.
+              (set-timer
+                (let* ([resume-info
+                        (async-shift1-to-scheduler sched
+                          (lambda (resumption)
+                            (with-async-mutex (async-task-mutex task)
+                              (async-invariant
+                                (not (async-task-resumption task))
+                                "preempted task already has a resumption" task)
+                              (async-task-resumption-set! task resumption))
+                            async-preemption-token))]
+                       [resume-sched
+                        (and (pair? resume-info) (car resume-info))]
+                       [ticks
+                        (and (pair? resume-info) (cdr resume-info))])
+                  ;; A migrated continuation reinstates its captured thread
+                  ;; parameters. Rebind the receiving scheduler before task
+                  ;; code can observe scheduler-local state.
+                  (unless (async-scheduler? resume-sched)
+                    ($oops 'async-preemption-handler
+                      "invalid preemption resume scheduler ~s" resume-sched))
+                  ($async-scheduler resume-sched)
+                  (set-current-sched-switch! #f)
+                  ;; Cancellation can win while the captured task is ready but
+                  ;; not running. Observe it directly on reentry instead of
+                  ;; manufacturing a nested timer trap.
+                  (async-check-cancellation! task)
+                  (unless (and (fixnum? ticks) (fx> ticks 0))
+                    ($oops 'async-preemption-handler
+                      "invalid preemption tick budget ~s" ticks))
+                  ticks))))))))
+
+;;; Reserve the Chez tick timer only while user task code is active.  The
+;;; scheduler loop, queue operations, polling, and callbacks run with their
+;;; ambient handler and timer.  An enclosing engine is rejected by run-async,
+;;; since both facilities own the same per-thread timer.
+(define call-with-async-preemption
+  (lambda (sched thunk)
+    (let* ([saved-handler (timer-interrupt-handler)]
+           [saved-ticks (set-timer 0)])
+      (dynamic-wind
+        (lambda ()
+          (timer-interrupt-handler async-preemption-handler))
+        (lambda ()
+          ;; Timer ownership remains outside the task's private prompt.
+          (call-with-async-task-prompt sched thunk))
+        (lambda ()
+          (set-timer 0)
+          (timer-interrupt-handler saved-handler)
+          (set-timer saved-ticks))))))
+
+;;; Enter only the user task continuation under the scheduler prompt.
 (define async-run-task-step
   (lambda (sched task)
     (if (async-task-entry task)
         (let ([entry (async-task-entry task)])
           (async-task-entry-set! task #f)
-          ($control-reset-at (async-scheduler-prompt-tag sched) #t entry))
+          (when (async-scheduler-preemption-ticks sched)
+            (set-timer (async-scheduler-preemption-ticks sched)))
+          (entry))
         (let ([resumption (async-task-resumption task)]
-              [payload (async-task-payload task)])
-          ;; A native one-shot transfers the stack out of this field.  An
-          ;; enclosing engine retains the call/cc-based resumption until the
-          ;; engine turn completes or another suspension replaces it.
-          (unless (async-scheduler-preemption-ticks sched)
-            (async-task-resumption-set! task #f))
+              [payload (async-task-payload task)]
+              [preempted? (async-task-preempted? task)])
+          (async-invariant
+            (if preempted?
+                ($control-native1-capture? resumption)
+                (procedure? resumption))
+            "ready task has no valid one-shot resumption" task)
+          ;; Invocation transfers ownership of the one-shot continuation.
+          (async-task-resumption-set! task #f)
+          (async-task-preempted?-set! task #f)
           (async-task-payload-set! task #f)
+          ;; A preemption resumption rearms after it reaches the interrupted
+          ;; point.  Other resumptions rearm here because they do not pass
+          ;; through the timer handler.
+          (when (and (async-scheduler-preemption-ticks sched)
+                     (not preempted?))
+            (set-timer (async-scheduler-preemption-ticks sched)))
           ;; Rewinding captured dynamic-winds is part of the scheduling
           ;; switch, not a user-level wind entry.
           (set-sched-switch! sched #t)
-          (resumption payload)))))
-
-(define async-run-task-engine
-  (lambda (sched task ticks)
-    (let* ([saved-engine (async-task-engine task)]
-           [engine (or saved-engine
-                       ($make-engine-with-timer-hooks
-                         (lambda () (async-run-task-step sched task))
-                         (lambda () (set-current-sched-switch! #t))
-                         (lambda () (set-current-sched-switch! #f))))]
-          [old-active ($async-engine-active)])
-      (async-task-engine-set! task #f)
-      (when saved-engine
-        (async-task-remove-affinity! task 'engine))
-      ($async-engine-active #t)
-      (when saved-engine (set-sched-switch! sched #t))
-      (let ([outcome
-             (guard (c [else (cons 'internal-escape c)])
-               (engine ticks
-                 (lambda (remaining outcome) outcome)
-                 (lambda (next-engine)
-                   (cons async-engine-expiration-token next-engine))))])
-        ($async-engine-active old-active)
-        outcome))))
+          (if preempted?
+              ($control-resume-native1-at
+                (async-scheduler-prompt-tag sched) resumption payload)
+              (resumption payload))))))
 
 (define async-run-task-once
   (lambda (sched task)
@@ -2330,40 +2414,46 @@
                 (when (and (not (async-task-entry task))
                            (task-cancel-requested? task)
                            (not (async-task-cancel-shield? task)))
+                  (unless (async-task-preempted? task)
+                    (async-task-payload-set! task
+                      (cons 'raise (task-cancellation-condition task)))))
+                (when (async-task-preempted? task)
+                  ;; The receiving worker is intentionally selected here, not
+                  ;; when the continuation was captured, because the task may
+                  ;; have moved through the shared work queues in between.
                   (async-task-payload-set! task
-                    (cons 'raise (task-cancellation-condition task))))
+                    (cons sched
+                      (async-scheduler-preemption-ticks sched))))
                 (async-task-state-set! task 'running)
                 (async-scheduler-current-task-set! sched task)
                 (install-task-dynamic-state! sched task)
                 (let* ([ticks (async-scheduler-preemption-ticks sched)]
                        [outcome
-                        (if ticks
-                            (async-run-task-engine sched task ticks)
-                            (guard (c [else (cons 'internal-escape c)])
-                              (async-run-task-step sched task)))])
-                  (when (and (pair? outcome)
-                             (eq? (car outcome)
-                                  async-engine-expiration-token))
-                    (snapshot-task-dynamic-state! sched task))
+                        (guard (c [else (cons 'internal-escape c)])
+                          (if ticks
+                              (call-with-async-preemption sched
+                                (lambda () (async-run-task-step sched task)))
+                              (call-with-async-task-prompt sched
+                                (lambda ()
+                                  (async-run-task-step sched task)))))])
                   (set-sched-switch! sched #f)
+                  (async-scheduler-preemption-exit-set! sched #f)
                   (async-scheduler-current-task-set! sched #f)
                   (restore-scheduler-dynamic-state! sched)
                   (cond
                     [(eq? outcome async-suspend-token)
                      (async-finish-suspension! task)
                      task]
-                    [(and (pair? outcome)
-                          (eq? (car outcome)
-                               async-engine-expiration-token))
-                     (async-task-engine-set! task (cdr outcome))
-                     (async-task-add-affinity! task 'engine)
+                    [(eq? outcome async-preemption-token)
+                     (async-task-preempted?-set! task #t)
+                     ;; The timer handler consumes this value only after the
+                     ;; one-shot continuation has been spliced onto its new
+                     ;; worker.  Cancellation may replace it with a raise.
+                     (async-task-payload-set! task ticks)
                      (async-task-state-set! task 'ready)
                      (async-scheduler-preemption-count-set! sched
                        (fx+ 1 (async-scheduler-preemption-count sched)))
-                     (async-debug-queue-claim! task 'next)
-                     (async-queue-push!
-                       (async-scheduler-next-queue sched)
-                       task)
+                     (async-publish-ready! task sched)
                      #f]
                     [(and (pair? outcome) (eq? (car outcome) 'done))
                      ;; A task that observes cancellation and still returns
@@ -3550,14 +3640,23 @@
                  ($oops who "invalid parallelism ~s" v))
                (set! parallelism v)]
               [(eq? k 'preemption-ticks)
-               (unless (or (not v) (and (fixnum? v) (fx> v 0)))
+               (unless (or (not v)
+                           (and (fixnum? v)
+                                (fx>= v async-minimum-preemption-ticks)))
                  ($oops who "invalid preemption tick count ~s" v))
                (set! preemption-ticks v)]
               [else ($oops who "unrecognized run-async option ~s" k)]))
           (loop (cddr opts))))
-      (when (or ($async-engine-active)
-                (and preemption-ticks ($engine-active?)))
-        ($oops who "cannot nest an async scheduler inside a task engine"))
+      (let ([outer ($async-scheduler)])
+        (when (and (async-scheduler? outer)
+                   (async-scheduler-current-task outer)
+                   (async-scheduler-preemption-ticks outer))
+          ($oops who
+            "cannot nest an async scheduler inside a preemptive task")))
+      ;; Engine bookkeeping uses runtime-private thread parameters.  A fiber
+      ;; snapshot must never copy that active state to a scheduler worker.
+      (when ($engine-active?)
+        ($oops who "cannot run an async scheduler inside an active engine"))
       (when (and (eq? clock 'virtual) (fx> parallelism 1))
         ($oops who "parallel scheduler groups require a real clock"))
       (when (fx> parallelism 1)

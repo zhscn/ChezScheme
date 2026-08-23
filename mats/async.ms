@@ -107,6 +107,7 @@
   (error? (run-async (lambda () 1) 'parallelism 0))
   (error? (run-async (lambda () 1) 'preemption-ticks 0))
   (error? (run-async (lambda () 1) 'preemption-ticks -1))
+  (error? (run-async (lambda () 1) 'preemption-ticks 999))
   (error? (run-async (lambda () 1) 'preemption-ticks 'often))
   (error? (run-async (lambda () 1) 'clock 'virtual 'parallelism 2))
   (error? (make-channel -1))
@@ -154,8 +155,8 @@
 
   ;; ---- timed preemption
 
-  ;; Cooperative mode remains the default.  With a bounded engine turn, a
-  ;; CPU-bound root task gives a ready child a scheduler turn.
+  ;; Cooperative mode remains the default.  With a bounded native fiber turn,
+  ;; a CPU-bound root task gives a ready child a scheduler turn.
   (equal?
     (list
       (run-async
@@ -170,10 +171,10 @@
             (spawn-task (lambda () (set-box! ran? #t)))
             (async-test-burn 100000)
             (unbox ran?)))
-        'preemption-ticks 10))
+        'preemption-ticks 1000))
     '(#f #t))
 
-  ;; Engine expiration preserves values and composes with an explicit async
+  ;; Native preemption preserves values and composes with an explicit async
   ;; suspension later in the same task.
   (equal?
     (call-with-values
@@ -185,12 +186,12 @@
             (async-test-burn 100000)
             (values 'a 'b 'c))
           'clock 'virtual
-          'preemption-ticks 20))
+          'preemption-ticks 1000))
       list)
     '(a b c))
 
-  ;; Exception handlers and fiber-local parameters survive repeated engine
-  ;; expiration and resumption.
+  ;; Exception handlers and fiber-local parameters survive repeated native
+  ;; preemption and resumption.
   (equal?
     (run-async
       (lambda ()
@@ -199,8 +200,53 @@
             (guard (c [else (list (p) (condition-message c))])
               (async-test-burn 100000)
               (error 'preemption-test "boom")))))
-      'preemption-ticks 10)
+      'preemption-ticks 1000)
     '(inner "boom"))
+
+  ;; Ordinary winders retain their language semantics across native transfers:
+  ;; every unwind has a matching rewind before task code continues.
+  (let ([counts
+         (run-async
+           (lambda ()
+             (let ([before 0] [after 0])
+               (dynamic-wind
+                 (lambda () (set! before (fx+ before 1)))
+                 (lambda () (async-test-burn 1000000))
+                 (lambda () (set! after (fx+ after 1))))
+               (cons before after)))
+           'preemption-ticks 1000)])
+    (and (fx> (car counts) 1)
+         (fx= (car counts) (cdr counts))))
+
+  ;; Timer capture can cross an intervening public prompt.  The public prompt
+  ;; remains usable after the scheduler activation is rebased.
+  (eqv?
+    (run-async
+      (lambda ()
+        (reset
+          (+ 100
+            (begin
+              (async-test-burn 1000000)
+              (shift/1 k (k 7))))))
+      'preemption-ticks 1000)
+    107)
+
+  ;; Repeated one-shot public prompt composition remains valid when timer
+  ;; delivery alternates with scheduler-level native captures.
+  (eqv?
+    (run-async
+      (lambda ()
+        (let loop ([i 0] [sum 0])
+          (if (fx= i 2000)
+              sum
+              (loop (fx+ i 1)
+                (fx+ sum
+                  (reset
+                    (begin
+                      (async-test-burn 1000)
+                      (shift/1 k (k 1)))))))))
+      'preemption-ticks 1000)
+    2000)
 
   ;; async-aware winders run for the user extent, not for timer-driven
   ;; continuation transfers.
@@ -213,10 +259,10 @@
             (lambda () (async-test-burn 100000))
             (lambda () (set! after (fx+ after 1))))
           (list before after)))
-      'preemption-ticks 10)
+      'preemption-ticks 1000)
     '(1 1))
 
-  ;; A dynamically installed context survives engine preemption and is
+  ;; A dynamically installed context survives native preemption and is
   ;; restored when its async-aware dynamic extent exits.
   (equal?
     (run-async
@@ -229,15 +275,111 @@
                      (async-test-burn 100000)
                      (eq? (current-async-context) context)))])
             (list inside (eq? (current-async-context) root)))))
-      'preemption-ticks 10)
+      'preemption-ticks 1000)
     '(#t #t))
 
-  ;; A scheduler entered by preempted user code would nest engines and is
-  ;; rejected before it can capture scheduler internals.
+  ;; A scheduler entered by preempted user code would compete for the same
+  ;; thread timer and is rejected before it can capture scheduler internals.
   (error?
     (run-async
       (lambda () (run-async (lambda () 'nested)))
-      'preemption-ticks 10))
+      'preemption-ticks 1000))
+
+  ;; Engine control state is runtime-thread-local and is not fiber state.
+  ;; Async schedulers reject both cooperative and preemptive engine nesting.
+  (error?
+    ((make-engine (lambda () (run-async (lambda () 'cooperative))))
+     100000
+     (lambda (ticks value) value)
+     (lambda (next) 'expired)))
+  (error?
+    ((make-engine
+       (lambda ()
+         (run-async (lambda () 'nested) 'preemption-ticks 1000)))
+     100000
+     (lambda (ticks value) value)
+     (lambda (next) 'expired)))
+
+  ;; A timer trap observes cancellation of CPU-bound code without requiring an
+  ;; explicit async operation or cooperative yield.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([started (make-future)])
+          (let ([task
+                 (spawn-task
+                   (lambda ()
+                     (future-fulfil! started #t)
+                     (let loop ()
+                       (async-test-burn 10000)
+                       (loop))))])
+            (future-get started)
+            (task-cancel! task 'cpu-cancel)
+            (guard (c [(async-cancellation-condition? c)
+                       (async-cancellation-reason c)])
+              (task-join task)))))
+      'preemption-ticks 1000)
+    'cpu-cancel)
+
+  ;; One-shot timer captures preserve a deep live stack and can later compose
+  ;; with ordinary task completion.
+  (equal?
+    (run-async
+      (lambda ()
+        (async-test-call-at-depth 128
+          (lambda ()
+            (async-test-burn 100000)
+            0)))
+      'preemption-ticks 1000)
+    128)
+
+  ;; Fiber-local thread parameters remain isolated while many preempted tasks
+  ;; are eligible for work stealing by different scheduler threads.
+  (or (not (threaded?))
+      (equal?
+        (run-async
+          (lambda ()
+            (let ([parameter (make-thread-parameter 'root)])
+              (let ([tasks
+                     (let loop ([i 0] [tasks '()])
+                       (if (fx= i 16)
+                           tasks
+                           (loop (fx+ i 1)
+                             (cons
+                               (spawn-task
+                                 (lambda ()
+                                   (parameter i)
+                                   (do ([round 0 (fx+ round 1)])
+                                       ((fx= round 4))
+                                     (async-test-burn 100000)
+                                     (unless (fx= (parameter) i)
+                                       (error 'preemption-parameter
+                                         "fiber parameter leaked")))
+                                   (parameter))
+                                 'migratable? #t)
+                               tasks))))])
+                (map task-join (reverse tasks)))))
+          'parallelism 4
+          'preemption-ticks 1000)
+        '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)))
+
+  ;; Scheduler turns restore the ambient timer handler they temporarily own.
+  (let ([saved-handler (timer-interrupt-handler)]
+        [saved-ticks (set-timer 0)]
+        [handler (lambda () (void))])
+    (dynamic-wind
+      (lambda () (timer-interrupt-handler handler))
+      (lambda ()
+        (and (equal?
+               (run-async
+                 (lambda () (async-test-burn 100000) 'done)
+                 'preemption-ticks 1000)
+               'done)
+             (eq? (timer-interrupt-handler) handler)
+             (fx= (set-timer 0) 0)))
+      (lambda ()
+        (timer-interrupt-handler saved-handler)
+        (set-timer saved-ticks))))
 
   ;; ---- timers (virtual clock)
 
@@ -1727,7 +1869,7 @@
       'parallelism 3)
     '(holder-enter holder-exit waiter))
 
-  ;; Engine preemption does not expose a held mutex to another worker.
+  ;; Native fiber preemption does not expose a held mutex to another worker.
   (equal?
     (run-async
       (lambda ()
@@ -1752,7 +1894,7 @@
               (task-join holder)
               (task-join waiter)))))
       'parallelism 3
-      'preemption-ticks 10)
+      'preemption-ticks 1000)
     #f)
 
   ;; The mutex serializes migratable tasks across worker schedulers.

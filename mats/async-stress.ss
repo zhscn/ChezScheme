@@ -7,6 +7,7 @@
 (import (chezscheme async context))
 (import (chezscheme async sync))
 (import (chezscheme async io fs))
+(import (chezscheme control))
 
 (define environment-positive-integer
   (lambda (name default)
@@ -185,6 +186,58 @@
                  counter))
              'parallelism 4)])
       (check (fx= value 200) 'async-mutex iteration value))))
+
+(define stress-native-preemption
+  (lambda (iteration)
+    (let ([value
+           (run-async
+             (lambda ()
+               (let ([parameter (make-thread-parameter 'root)]
+                     [started (make-future)])
+                 (let* ([workers
+                         (map
+                           (lambda (id)
+                             (spawn-task
+                               (lambda ()
+                                 (parameter id)
+                                 (do ([round 0 (fx+ round 1)])
+                                     ((fx= round 4))
+                                   (let loop ([i 0])
+                                     (unless (fx= i 10000)
+                                       (loop (fx+ i 1))))
+                                   (unless
+                                     (eqv?
+                                       (reset
+                                         (shift/1 k (k (parameter))))
+                                       id)
+                                     (error 'async-stress
+                                       "prompt or parameter corruption")))
+                                 (parameter))
+                               'migratable? #t))
+                           '(0 1 2 3))]
+                        [victim
+                         (spawn-task
+                           (lambda ()
+                             (future-fulfil! started #t)
+                             (let loop ()
+                               (let burn ([i 0])
+                                 (unless (fx= i 10000)
+                                   (burn (fx+ i 1))))
+                               (loop)))
+                           'migratable? #t)])
+                   (future-get started)
+                   (task-cancel! victim 'stress-preemption-cancel)
+                   (let ([canceled
+                          (guard (c
+                                   [(async-cancellation-condition? c)
+                                    (async-cancellation-reason c)])
+                            (task-join victim))])
+                     (cons canceled (map task-join workers))))))
+             'parallelism 4
+             'preemption-ticks 1000)])
+      (check
+        (equal? value '(stress-preemption-cancel 0 1 2 3))
+        'native-preemption iteration value))))
 
 (define stress-sync-primitives
   (lambda (iteration)
@@ -408,6 +461,9 @@
     (when (stress-scenario? "mutex")
       (atomic-box-set! stress-location (list i 'async-mutex))
       (stress-async-mutex i))
+    (when (stress-scenario? "preemption")
+      (atomic-box-set! stress-location (list i 'native-preemption))
+      (stress-native-preemption i))
     (when (stress-scenario? "sync")
       (atomic-box-set! stress-location (list i 'sync-primitives))
       (stress-sync-primitives i))

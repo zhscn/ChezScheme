@@ -89,7 +89,7 @@
                        (file-close in)
                        (list n (utf8->string bv) (eof-object? eof)
                              (cdr (assq 'size stat))))))))
-             'preemption-ticks 20)))
+             'preemption-ticks 1000)))
       (asyncio-delete-if-present path)
       (equal? result '(11 "hello async" #t 11))))
 

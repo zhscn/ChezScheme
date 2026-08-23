@@ -278,8 +278,21 @@ TODO:
     (nongenerative)
     (opaque #t)
     (sealed #t)
-    (fields (immutable frame)
-            (immutable handler)))
+    (fields (mutable frame)
+            (mutable handler)))
+
+  ;; A native capture is an internal linear capability.  Keeping its prompt
+  ;; identity and ownership flag behind a sealed record prevents scheduler
+  ;; code from accidentally treating an arbitrary vector as a continuation.
+  (define-record-type native-control-capture
+    (nongenerative)
+    (opaque #t)
+    (sealed #t)
+    (fields (immutable tag)
+            (immutable inner)
+            (immutable limit)
+            (immutable activation)
+            (immutable fresh?)))
 
   (define-record-type control-shift-request
     (nongenerative)
@@ -289,6 +302,8 @@ TODO:
     (fields (immutable tag)
             (immutable zero?)
             (immutable one-shot?)
+            (immutable native?)
+            (immutable activation)
             (immutable proc)))
 
   (define empty-delimited-continuation-info
@@ -302,6 +317,19 @@ TODO:
 
   (define disabled-control-prompt-frames
     ($make-thread-parameter '() (lambda (x) x)))
+
+  ;; The innermost prompt is tracked explicitly. Continuation-mark traversal
+  ;; is suitable for lookup by tag, but its ordering is not a scheduler
+  ;; ownership contract.
+  (define current-control-prompt-activation
+    ($make-thread-parameter #f (lambda (x) x)))
+
+  ;; Native scheduler capture must not splice a continuation while an ordinary
+  ;; delimited-control operation is between capture and transfer.  The flag is
+  ;; false for the capture and its shift-handler extent, where the handler can
+  ;; immediately splice the continuation it received.
+  (define native-control-capture-ready
+    ($make-thread-parameter #t (lambda (x) x)))
 
   (define control-prompt-mark-key
     (gensym "control-prompt"))
@@ -326,6 +354,16 @@ TODO:
         (continuation-marks->list
           (current-continuation-marks)
           control-prompt-mark-key))))
+
+  (define native-control-capture-ready-at?
+    (lambda (tag)
+      (let ([activation (current-control-prompt-activation)])
+        (and (native-control-capture-ready)
+             (control-prompt-activation? activation)
+             (let ([frame
+                    (control-prompt-activation-frame activation)])
+               (and (not (control-prompt-frame-disabled? frame))
+                    (eq? tag (control-prompt-frame-tag frame))))))))
 
   (define find-unwind-limit
     (lambda (k info)
@@ -491,11 +529,18 @@ TODO:
                                ($call-in-continuation target
                                  (lambda ()
                                    (handler obj
-                                     ((if (and (control-shift-request? obj)
-                                               (control-shift-request-one-shot? obj))
-                                          make-one-shot-delimited-continuation
-                                          make-delimited-continuation)
-                                       inner limit info empty?)))))))))
+                                     (if (and (control-shift-request? obj)
+                                              (control-shift-request-native? obj))
+                                         (make-native-control-capture
+                                           (control-shift-request-tag obj)
+                                           inner limit
+                                           (control-shift-request-activation obj)
+                                           (box #t))
+                                         ((if (and (control-shift-request? obj)
+                                                   (control-shift-request-one-shot? obj))
+                                              make-one-shot-delimited-continuation
+                                              make-delimited-continuation)
+                                           inner limit info empty?))))))))))
                      2
                      info)]
                  [protected-thunk
@@ -504,10 +549,12 @@ TODO:
                              (make-control-prompt-activation
                                marker unwind-handler)])
                         (lambda ()
-                          (with-continuation-mark
-                            control-prompt-mark-key
-                            activation
-                            (thunk))))
+                          (parameterize
+                            ([current-control-prompt-activation activation])
+                            (with-continuation-mark
+                              control-prompt-mark-key
+                              activation
+                              (thunk)))))
                       thunk)])
               (call-with-values
                 (lambda ()
@@ -627,7 +674,15 @@ TODO:
                                 (apply k results)))))]
                        [body
                         (lambda ()
-                          ((control-shift-request-proc obj) resume))])
+                          (if (control-shift-request-native? obj)
+                              ((control-shift-request-proc obj) k)
+                              ;; A public shift handler can immediately splice
+                              ;; its captured continuation. Keep that complete
+                              ;; handler extent atomic with respect to native
+                              ;; scheduler capture.
+                              (parameterize
+                                ([native-control-capture-ready #f])
+                                ((control-shift-request-proc obj) resume))))])
                   (if (and zero? shift-zero?)
                       (body)
                       ($control-reset-at tag zero? body)))
@@ -657,19 +712,20 @@ TODO:
           ($oops who "no matching continuation prompt for ~s" tag))
         ;; Invoke the prompt's unwind handler directly so that intervening
         ;; exception handlers cannot observe the internal control request.
-        ($call-getting-continuation-attachment
-          no-continuation-attachment
-          (lambda (attachment)
-            (#3%call/cc
-              (lambda (inner)
-                (invoke-handler
-                  (control-prompt-activation-handler activation)
-                  (make-control-shift-request tag zero? #f proc)
-                  (make-raise-context #t attachment inner)))))))))
+        (parameterize ([native-control-capture-ready #f])
+          ($call-getting-continuation-attachment
+            no-continuation-attachment
+            (lambda (attachment)
+              (#3%call/cc
+                (lambda (inner)
+                  (invoke-handler
+                    (control-prompt-activation-handler activation)
+                    (make-control-shift-request tag zero? #f #f #f proc)
+                    (make-raise-context #t attachment inner))))))))))
 
-  ;; Capture through call/cc for an enclosing runtime facility that retains
-  ;; the active stack, while preserving linear resumption ownership.
-  (set-who! $control-shift-linear-at
+  ;; Internal one-shot variant used by fibers.  Its resumption has linear
+  ;; ownership and signals an error if invoked more than once.
+  (set-who! $control-shift1-at
     (lambda (tag zero? proc)
       (unless (control-prompt-tag? tag)
         ($oops who "~s is not a continuation prompt tag" tag))
@@ -678,19 +734,21 @@ TODO:
       (let ([activation (find-control-prompt-activation tag)])
         (unless activation
           ($oops who "no matching continuation prompt for ~s" tag))
-        ($call-getting-continuation-attachment
-          no-continuation-attachment
-          (lambda (attachment)
-            (#3%call/cc
-              (lambda (inner)
-                (invoke-handler
-                  (control-prompt-activation-handler activation)
-                  (make-control-shift-request tag zero? #t proc)
-                  (make-raise-context #t attachment inner)))))))))
+        (parameterize ([native-control-capture-ready #f])
+          ($call-getting-continuation-attachment
+            no-continuation-attachment
+            (lambda (attachment)
+              (#3%call/1cc
+                (lambda (inner)
+                  (invoke-handler
+                    (control-prompt-activation-handler activation)
+                    (make-control-shift-request tag zero? #t #f #f proc)
+                    (make-raise-context #t attachment inner))))))))))
 
-  ;; Internal one-shot variant used by fibers.  Its resumption has linear
-  ;; ownership and signals an error if invoked more than once.
-  (set-who! $control-shift1-at
+  ;; Capture a one-shot continuation for a scheduler-owned prompt.  The raw
+  ;; capture retains its prompt activation so resume can rebase that activation
+  ;; to the fresh prompt installed for the receiving scheduler turn.
+  (set-who! $control-shift-native1-at
     (lambda (tag zero? proc)
       (unless (control-prompt-tag? tag)
         ($oops who "~s is not a continuation prompt tag" tag))
@@ -706,8 +764,57 @@ TODO:
               (lambda (inner)
                 (invoke-handler
                   (control-prompt-activation-handler activation)
-                  (make-control-shift-request tag zero? #t proc)
+                  (make-control-shift-request
+                    tag zero? #t #t activation proc)
                   (make-raise-context #t attachment inner)))))))))
+
+  (set! $control-native1-capture? native-control-capture?)
+  (set-who! $control-native1-capture-ready-at?
+    (lambda (tag)
+      (unless (control-prompt-tag? tag)
+        ($oops who "~s is not a continuation prompt tag" tag))
+      (native-control-capture-ready-at? tag)))
+
+  ;; Rebase a raw capture to the active prompt and splice it onto the current
+  ;; invocation tail.  Prompt rebasing keeps later shifts flat across scheduler
+  ;; turns instead of accumulating one resumption reset per preemption.
+  (set-who! $control-resume-native1-at
+    (lambda (tag raw value)
+      (unless (control-prompt-tag? tag)
+        ($oops who "~s is not a continuation prompt tag" tag))
+      (unless (native-control-capture? raw)
+        ($oops who "~s is not a native one-shot prompt capture" raw))
+      (unless (eq? tag (native-control-capture-tag raw))
+        ($oops who "native one-shot prompt capture belongs to another prompt"))
+      (let ([current (find-control-prompt-activation tag)])
+        (unless current
+          ($oops who "no matching continuation prompt for ~s" tag))
+        (let* ([inner (native-control-capture-inner raw)]
+               [limit (native-control-capture-limit raw)]
+               [source (native-control-capture-activation raw)]
+               [handler (control-prompt-activation-handler current)]
+               [info (and (wrapper-procedure? handler)
+                          (wrapper-procedure-data handler))])
+          (unless (and
+                    (control-prompt-activation? source)
+                    (eq? tag
+                      (control-prompt-frame-tag
+                        (control-prompt-activation-frame source))))
+            ($oops who "invalid source prompt activation for ~s" tag))
+          (unless (unwind-handler-info? info)
+            ($oops who "invalid continuation prompt activation for ~s" tag))
+          ;; All validation is non-destructive.  Only the caller that wins
+          ;; this claim may mutate and splice the captured activation.
+          (unless (box-cas! (native-control-capture-fresh? raw) #t #f)
+            ($oops who
+              "attempt to resume a shot native one-shot prompt capture"))
+          (control-prompt-activation-frame-set! source
+            (control-prompt-activation-frame current))
+          (control-prompt-activation-handler-set! source handler)
+          (#3%call/1cc
+            (lambda (tail)
+              (register-unwind-target! info tail)
+              ((compose-continuation-oneshot inner limit tail) value)))))))
 
   (set-who! raise
     (lambda (obj)

@@ -21,7 +21,7 @@ The design supports:
 - asynchronous timers, networking, name resolution, and file operations;
 - composable wait operations, channels, and fiber-aware mutexes;
 - an optional scheduler group spanning multiple operating-system threads; and
-- optional timed preemption built on Chez Scheme engines.
+- optional timed preemption using native one-shot fiber continuations.
 
 Transparent suspension of every existing port operation is outside the core
 contract. Async I/O uses handles owned by the async library. Integration with
@@ -46,8 +46,8 @@ An **operation** represents an action that can either complete immediately or
 suspend its task until an external condition becomes true. I/O requests,
 timers, channel sends and receives, and task joins are operations.
 
-A **resumption** is a one-shot wrapper around a captured task continuation.
-Exactly one completion, cancellation, or failure path may claim it.
+A **resumption** is a one-shot captured task continuation. Exactly one
+completion, cancellation, or failure path may claim it.
 
 A **task group** owns a set of child tasks and provides a structured lifetime
 boundary for them.
@@ -132,6 +132,7 @@ Representative public forms are:
 Each scheduler owns:
 
 - a reference to its scheduler group's private continuation-prompt tag;
+- the escape continuation for the active preemptive task turn;
 - a current-turn run queue;
 - a next-turn run queue;
 - a thread-safe remote-submission queue;
@@ -152,7 +153,7 @@ Only the owning operating-system thread may:
 - call `uv_run` on the scheduler's loop;
 - create, modify, or close handles belonging to that loop;
 - move tasks between the scheduler's local queues; or
-- invoke Scheme resumptions belonging to that scheduler.
+- invoke a claimed task resumption as that scheduler's current work.
 
 Remote threads submit commands to the remote-submission queue and call
 `uv_async_send`. A libuv worker or arbitrary foreign thread never invokes a
@@ -231,32 +232,21 @@ group whose lifetime is owned by the application.
 
 ## Suspension protocol
 
-The scheduler runs each task under its private prompt. The conceptual shape
-is:
+The scheduler runs each task turn under its group's private prompt. An
+operation that cannot complete immediately captures a one-shot delimited
+continuation through that prompt, registers its wait, and returns a suspension
+token to the scheduler. The prompt implementation preserves exception
+unwinding, dynamic-wind transitions, and continuation attachments.
 
-```scheme
-(reset0-at scheduler-tag
-  (run-task-entry task))
-```
-
-An operation that cannot complete immediately suspends through the matching
-prompt:
-
-```scheme
-(shift0-at scheduler-tag k
-  (register-wait! operation scheduler task
-                  (make-one-shot-resumption task k)))
-```
-
-The actual implementation uses internal procedures so that the prompt tag,
-task state transition, and resumption construction form one checked
-operation.
+The operation resumption is invoked under a fresh activation of the same
+private prompt on the worker that claims the ready task. Runtime one-shot
+composition consumes the captured stack on its single invocation.
 
 Suspension performs these actions atomically from the scheduler's point of
 view:
 
 1. Capture the continuation through the scheduler prompt.
-2. Wrap it in a one-shot resumption.
+2. Store it as a one-shot resumption.
 3. Change the task state from `running` to `waiting`.
 4. Publish the wait registration.
 5. Return control to the scheduler.
@@ -266,9 +256,10 @@ changes the task to `ready`, and schedules it for the next turn. Cancellation
 and failure compete for the same claim. A second claim has no effect and
 cannot invoke the continuation again.
 
-Although Chez Scheme delimited continuations are multi-shot, async task
-resumptions are one-shot. Multi-shot resumption would duplicate task identity,
-resource ownership, and pending I/O state.
+Async task resumptions are one-shot. Their continuation stack is transferred
+to the claiming worker and the task clears its resumption before invocation.
+This ownership rule preserves unique task identity, resource ownership, and
+pending I/O state.
 
 ## Scheduler turns and fairness
 
@@ -479,7 +470,8 @@ point. I/O conditions retain the libuv error code and include the operation,
 handle, and relevant address or path information.
 
 Each spawned task inherits an independent exception state from its parent.
-Internal scheduler prompts are not part of a saved exception state.
+Internal scheduler prompts are runtime control state rather than part of a
+saved exception state.
 
 ## Dynamic state
 
@@ -572,12 +564,11 @@ The I/O surface includes:
 The default scheduler group has one scheduler. An explicit parallelism option
 creates one scheduler and one libuv loop per operating-system thread.
 
-Tasks are scheduler-local unless created as migratable. A task is pinned while
-it runs under an engine resumption or another scheduler-local execution
-constraint. Native resources remain assigned to their owner loop independently
-of the task that uses them. An operation on a resource from another scheduler
-in the same group is submitted to the owner loop and its result is routed back
-through the task's current scheduler.
+Tasks are scheduler-local unless created as migratable. Native resources
+remain assigned to their owner loop independently of the task that uses them.
+An operation on a resource from another scheduler in the same group is
+submitted to the owner loop and its result is routed back through the task's
+current scheduler.
 
 Idle schedulers may steal only ready, migratable tasks. Waiting tasks are not
 stolen; their completion is delivered to the scheduler that owns the wait.
@@ -595,23 +586,41 @@ Without that support, the scheduler rejects parallelism greater than one.
 ## Timed preemption
 
 The cooperative scheduler is the core execution contract. Timed preemption is
-an optional policy implemented with Chez Scheme engines.
+an optional policy implemented with the runtime timer and native one-shot
+prompt captures.
 
-In preemptive mode, the scheduler runs a ready task with a bounded number of
-engine ticks. Normal completion produces task results. Engine expiration
-produces a resumable task and schedules it for the next turn. Explicit async
-suspension registers the resumable task with its operation instead of placing
-it immediately on a run queue.
+In preemptive mode, the scheduler arms a positive tick budget only while user
+task code is active. Each preemptive turn places a scheduler escape outside the
+private prompt. At a Scheme safe point, timer expiration captures the raw
+one-shot continuation through the prompt, stores it on the task, and invokes
+the escape so scheduler frames are not retained by the fiber.
+
+Resumption installs a fresh prompt on the worker that claimed the task,
+rebases the captured prompt activation to that prompt, and transfers the stack
+with the runtime one-shot composition primitive. Repeated preemption therefore
+does not accumulate prompt or scheduler trampolines. Migratable preempted tasks
+remain eligible for work stealing. Explicit async suspension continues to use
+the standard one-shot prompt protocol and registers the task with its
+operation.
 
 Preemption is disabled while executing scheduler internals, libuv callbacks,
-foreign critical sections, and non-fiber-aware lock operations. Engines cannot
-be nested; entering a preemptive scheduler while another engine is active is
-an error.
+foreign critical sections, non-fiber-aware lock operations, and the dynamic
+extent of a more deeply nested delimited-control prompt. The prompt runtime
+tracks the innermost activation explicitly, so a timer delivered in such an
+extent is rearmed without capturing a partially owned prompt stack.
 
-Preemption is enabled per `run-async` invocation with a positive
-`preemption-ticks` value. The default scheduler is cooperative. Engine
-resumptions add a temporary affinity reason so that a preempted continuation
-resumes on the scheduler that owns its engine state.
+An async scheduler cannot be entered from an active engine. Engine control
+state is runtime-thread-local and is not included in the fiber-local dynamic
+state contract. A task running under a preemptive scheduler cannot invoke a
+nested scheduler because the outer task owns that thread's timer until its
+turn ends.
+
+Preemption is enabled per `run-async` invocation with a `preemption-ticks`
+value of at least 1000. The lower bound leaves enough runtime instructions for
+the interrupt handler to return before another timer trap. The default
+scheduler is cooperative. Continuation splicing and scheduler state
+transitions run with the timer disarmed; the next tick budget begins only after
+the interrupted fiber has been restored.
 
 ## Blocking operations
 
@@ -630,7 +639,7 @@ Fiber-aware synchronization uses channels, operations, futures, or async
 mutexes. Holding an operating-system mutex across a suspension is invalid
 because another fiber on the same thread cannot make progress through that
 mutex. Internal operating-system mutex sections disable timer interrupts so
-engine expiration cannot suspend a task while it owns a scheduler lock.
+preemption cannot suspend a task while it owns a scheduler lock.
 
 ## Resource finalization
 
@@ -701,7 +710,7 @@ and thread sanitizers where supported.
 
 The implementation is organized into these capability layers:
 
-1. A single-thread cooperative scheduler with private prompts, task records,
+1. A single-thread cooperative scheduler with private prompts,
    one-shot resumptions, joining, cancellation, and deterministic tests.
 2. Fiber-local dynamic-state capture and activation.
 3. The operation protocol, timers, futures, closeable channels, choice, and
@@ -710,9 +719,9 @@ The implementation is organized into these capability layers:
    orderly native shutdown.
 5. Scheduler groups, remote wakeup, task affinity, and ready-task work
    stealing.
-6. Opt-in timed preemption using engines.
+6. Opt-in timed preemption using native one-shot fiber continuations.
 7. Explicit adapters between async handles and Chez Scheme ports.
 
 Each layer preserves the task and operation contracts of the layers beneath
 it. Parallel execution requires thread support and a real clock. Timed
-preemption requires an available, non-nested engine context.
+preemption requires ownership of the current thread's timer facility.

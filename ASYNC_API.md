@@ -34,9 +34,15 @@ group terminates. Supported options are:
 - `clock`: `real` or `virtual`; the default is `real`.
 - `parallelism`: a positive fixnum; the default is `1`. Values greater than
   one require thread support and a real clock.
-- `preemption-ticks`: `#f` or a positive fixnum; the default is `#f`.
+- `preemption-ticks`: `#f` or a fixnum of at least `1000`; the default is
+  `#f`.
 
-A scheduler using `preemption-ticks` cannot be nested inside an active engine.
+A positive `preemption-ticks` budget enables safe-point preemption with
+one-shot fiber continuations. Preempted migratable tasks remain eligible for
+work stealing. Timer delivery is deferred while a more deeply nested
+delimited-control prompt is active. `run-async` cannot be called inside an
+active engine. A task running under a preemptive scheduler also cannot invoke
+a nested `run-async`.
 
 ```scheme
 (spawn-task thunk option value ...) -> task

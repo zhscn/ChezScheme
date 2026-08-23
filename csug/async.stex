@@ -112,10 +112,14 @@ Optional configuration settings may be supplied as alternating
   A value greater than 1 requires a threaded build of {\ChezScheme} and a
   \scheme{real} clock.
 \item[\scheme{preemption-ticks}] must be either \scheme{#f} (the default) or
-  a positive fixnum.  When specified as a positive fixnum, time-sliced
-  preemptive scheduling is enabled for pure Scheme computations using
-  engine ticks.  A scheduler with preemption enabled cannot be nested
-  inside an active engine.
+  a fixnum of at least 1000.  When specified as a tick budget, time-sliced
+  preemptive scheduling is enabled for pure Scheme computations.  Timer
+  expiration captures a one-shot fiber continuation at a Scheme safe point;
+  a migratable task remains eligible for work stealing when it becomes ready.
+  Timer delivery is deferred while a more deeply nested delimited-control
+  prompt is active.  \scheme{run-async} cannot be called inside an active
+  engine.  A task running in a preemptive scheduler also cannot invoke a
+  nested \scheme{run-async}.
 \end{description}
 
 \scheme{run-async} returns the values returned by \var{thunk}.  If the root
