@@ -5109,6 +5109,53 @@
              (begin (foreign-free addr) #t)))))
   )
 
+(mat rebuilt-remembered-set
+  (parameterize ([#%$enable-check-heap #t])
+    (with-interrupts-disabled
+      (let ()
+        (define-record-type remembered-record
+          (fields (mutable value)))
+        (define v (vector #f))
+        (define r (make-remembered-record #f))
+        (define w (weak-cons #f #f))
+        (define e (ephemeron-cons #f #f))
+        (define rbv (make-reference-bytevector (foreign-sizeof 'ptr)))
+        (define sym (gensym))
+
+        ;; Put every source object in the oldest nonstatic generation.
+        (collect (collect-maximum-generation)
+                 (collect-maximum-generation)
+                 (collect-maximum-generation))
+
+        (let ([roots (vector (list 'vector-target)
+                             (list 'record-target)
+                             (list 'weak-target)
+                             (list 'ephemeron-key)
+                             (list 'ephemeron-value)
+                             (list 'reference-target)
+                             (list 'symbol-target))])
+          (vector-set! v 0 (vector-ref roots 0))
+          (remembered-record-value-set! r (vector-ref roots 1))
+          (set-car! w (vector-ref roots 2))
+          (set-car! e (vector-ref roots 3))
+          (set-cdr! e (vector-ref roots 4))
+          (bytevector-reference-set! rbv 0 (vector-ref roots 5))
+          (#%$set-top-level-value! sym (vector-ref roots 6))
+
+          ;; A full collection promotes the targets while retaining the
+          ;; old-to-young edges in each space's remembered representation.
+          (collect (collect-maximum-generation))
+          (and (eq? (vector-ref v 0) (vector-ref roots 0))
+               (eq? (remembered-record-value r) (vector-ref roots 1))
+               (eq? (car w) (vector-ref roots 2))
+               (eq? (car e) (vector-ref roots 3))
+               (eq? (cdr e) (vector-ref roots 4))
+               (eq? (bytevector-reference-ref rbv 0)
+                    (vector-ref roots 5))
+               (eq? (#%$top-level-value sym) (vector-ref roots 6))
+               (begin (keep-live (list v r w e rbv sym roots)) #t))))))
+  )
+
 (mat weak-cons
    (procedure? weak-cons)
    (procedure? weak-pair?)

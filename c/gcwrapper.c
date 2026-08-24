@@ -491,12 +491,12 @@ void Scompact_heap(void) {
 /* S_check_heap checks for various kinds of heap consistency
    It currently checks for:
        dangling references in space_impure (generation > 0) and space_pure
-       extra dirty bits
-       missing dirty bits
+       dirty-card coverage of every old-to-young pointer
+       dirty-segment minima and list membership
+       a full-heap remembered-set rebuild after a full collection
 
    Some additional things it should check for but doesn't:
-       correct dirty bytes, following sweep_dirty conventions
-       dangling references in in space_code and space_continuation
+       dangling references in space_code and space_continuation
        dirty bits set for non-impure segments outside of generation zero
        proper chaining of segments of a space and generation:
           chains contain all and only the appropriate segments
@@ -568,6 +568,327 @@ static int maybe_inexactnum_marked(ptr p, seginfo *psi) {
 }
 
 static void shadow_seed_checked_pointer(ptr *pp, ptr p, uptr seg, ISPC s);
+static uptr size_object(ptr p);
+
+#define REMEMBERED_EMPTY_SEGMENT ((uptr)-1)
+
+typedef struct {
+  uptr segment;
+  IGEN generation;
+  ISPC space;
+  unsigned char required[cards_per_segment];
+  unsigned char scanned[cards_per_segment];
+  unsigned int listed_minimum;
+  unsigned int list_count;
+} rebuilt_remembered_segment;
+
+typedef struct {
+  rebuilt_remembered_segment *segments;
+  size_t capacity;
+  size_t count;
+  size_t occupied_segment_count;
+  IBOOL active;
+} rebuilt_remembered_state;
+
+static rebuilt_remembered_state rebuilt_remembered;
+
+static IBOOL remembered_spacep(ISPC s) {
+  return s == space_impure
+      || s == space_symbol
+      || s == space_port
+      || s == space_impure_record
+      || s == space_impure_typed_object
+      || s == space_immobile_impure
+      || s == space_count_impure
+      || s == space_closure
+      || s == space_weakpair
+      || s == space_ephemeron
+      || s == space_reference_array;
+}
+
+static IBOOL remembered_object_card_spacep(ISPC s) {
+  return s == space_symbol
+      || s == space_port
+      || s == space_impure_record;
+}
+
+static size_t remembered_segment_hash(uptr segment, size_t capacity) {
+  segment ^= segment >> 17;
+  segment *= (uptr)0xed5ad4bbU;
+  segment ^= segment >> 11;
+  return (size_t)segment & (capacity - 1);
+}
+
+static void remembered_rehash(size_t capacity) {
+  rebuilt_remembered_segment *old_segments = rebuilt_remembered.segments;
+  size_t old_capacity = rebuilt_remembered.capacity;
+  size_t i;
+
+  rebuilt_remembered.segments = (rebuilt_remembered_segment *)malloc(
+    capacity * sizeof(rebuilt_remembered_segment));
+  if (rebuilt_remembered.segments == NULL)
+    S_error_abort("check_heap: cannot allocate remembered-set rebuild");
+  rebuilt_remembered.capacity = capacity;
+  rebuilt_remembered.count = 0;
+  for (i = 0; i < capacity; i += 1)
+    rebuilt_remembered.segments[i].segment = REMEMBERED_EMPTY_SEGMENT;
+
+  if (old_segments != NULL) {
+    for (i = 0; i < old_capacity; i += 1) {
+      if (old_segments[i].segment != REMEMBERED_EMPTY_SEGMENT) {
+        size_t at = remembered_segment_hash(old_segments[i].segment,
+                                             capacity);
+        while (rebuilt_remembered.segments[at].segment
+               != REMEMBERED_EMPTY_SEGMENT)
+          at = (at + 1) & (capacity - 1);
+        rebuilt_remembered.segments[at] = old_segments[i];
+        rebuilt_remembered.count += 1;
+      }
+    }
+    free(old_segments);
+  }
+}
+
+static rebuilt_remembered_segment *remembered_find_segment(uptr segment,
+                                                            IBOOL create) {
+  size_t at;
+  seginfo *si;
+
+  if (rebuilt_remembered.capacity == 0) {
+    if (!create) return NULL;
+    remembered_rehash(64);
+  } else if (create
+             && (rebuilt_remembered.count + 1) * 2
+                  >= rebuilt_remembered.capacity) {
+    remembered_rehash(rebuilt_remembered.capacity * 2);
+  }
+
+  at = remembered_segment_hash(segment, rebuilt_remembered.capacity);
+  while (rebuilt_remembered.segments[at].segment
+         != REMEMBERED_EMPTY_SEGMENT) {
+    if (rebuilt_remembered.segments[at].segment == segment)
+      return &rebuilt_remembered.segments[at];
+    at = (at + 1) & (rebuilt_remembered.capacity - 1);
+  }
+
+  if (!create) return NULL;
+  si = MaybeSegInfo(segment);
+  if (si == NULL || !remembered_spacep(si->space))
+    S_error_abort("check_heap: invalid remembered-set source segment");
+  rebuilt_remembered.segments[at].segment = segment;
+  rebuilt_remembered.segments[at].generation = si->generation;
+  rebuilt_remembered.segments[at].space = si->space;
+  memset(rebuilt_remembered.segments[at].required, 0xff,
+         sizeof(rebuilt_remembered.segments[at].required));
+  memset(rebuilt_remembered.segments[at].scanned, 0xff,
+         sizeof(rebuilt_remembered.segments[at].scanned));
+  rebuilt_remembered.segments[at].listed_minimum = 0xff;
+  rebuilt_remembered.segments[at].list_count = 0;
+  rebuilt_remembered.count += 1;
+  return &rebuilt_remembered.segments[at];
+}
+
+static void remembered_reset(void) {
+  free(rebuilt_remembered.segments);
+  memset(&rebuilt_remembered, 0, sizeof(rebuilt_remembered));
+}
+
+static void remembered_begin(IBOOL aftergc, IGEN mcg) {
+  IGEN g;
+  ISPC s;
+
+  remembered_reset();
+  if (!aftergc || mcg < S_G.max_nonstatic_generation) return;
+  rebuilt_remembered.active = 1;
+
+  for (g = 0; g <= static_generation; INCRGEN(g))
+    for (s = 0; s <= max_real_space; s += 1) {
+      seginfo *si;
+      for (si = S_G.occupied_segments[g][s]; si != NULL; si = si->next) {
+        rebuilt_remembered.occupied_segment_count += 1;
+        if (remembered_spacep(s))
+          (void)remembered_find_segment(si->number, 1);
+      }
+    }
+}
+
+static void remembered_lower(unsigned char *slot, IGEN generation) {
+  if (generation < *slot) *slot = generation;
+}
+
+static void remembered_record_pointer(ptr *pp, ptr p,
+                                      IBOOL address_is_meaningful,
+                                      ptr base) {
+  seginfo *from_si, *to_si;
+  rebuilt_remembered_segment *rs;
+  uptr address, card;
+
+  if (!rebuilt_remembered.active || !address_is_meaningful
+      || FIXMEDIATE(p)
+      || (to_si = MaybeSegInfo(ptr_get_segment(p))) == NULL)
+    return;
+
+  address = (uptr)TO_PTR(pp);
+  from_si = MaybeSegInfo(addr_get_segment(address));
+  if (from_si == NULL || !remembered_spacep(from_si->space)
+      || from_si->generation == 0
+      || to_si->generation >= from_si->generation)
+    return;
+
+  rs = remembered_find_segment(from_si->number, 0);
+  if (rs == NULL)
+    S_error_abort("check_heap: uninventoried remembered-set source");
+  card = (address >> card_offset_bits)
+       & ((1 << segment_card_offset_bits) - 1);
+  remembered_lower(&rs->required[card], to_si->generation);
+
+  if (remembered_object_card_spacep(from_si->space) && base != (ptr)0) {
+    uptr start = (uptr)UNTYPE(base, TYPEBITS(base));
+    uptr end = start + size_object(base) - 1;
+    uptr first_card = start >> card_offset_bits;
+    uptr last_card = end >> card_offset_bits;
+    uptr object_card;
+
+    for (object_card = first_card; object_card <= last_card; object_card += 1) {
+      uptr segment = object_card >> segment_card_offset_bits;
+      rebuilt_remembered_segment *object_rs =
+        remembered_find_segment(segment, 0);
+      if (object_rs == NULL)
+        S_error_abort("check_heap: object crosses an uninventoried segment");
+      remembered_lower(
+        &object_rs->scanned[
+          object_card & ((1 << segment_card_offset_bits) - 1)],
+        to_si->generation);
+    }
+  } else {
+    remembered_lower(&rs->scanned[card], to_si->generation);
+  }
+}
+
+static void remembered_verify(void) {
+  IGEN from_generation;
+  size_t i;
+
+  if (!rebuilt_remembered.active) return;
+
+  for (from_generation = 1;
+       from_generation <= static_generation;
+       from_generation = from_generation == S_G.max_nonstatic_generation
+                           ? static_generation : from_generation + 1) {
+    IGEN to_generation;
+    IGEN maximum_to_generation =
+      from_generation == static_generation
+        ? S_G.max_nonstatic_generation : from_generation - 1;
+
+    for (to_generation = 0;
+         to_generation <= maximum_to_generation;
+         to_generation += 1) {
+      seginfo *listed;
+      size_t entries = 0;
+      for (listed = DirtySegments(from_generation, to_generation);
+           listed != NULL;
+           listed = listed->dirty_next) {
+        entries += 1;
+        if (entries > rebuilt_remembered.occupied_segment_count) {
+          S_checkheap_errors += 1;
+          printf("!!! rebuilt remembered set found a cyclic or oversized"
+                 " dirty list from generation %d to %d\n",
+                 from_generation, to_generation);
+          break;
+        }
+        if (remembered_spacep(listed->space)) {
+          rebuilt_remembered_segment *rs =
+            remembered_find_segment(listed->number, 0);
+          if (rs == NULL)
+            S_error_abort("check_heap: dirty list has uninventoried segment");
+          rs->list_count += 1;
+          if ((unsigned int)to_generation < rs->listed_minimum)
+            rs->listed_minimum = (unsigned int)to_generation;
+        }
+      }
+    }
+  }
+
+  for (i = 0; i < rebuilt_remembered.capacity; i += 1) {
+    rebuilt_remembered_segment *rs = &rebuilt_remembered.segments[i];
+    seginfo *si;
+    uptr card;
+    unsigned int required_min = 0xff;
+
+    if (rs->segment == REMEMBERED_EMPTY_SEGMENT) continue;
+    si = SegInfo(rs->segment);
+    if (si->generation != rs->generation || si->space != rs->space)
+      S_error_abort("check_heap: remembered-set segment changed during rebuild");
+
+    if ((si->min_dirty_byte == 0xff && rs->list_count != 0)
+        || (si->min_dirty_byte != 0xff
+            && (rs->list_count != 1
+                || rs->listed_minimum != si->min_dirty_byte))) {
+      S_checkheap_errors += 1;
+      printf("!!! rebuilt remembered set found inconsistent dirty index:"
+             " generation %d space %d segment "PHtx
+             " minimum %d, listed minimum %u, occurrences %u\n",
+             rs->generation, rs->space, (ptrdiff_t)rs->segment,
+             si->min_dirty_byte, rs->listed_minimum, rs->list_count);
+    }
+
+    for (card = 0; card < cards_per_segment; card += 1) {
+      unsigned int actual = si->dirty_bytes[card];
+      unsigned int required = rs->required[card];
+      unsigned int scanned = rs->scanned[card];
+
+      if (actual > required) {
+        S_checkheap_errors += 1;
+        printf("!!! rebuilt remembered set found missing card:"
+               " generation %d space %d segment "PHtx" card %td"
+               " has %u, requires at most %u\n",
+               rs->generation, rs->space, (ptrdiff_t)rs->segment,
+               (ptrdiff_t)card, actual, required);
+      }
+
+      if (required < required_min) required_min = required;
+
+      if (actual != 0xff
+          && (rs->generation == 0
+              || actual >= (unsigned int)rs->generation)) {
+        S_checkheap_errors += 1;
+        printf("!!! rebuilt remembered set found invalid card generation:"
+               " generation %d space %d segment "PHtx" card %td"
+               " has %u\n",
+               rs->generation, rs->space, (ptrdiff_t)rs->segment,
+               (ptrdiff_t)card, actual);
+      }
+
+      if (checkheap_noisy && actual != scanned) {
+        printf("... rebuilt remembered card is conservative:"
+               " generation %d space %d segment "PHtx" card %td"
+               " has %u, physical requirement %u, current scan %u\n",
+               rs->generation, rs->space, (ptrdiff_t)rs->segment,
+               (ptrdiff_t)card, actual, required, scanned);
+      }
+    }
+
+    if (required_min != 0xff) {
+      if (si->min_dirty_byte > required_min) {
+        S_checkheap_errors += 1;
+        printf("!!! rebuilt remembered set found invalid segment minimum:"
+               " generation %d space %d segment "PHtx
+               " has %d, requires at most %u\n",
+               rs->generation, rs->space, (ptrdiff_t)rs->segment,
+               si->min_dirty_byte, required_min);
+      }
+      if (rs->list_count != 1 || rs->listed_minimum > required_min) {
+        S_checkheap_errors += 1;
+        printf("!!! rebuilt remembered set found unindexed segment:"
+               " generation %d space %d segment "PHtx
+               " requires at most %u\n",
+               rs->generation, rs->space, (ptrdiff_t)rs->segment,
+               required_min);
+      }
+    }
+  }
+  remembered_reset();
+}
 
 static void check_pointer(ptr *pp, IBOOL address_is_meaningful, IBOOL is_reference, ptr base, uptr seg, ISPC s, IBOOL aftergc) {
   ptr p = *pp;
@@ -576,6 +897,7 @@ static void check_pointer(ptr *pp, IBOOL address_is_meaningful, IBOOL is_referen
     p = S_maybe_reference_to_object(p);
 
   shadow_seed_checked_pointer(pp, p, seg, s);
+  remembered_record_pointer(pp, p, address_is_meaningful, base);
 
   if (!FIXMEDIATE(p)) {
     seginfo *psi = MaybeSegInfo(ptr_get_segment(p));
@@ -1922,6 +2244,7 @@ void S_check_heap(IBOOL aftergc, IGEN mcg) {
   uptr static_segments = 0;
   uptr nonstatic_segments = 0;
 
+  remembered_begin(aftergc, mcg);
   check_dirty();
   checked_stack_range_count = 0;
   check_worker_stack_geometry();
@@ -2295,6 +2618,7 @@ void S_check_heap(IBOOL aftergc, IGEN mcg) {
 
   check_stack_range_ownership();
 
+  remembered_verify();
   if (aftergc) shadow_check_heap(mcg);
 
   if (S_checkheap_errors) {
@@ -2383,9 +2707,12 @@ static void check_dirty(void) {
   check_dirty_space(space_symbol);
   check_dirty_space(space_port);
   check_dirty_space(space_impure_record);
+  check_dirty_space(space_impure_typed_object);
   check_dirty_space(space_weakpair);
   check_dirty_space(space_ephemeron);
   check_dirty_space(space_immobile_impure);
+  check_dirty_space(space_count_impure);
+  check_dirty_space(space_closure);
   check_dirty_space(space_reference_array);
 
   fflush(stdout);
