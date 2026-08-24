@@ -2077,6 +2077,206 @@
                   (equal? (cdr finished) '(return . done))))
            (eq? (#3%$native-fiber-state task) 'finished)))))
 
+(mat native-fiber-foreign-callback-boundary
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [call-callback
+          (foreign-procedure "call_for_interrupt_test" (void* int) int)]
+         [task #f]
+         [blocked? #f]
+         [callback-depth #f]
+         [nested-callback-depth #f]
+         [after-depth #f])
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (let* ([inner-callback
+                  (foreign-callable
+                    (lambda (value)
+                      (set! nested-callback-depth
+                        (#3%$fiber-switch-prohibited-depth))
+                      (fx+ value 1))
+                    (int) int)]
+                 [callback
+                  (foreign-callable
+                    (lambda (value)
+                      (set! callback-depth
+                        (#3%$fiber-switch-prohibited-depth))
+                      (guard (condition
+                               [else
+                                (set! blocked? #t)])
+                        (#3%$native-fiber-try-claim! scheduler)
+                        (#3%$native-fiber-switch task scheduler 'escaped)
+                        (void))
+                      (fx+ (call-callback
+                             (foreign-callable-entry-point inner-callback)
+                             value)
+                           1))
+                    (int) int)]
+                 [result
+                  (call-callback
+                    (foreign-callable-entry-point callback)
+                    40)])
+            (keep-live callback)
+            (keep-live inner-callback)
+            (set! after-depth (#3%$fiber-switch-prohibited-depth))
+            (#3%$native-fiber-switch task scheduler result)
+            'done))
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-finish fiber scheduler outcome))
+        #b001))
+    (#3%$native-fiber-try-claim! task)
+    (let ([yielded (#3%$native-fiber-switch scheduler task 'start)])
+      (and (eq? (car yielded) task)
+           (fx= (cdr yielded) 42)
+           blocked?
+           (fx= callback-depth 1)
+           (fx= nested-callback-depth 2)
+           (fx= after-depth 0)
+           (eq? (#3%$native-fiber-state task) 'parked)
+           (#3%$native-fiber-try-claim! task)
+           (let ([finished (#3%$native-fiber-switch scheduler task 'resume)])
+             (and (eq? (car finished) task)
+                  (equal? (cdr finished) '(return . done))))
+           (eq? (#3%$native-fiber-state task) 'finished)))))
+
+(mat native-fiber-engine-boundary
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [task #f]
+         [task-blocked? #f]
+         [engine-blocked? #f]
+         [adopt-blocked? #f])
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (set! task-blocked?
+            (guard (condition [else #t])
+              (let ([engine (make-engine (lambda () 'escaped))])
+                (engine 10000 (lambda args #f) (lambda args #f)))
+              #f))
+          'done)
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-finish fiber scheduler outcome))
+        #b001))
+    (let ([engine
+           (make-engine
+             (lambda ()
+               (#3%$native-fiber-try-claim! task)
+               (set! engine-blocked?
+                 (guard (condition [else #t])
+                   (#3%$native-fiber-switch scheduler task 'escaped)
+                   #f))))])
+      (engine 10000 (lambda args (void)) (lambda args (void))))
+    (let ([worker-result #f])
+      (thread-join
+        (fork-thread
+          (lambda ()
+            (let ([engine
+                   (make-engine
+                     (lambda ()
+                       (set! adopt-blocked?
+                         (guard (condition [else #t])
+                           (#3%$native-fiber-adopt 0)
+                           #f))))])
+              (engine 10000
+                (lambda args (set! worker-result #t))
+                (lambda args (set! worker-result #f)))))))
+      (and worker-result
+           engine-blocked?
+           adopt-blocked?
+           (let ([finished (#3%$native-fiber-switch scheduler task 'start)])
+             (and (eq? (car finished) task)
+                  (equal? (cdr finished) '(return . done))))
+           task-blocked?
+           (eq? (#3%$native-fiber-state task) 'finished)))))
+
+(mat native-fiber-safe-point-preemption
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [task #f]
+         [progress #f]
+         [preempt-progress #f]
+         [handler-count 0]
+         [saved-handler (timer-interrupt-handler)])
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (set-timer 1000)
+          (let loop ([i 1000000])
+            (set! progress i)
+            (unless (fx= i 0)
+              (loop (fx- i 1))))
+          'completed)
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-finish fiber scheduler outcome))
+        #b001))
+    (dynamic-wind
+      (lambda ()
+        (timer-interrupt-handler
+          (lambda ()
+            (set! handler-count (fx+ handler-count 1))
+            (set! preempt-progress progress)
+            (unless (#3%$native-fiber-preempt scheduler 'preempted)
+              (set-timer 1)))))
+      (lambda ()
+        (#3%$native-fiber-try-claim! task)
+        (let ([preempted (#3%$native-fiber-switch scheduler task 'start)])
+          (and (eq? (car preempted) task)
+               (eq? (cdr preempted) 'preempted)
+               (fixnum? preempt-progress)
+               (fx> preempt-progress 0)
+               (fx< preempt-progress 1000000)
+               (fx= handler-count 1)
+               (#3%$native-fiber-try-claim! task)
+               (let ([finished
+                      (#3%$native-fiber-switch scheduler task 'resume)])
+                 (and (eq? (car finished) task)
+                      (equal? (cdr finished) '(return . completed))))
+               (eq? (#3%$native-fiber-state task) 'finished))))
+      (lambda ()
+        (set-timer 0)
+        (timer-interrupt-handler saved-handler)))))
+
+(mat native-fiber-runtime-exit-boundary
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [task #f]
+         [handlers-ran 0])
+    (define (blocked? thunk)
+      (guard (condition [else #t])
+        (thunk)
+        #f))
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (parameterize ([exit-handler
+                          (lambda args
+                            (set! handlers-ran (fx+ handlers-ran 1)))]
+                         [reset-handler
+                          (lambda ()
+                            (set! handlers-ran (fx+ handlers-ran 1)))]
+                         [abort-handler
+                          (lambda args
+                            (set! handlers-ran (fx+ handlers-ran 1)))])
+            (and (blocked? (lambda () (exit 0)))
+                 (blocked? reset)
+                 (blocked? abort)
+                 (fx= handlers-ran 0))))
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-finish fiber scheduler outcome))
+        #b001))
+    (#3%$native-fiber-try-claim! task)
+    (let ([finished (#3%$native-fiber-switch scheduler task 'start)])
+      (and (eq? (car finished) task)
+           (equal? (cdr finished) '(return . #t))
+           (fx= handlers-ran 0)
+           (eq? (#3%$native-fiber-state task) 'finished)))))
+
 (mat wait-for-threads
   (begin
     ;; To avoid breaking later tests that use `(collect)`,

@@ -9603,8 +9603,11 @@
                   (lambda (extra ... t ... ...)
                     ;; note: interrupt disabling is handled in cpnanopass, because it needs
                     ;; to be close enough to the back end to apply even for interpret mode
-                    ($event-trap-check) ; ensure eventual `($event)` in the case of many short callbacks
-                    (result-filter (p extra ... actual ...))))
+                    (#3%$app/no-inline
+                      $call-with-native-fiber-switch-prohibited
+                      (lambda ()
+                        ($event-trap-check) ; ensure eventual `($event)` in the case of many short callbacks
+                        (result-filter (p extra ... actual ...))))))
                 (extra-arg ... arg ... ...)
                 result)))))))
 

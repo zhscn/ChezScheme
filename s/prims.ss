@@ -1832,6 +1832,27 @@
     [() ($fiber-switch-prohibited-depth)]
     [(depth) ($fiber-switch-prohibited-depth depth)]))
 
+(define $call-with-native-fiber-switch-prohibited)
+(set! $call-with-native-fiber-switch-prohibited
+  (lambda (thunk)
+    (unless (procedure? thunk)
+      ($oops '$call-with-native-fiber-switch-prohibited
+        "~s is not a procedure" thunk))
+    (dynamic-wind
+      (lambda ()
+        (let ([depth ($fiber-switch-prohibited-depth)])
+          (when (fx= depth (most-positive-fixnum))
+            ($oops '$call-with-native-fiber-switch-prohibited
+              "native-fiber switch prohibition depth overflow"))
+          ($fiber-switch-prohibited-depth (fx+ depth 1))))
+      thunk
+      (lambda ()
+        (let ([depth ($fiber-switch-prohibited-depth)])
+          (unless (fx> depth 0)
+            ($oops '$call-with-native-fiber-switch-prohibited
+              "native-fiber switch prohibition depth underflow"))
+          ($fiber-switch-prohibited-depth (fx- depth 1)))))))
+
 ;; A native fiber is a linear VM execution context.  Its control field is the
 ;; only field read or written concurrently; all other mutable fields are owned
 ;; by the worker that has successfully claimed the fiber.
@@ -1843,6 +1864,7 @@
 (define $native-fiber-adopt)
 (define $native-fiber-create)
 (define $native-fiber-try-claim!)
+(define $native-fiber-preempt)
 (define $native-fiber-switch)
 (define $native-fiber-finish)
 (define $native-fiber-pin!)
@@ -1871,6 +1893,10 @@
   (opaque #t))
 
 (define native-fiber-next-id (box 0))
+
+(define native-fiber-switch-prohibited?
+  (lambda ()
+    (fx> (#3%$fiber-switch-prohibited-depth) 0)))
 
 (define native-fiber-allocate-id
   (lambda ()
@@ -1946,6 +1972,9 @@
                  (fx= (fxlogand flags (fxlognot (constant native-fiber-flags-mask))) 0)
                  (fx= (fxlogand flags (constant native-fiber-flag-migratable)) 0))
       ($oops '$native-fiber-adopt "invalid native-fiber flags ~s" flags))
+    (when (native-fiber-switch-prohibited?)
+      ($oops '$native-fiber-adopt
+        "native-fiber adoption is prohibited in this runtime region"))
     (when ($current-native-fiber)
       ($oops '$native-fiber-adopt "the current native thread already has an active fiber"))
     (let* ([owner (fx+ (#3%get-thread-id) 1)]
@@ -2085,7 +2114,7 @@
     (unless (eq? current ($current-native-fiber))
       ($oops who "native fiber ~s is not the running native fiber"
         (native-fiber-id current)))
-    (when (fx> ($fiber-switch-prohibited-depth) 0)
+    (when (native-fiber-switch-prohibited?)
       ($oops who "native-fiber switching is prohibited in this runtime region"))
     (let ([owner (native-fiber-current-owner)]
           [current-control (native-fiber-control current)]
@@ -2167,6 +2196,30 @@
 (set! $native-fiber-switch
   (lambda (current target payload)
     (native-fiber-exchange '$native-fiber-switch current target payload #f)))
+
+(set! $native-fiber-preempt
+  (lambda (target payload)
+    (unless ($native-fiber? target)
+      ($oops '$native-fiber-preempt "~s is not a native fiber" target))
+    (when (fx= (fxlogand (native-fiber-flags target)
+                          (constant native-fiber-flag-scheduler))
+               0)
+      ($oops '$native-fiber-preempt
+        "native fiber ~s is not a scheduler fiber"
+        (native-fiber-id target)))
+    (let ([current ($current-native-fiber)])
+      (cond
+        [(or (not current)
+             (eq? current target)
+             (not (fx= (fxlogand (native-fiber-flags current)
+                                  (constant native-fiber-flag-scheduler))
+                        0))
+             (native-fiber-switch-prohibited?))
+         #f]
+        [($native-fiber-try-claim! target)
+         (native-fiber-exchange '$native-fiber-preempt
+           current target payload #f)]
+        [else #f]))))
 
 (set! $native-fiber-finish
   (lambda (current target outcome)

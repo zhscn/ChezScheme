@@ -337,7 +337,7 @@ typedef uint64_t U64;
 #define int_bits 0x20
 #define integer_divide_instruction 1
 #define keyboard_interrupt_index 0x3
-#define library_entry_vector_size 0x27A
+#define library_entry_vector_size 0x282
 #define libspec_closure_index 0xD
 #define libspec_does_not_expect_headroom_index 0x0
 #define libspec_error_index 0xE
@@ -528,10 +528,18 @@ typedef uint64_t U64;
 #define most_positive_fixnum (iptr)0xFFFFFFFFFFFFFFF
 #define nan_single_comparison_truep 1
 #define native_endianness unknown
-#define native_fiber_flag_debug 0x4
+#define native_fiber_context_disp 0x11
+#define native_fiber_control_disp 0x9
+#define native_fiber_entry_disp 0x21
+#define native_fiber_flag_debug 0x8
+#define native_fiber_flag_migratable 0x4
 #define native_fiber_flag_pinned 0x1
 #define native_fiber_flag_scheduler 0x2
-#define native_fiber_flags_mask 0x7
+#define native_fiber_flags_disp 0x31
+#define native_fiber_flags_mask 0xF
+#define native_fiber_handler_stack_disp 0x19
+#define native_fiber_id_disp 0x39
+#define native_fiber_on_return_disp 0x29
 #define native_fiber_state_bits 0x3
 #define native_fiber_state_claimed 0x1
 #define native_fiber_state_finished 0x6
@@ -541,6 +549,7 @@ typedef uint64_t U64;
 #define native_fiber_state_parked 0x4
 #define native_fiber_state_parking 0x3
 #define native_fiber_state_running 0x2
+#define native_fiber_type_disp 0x1
 #define never_immutable_flag 0x0
 #define one_shot_headroom 0xC00
 #define open_fd_append 0x8
@@ -1074,6 +1083,7 @@ typedef uint64_t U64;
 #define size_forward 0x10
 #define size_guardian_entry 0x30
 #define size_inexactnum 0x20
+#define size_native_fiber 0x40
 #define size_pair 0x10
 #define size_phantom 0x10
 #define size_port 0x50
@@ -1678,5 +1688,5 @@ typedef uint64_t U64;
 /* library entries we access from C code */
 #define library_nonprocedure_code 162
 #define library_dounderflow 164
-#define library_popcount_slow 630
-#define library_cpu_features 632
+#define library_popcount_slow 638
+#define library_cpu_features 640

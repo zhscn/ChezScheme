@@ -22,7 +22,6 @@
 
 ;;; All of the engine code is defined within local state
 ;;; containing the following variables:
-;;;   *active*  true iff an engine is running
 ;;;   *exit*    the continuation to the engine invoker
 ;;;   *keybd*   the saved keyboard interrupt handler
 ;;;   *timer*   the saved timer interrupt handler
@@ -30,24 +29,24 @@
 
 (let ()
 
-(define-threaded *exit*)
+(define-threaded *exit* #f)
 (define-threaded *keybd*)
 (define-threaded *timer*)
-(define-threaded *active* #f)
+
+(define engine-active?
+  (lambda () (and *exit* #t)))
 
 (define cleanup
   (lambda (who)
-    (unless *active* ($oops who "no engine active"))
-    (set! *active* #f)
+    (unless (engine-active?) ($oops who "no engine active"))
     (keyboard-interrupt-handler *keybd*)
     (timer-interrupt-handler *timer*)
     (set! *keybd* (void))
-    (set! *exit* (void))
+    (set! *exit* #f)
     (set! *timer* (void))))
 
 (define setup
   (lambda (exit)
-    (set! *active* #t)
     (set! *keybd* (keyboard-interrupt-handler))
     (keyboard-interrupt-handler (exception *keybd*))
     (set! *timer* (timer-interrupt-handler))
@@ -86,9 +85,17 @@
     ((call/cc
        (lambda (exit)
          (set-timer 0)
-         (when *active* ($oops 'engine "cannot nest engines"))
+         (when (engine-active?) ($oops 'engine "cannot nest engines"))
+         (let ([fiber ($current-native-fiber)])
+           (when (and fiber
+                      (fx= (fxlogand ($native-fiber-flags fiber)
+                                     (constant native-fiber-flag-scheduler))
+                           0))
+             ($oops 'engine "cannot enter an engine from a native task fiber")))
          (setup exit)
-         (k ticks))))))
+         (#3%$app/no-inline
+           $call-with-native-fiber-switch-prohibited
+           (lambda () (k ticks))))))))
 
 (define eng
  ; create an engine from a procedure or continuation

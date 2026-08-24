@@ -684,25 +684,47 @@
   (define (unexpected-return who)
     ($oops who (format "unexpected return from ~s handler" who)))
 
+  (define (check-native-fiber-control-exit who)
+    (let ([fiber ($current-native-fiber)])
+      (when (and fiber
+                 (fx= (fxlogand ($native-fiber-flags fiber)
+                                (constant native-fiber-flag-scheduler))
+                      0))
+        ($oops who "cannot leave the runtime from a native task fiber"))))
+
   (set-who! exit
     (lambda args
+      (check-native-fiber-control-exit who)
       (apply (exit-handler) args)
       (unexpected-return who)))
 
   (set-who! #(r6rs: exit)
     (case-lambda
-      [() ((exit-handler)) (unexpected-return who)]
-      [(x) ((exit-handler) x) (unexpected-return who)]))
+      [()
+       (check-native-fiber-control-exit who)
+       ((exit-handler))
+       (unexpected-return who)]
+      [(x)
+       (check-native-fiber-control-exit who)
+       ((exit-handler) x)
+       (unexpected-return who)]))
 
   (set-who! reset
     (lambda ()
+      (check-native-fiber-control-exit who)
       ((reset-handler))
       (unexpected-return who)))
 
   (set-who! abort
     (case-lambda
-      [() ((abort-handler)) (unexpected-return who)]
-      [(x) ((abort-handler) x) (unexpected-return who)])))
+      [()
+       (check-native-fiber-control-exit who)
+       ((abort-handler))
+       (unexpected-return who)]
+      [(x)
+       (check-native-fiber-control-exit who)
+       ((abort-handler) x)
+       (unexpected-return who)])))
 
 (define-who assert-unreachable
   (lambda ()
