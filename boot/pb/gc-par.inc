@@ -1,5 +1,6 @@
 static IGEN copy(thread_gc *tgc, ptr p, seginfo *si, ptr *dest)
 {
+  S_checkheap_note_reached(p);
   check_triggers(tgc, si);
   {
     ptr new_p;
@@ -359,6 +360,7 @@ static IGEN copy(thread_gc *tgc, ptr p, seginfo *si, ptr *dest)
                   INITCDR(new_p) = new_cdr_p;
                   INITCAR(new_cdr_p) = INITCAR(cdr_p);
                   INITCDR(new_cdr_p) = INITCDR(cdr_p);
+                  S_checkheap_note_reached(cdr_p);
                   FWDMARKER(cdr_p) = forward_marker;
                   FWDADDRESS(cdr_p) = new_cdr_p;
                 }
@@ -399,6 +401,7 @@ static IGEN copy(thread_gc *tgc, ptr p, seginfo *si, ptr *dest)
                   INITCDR(new_p) = new_cdr_p;
                   INITCAR(new_cdr_p) = INITCAR(cdr_p);
                   INITCDR(new_cdr_p) = INITCDR(cdr_p);
+                  S_checkheap_note_reached(cdr_p);
                   FWDMARKER(cdr_p) = forward_marker;
                   FWDADDRESS(cdr_p) = new_cdr_p;
                 }
@@ -3032,6 +3035,7 @@ static uptr size_object(ptr p)
 
 static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
 {
+  S_checkheap_note_reached(p);
   check_triggers(tgc, si);
   if (!si->marked_mask) {
     init_mask(tgc, si->marked_mask, si->generation, 0);

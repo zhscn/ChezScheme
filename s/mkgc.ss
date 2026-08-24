@@ -27,6 +27,7 @@
 ;;   - measure     : recurs for reachable size
 ;;   - check
 ;;   - shadow      : independently mark reachable objects after collection
+;;   - checkmark   : independently mark the pre-collection strong closure
 
 ;; For the specification, there are a few declaration forms described
 ;; below, such as `trace` to declare a pointer-valued field within an
@@ -183,6 +184,8 @@
        [(check shadow)
         (trace pair-car)
         (trace pair-cdr)]
+       [checkmark
+        (shadow_ephemeron _)]
        [else])
       (add-ephemeron-to-pending)
       (mark one-bit no-sweep)
@@ -192,6 +195,7 @@
       (space space-weakpair)
       (case-mode
        [(check) (trace pair-car)]
+       [checkmark (shadow_weak_pair _)]
        [else])
       (try-double-pair copy pair-car
                        trace pair-cdr
@@ -669,6 +673,7 @@
        (set! (pair-cdr _copy_) new_cdr_p)
        (set! (pair-car new_cdr_p) (pair-car cdr_p))
        (set! (pair-cdr new_cdr_p) (pair-cdr cdr_p))
+       (S_checkheap_note_reached cdr_p)
        (set! (FWDMARKER cdr_p) forward_marker)
        (set! (FWDADDRESS cdr_p) new_cdr_p)
        (case-flag maybe-backreferences?
@@ -752,6 +757,9 @@
    [(sweep sweep-in-old)
     (trace ref) ; can't trace `val` directly, because we need an impure relocate
     (define val : ptr (ref _))]
+   [(check shadow checkmark)
+    (trace ref)
+    (define val : ptr (ref _))]
    [else]))
 
 (define-trace-macro (trace-symcode symbol-pvalue val)
@@ -765,6 +773,11 @@
        [off (trace-pure (just code))])
     (INITSYMCODE _ code)]
    [measure]
+   [(check shadow checkmark)
+    (define code : ptr (cond
+                         [(Sprocedurep val) (CLOSCODE val)]
+                         [else (SYMCODE _)]))
+    (trace-pure (just code))]
    [else
     (copy symbol-pvalue)]))
 
@@ -871,7 +884,7 @@
                 (trace-record-type-pm num rtd)])]
             [(sweep-in-old self-test)
              (trace-record-type-pm num rtd)]
-            [(check) (check-bignum num)]
+            [(check shadow checkmark) (check-bignum num)]
             [else])])
          (let* ([index : iptr (- (BIGLEN num) 1)]
                 ;; Ignore bit for already forwarded rtd
@@ -958,7 +971,7 @@
                           (cast iptr (port-buffer _))))
       (trace port-buffer)
       (set! (port-last _) (cast ptr (+ (cast iptr (port-buffer _)) n))))]
-   [(sweep-in-old check shadow)
+   [(sweep-in-old check shadow checkmark)
     (when (& (cast uptr _tf_) flag)
       (trace port-buffer))]
    [else
@@ -1076,7 +1089,7 @@
            (set! mask >>= 1)))]
        [else
         (case-mode
-         [(check shadow) (check-bignum num)]
+         [(check shadow checkmark) (check-bignum num)]
          [else
           (define n_si : seginfo* (SegInfo (ptr_get_segment num)))
           (cond
@@ -1423,7 +1436,8 @@
                        config)])])))])
        (case (lookup 'mode config)
          [(copy)
-          (code-block
+         (code-block
+           "S_checkheap_note_reached(p);"
            "check_triggers(tgc, si);"
            (code-block
             "ptr new_p;"
@@ -1437,7 +1451,8 @@
             "*dest = new_p;"
             "return tg;"))]
          [(mark)
-          (code-block
+         (code-block
+           "S_checkheap_note_reached(p);"
            "check_triggers(tgc, si);"
            (ensure-segment-mark-mask "si" "")
            (body)
@@ -1580,7 +1595,7 @@
                         (code
                          "/* Do not inspect the type or first field of the rtd, because"
                          "   it may have been overwritten for forwarding. */")])]
-                    [(measure sweep sweep-in-old check shadow)
+                    [(measure sweep sweep-in-old check shadow checkmark)
                      (statements `((trace-early ,field)) (cons `(early-rtd? #t) config))]
                     [else #f])
                   (statements (cdr l) (cons `(copy-extra-rtd ,field) config)))]
@@ -1689,7 +1704,7 @@
                (statements (cons `(copy-bytes ,offset (* ptr_bytes ,len))
                                  (cdr l))
                            config)]
-              [(sweep measure sweep-in-old check shadow self-test)
+              [(sweep measure sweep-in-old check shadow checkmark self-test)
                (code
                 (loop-over-pointers
                  (field-expression offset config "p" #t)
@@ -2122,8 +2137,11 @@
                  [else "1"])
                (if (eq? purity/kind 'reference) "1" "0")
                (expression '_ config))]
-      [(eq? mode 'shadow)
-       (format "shadow_pointer(~a);"
+      [(memq mode '(shadow checkmark))
+       (format "~a(~a);"
+               (if (eq? mode 'shadow)
+                   "shadow_pointer"
+                   "shadow_expected_pointer")
                (reference->object (field-expression field config "p" #f)))]
       [else #f]))
 
@@ -2596,6 +2614,8 @@
                              `((mode check))))
        (print-code (generate "shadow_object"
                              `((mode shadow))))
+       (print-code (generate "checkmark_object"
+                             `((mode checkmark))))
        (print-code (generate "size_object"
                              `((mode size)))))))
 

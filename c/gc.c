@@ -979,7 +979,11 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
     }
 
    /* perform after ScanDirty */
-    if (S_checkheap) S_check_heap(0, MAX_CG);
+    if (S_checkheap) {
+      S_checkheap_begin_mark_check(MAX_CG, count_roots_ls);
+      S_check_heap(0, MAX_CG);
+      S_checkheap_finish_mark_check();
+    }
 
 #ifdef DEBUG
 (void)printf("max_cg = %x;  go? ", MAX_CG); (void)fflush(stdout); (void)getc(stdin);
@@ -1327,6 +1331,8 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
     parallel_sweep_dirty_and_generation(tgc);
 
     teardown_sweepers();
+
+    if (S_checkheap) S_checkheap_verify_mark_check();
 
     pre_finalization_size = target_generation_space_so_far(tgc);
 

@@ -567,11 +567,15 @@ static int maybe_inexactnum_marked(ptr p, seginfo *psi) {
   return 0;
 }
 
+static void shadow_seed_checked_pointer(ptr *pp, ptr p, uptr seg, ISPC s);
+
 static void check_pointer(ptr *pp, IBOOL address_is_meaningful, IBOOL is_reference, ptr base, uptr seg, ISPC s, IBOOL aftergc) {
   ptr p = *pp;
 
   if (is_reference)
     p = S_maybe_reference_to_object(p);
+
+  shadow_seed_checked_pointer(pp, p, seg, s);
 
   if (!FIXMEDIATE(p)) {
     seginfo *psi = MaybeSegInfo(ptr_get_segment(p));
@@ -880,13 +884,22 @@ static void check_continuation_layout(ptr p) {
                        p, base, span);
 }
 
-/* A full post-collection check uses storage that is independent of the
- * collector's mark masks. Object layout is shared with the collector, while
- * roots, worklist state, and visited bits are reconstructed here. */
+/* A full-collection check uses storage that is independent of the collector's
+ * mark masks. Object layout is shared with the collector, while roots,
+ * worklist state, and visited bits are reconstructed here. */
 typedef struct {
   uptr segment;
+  IGEN generation;
   unsigned char *bits;
+  uptr *official_bits;
 } shadow_segment;
+
+typedef struct {
+  ptr object;
+  ptr key;
+  ptr value;
+  IBOOL activated;
+} shadow_ephemeron_entry;
 
 typedef struct {
   shadow_segment *segments;
@@ -895,11 +908,23 @@ typedef struct {
   ptr *work;
   size_t work_capacity;
   size_t work_count;
+  shadow_ephemeron_entry *ephemerons;
+  size_t ephemeron_capacity;
+  size_t ephemeron_count;
+  IGEN maximum_collected_generation;
+  int phase;
 } shadow_state;
 
 static shadow_state shadow;
 
+static void checkmark_object(ptr p);
+
 #define SHADOW_EMPTY_SEGMENT ((uptr)-1)
+#define SHADOW_PHASE_NONE 0
+#define SHADOW_PHASE_PREPARING 1
+#define SHADOW_PHASE_COLLECTING 2
+#define SHADOW_OFFICIAL_WORDS \
+  ((segment_bitmap_bytes + sizeof(uptr) - 1) / sizeof(uptr))
 
 static size_t shadow_segment_hash(uptr segment, size_t capacity) {
   segment ^= segment >> 17;
@@ -920,7 +945,9 @@ static void shadow_rehash(size_t capacity) {
   shadow.segment_count = 0;
   for (i = 0; i < capacity; i += 1) {
     shadow.segments[i].segment = SHADOW_EMPTY_SEGMENT;
+    shadow.segments[i].generation = 0;
     shadow.segments[i].bits = NULL;
+    shadow.segments[i].official_bits = NULL;
   }
 
   if (old_segments != NULL) {
@@ -937,27 +964,40 @@ static void shadow_rehash(size_t capacity) {
   }
 }
 
-static unsigned char *shadow_segment_bits(uptr segment) {
+static shadow_segment *shadow_find_segment(uptr segment, IBOOL create) {
   size_t at;
+  seginfo *si;
 
-  if (shadow.segment_capacity == 0)
+  if (shadow.segment_capacity == 0) {
+    if (!create) return NULL;
     shadow_rehash(64);
-  else if ((shadow.segment_count + 1) * 2 >= shadow.segment_capacity)
+  } else if (create
+             && (shadow.segment_count + 1) * 2 >= shadow.segment_capacity) {
     shadow_rehash(shadow.segment_capacity * 2);
+  }
 
   at = shadow_segment_hash(segment, shadow.segment_capacity);
   while (shadow.segments[at].segment != SHADOW_EMPTY_SEGMENT) {
     if (shadow.segments[at].segment == segment)
-      return shadow.segments[at].bits;
+      return &shadow.segments[at];
     at = (at + 1) & (shadow.segment_capacity - 1);
   }
 
+  if (!create) return NULL;
+  si = MaybeSegInfo(segment);
+  if (si == NULL)
+    S_error_abort("check_heap: cannot shadow an unknown segment");
   shadow.segments[at].bits = (unsigned char *)calloc(1, segment_bitmap_bytes);
   if (shadow.segments[at].bits == NULL)
     S_error_abort("check_heap: cannot allocate shadow-mark bitmap");
   shadow.segments[at].segment = segment;
+  shadow.segments[at].generation = si->generation;
   shadow.segment_count += 1;
-  return shadow.segments[at].bits;
+  return &shadow.segments[at];
+}
+
+static unsigned char *shadow_segment_bits(uptr segment) {
+  return shadow_find_segment(segment, 1)->bits;
 }
 
 static void shadow_push(ptr p) {
@@ -1007,18 +1047,254 @@ static void shadow_pointer(ptr p) {
   shadow_push(p);
 }
 
+static IBOOL shadow_expected_marked(ptr p) {
+  shadow_segment *ss;
+
+  if (FIXMEDIATE(p)) return 1;
+  ss = shadow_find_segment(ptr_get_segment(p), 0);
+  return ss != NULL
+      && (ss->bits[segment_bitmap_byte(p)] & segment_bitmap_bit(p)) != 0;
+}
+
+static void shadow_expected_pointer(ptr p) {
+  seginfo *si;
+  unsigned char *bits;
+  uptr byte;
+  unsigned char bit;
+
+  if (shadow.phase != SHADOW_PHASE_PREPARING
+      || FIXMEDIATE(p)
+      || (si = MaybeSegInfo(ptr_get_segment(p))) == NULL)
+    return;
+
+  if (si->space == space_empty)
+    S_error_abort("check_heap: expected traversal reached empty space");
+
+  bits = shadow_segment_bits(ptr_get_segment(p));
+  byte = segment_bitmap_byte(p);
+  bit = (unsigned char)segment_bitmap_bit(p);
+  if (bits[byte] & bit) return;
+  bits[byte] |= bit;
+  shadow_push(p);
+}
+
+static void shadow_ephemeron(ptr p) {
+  shadow_ephemeron_entry *entries;
+  size_t capacity;
+
+  if (shadow.phase != SHADOW_PHASE_PREPARING) return;
+  if (shadow.ephemeron_count == shadow.ephemeron_capacity) {
+    capacity = shadow.ephemeron_capacity == 0
+                 ? 64 : shadow.ephemeron_capacity * 2;
+    entries = (shadow_ephemeron_entry *)realloc(
+      shadow.ephemerons, capacity * sizeof(shadow_ephemeron_entry));
+    if (entries == NULL)
+      S_error_abort("check_heap: cannot enlarge shadow ephemeron inventory");
+    shadow.ephemerons = entries;
+    shadow.ephemeron_capacity = capacity;
+  }
+  shadow.ephemerons[shadow.ephemeron_count].object = p;
+  shadow.ephemerons[shadow.ephemeron_count].key = Scar(p);
+  shadow.ephemerons[shadow.ephemeron_count].value = Scdr(p);
+  shadow.ephemerons[shadow.ephemeron_count].activated = 0;
+  shadow.ephemeron_count += 1;
+}
+
+static void shadow_weak_pair(ptr p) {
+  (void)p;
+}
+
+static IBOOL shadow_ephemeron_key_live(ptr key) {
+  seginfo *si;
+
+  if (FIXMEDIATE(key)
+      || (si = MaybeSegInfo(ptr_get_segment(key))) == NULL
+      || si->generation > shadow.maximum_collected_generation)
+    return 1;
+  return shadow_expected_marked(key);
+}
+
+static void shadow_drain_expected(void) {
+  for (;;) {
+    size_t i;
+    IBOOL changed = 0;
+
+    while (shadow.work_count != 0)
+      checkmark_object(shadow.work[--shadow.work_count]);
+
+    for (i = 0; i < shadow.ephemeron_count; i += 1) {
+      shadow_ephemeron_entry *entry = &shadow.ephemerons[i];
+      if (!entry->activated && shadow_ephemeron_key_live(entry->key)) {
+        entry->activated = 1;
+        shadow_expected_pointer(entry->value);
+        changed = 1;
+      }
+    }
+    if (!changed && shadow.work_count == 0) break;
+  }
+}
+
 static void shadow_reset(void) {
   size_t i;
 
   for (i = 0; i < shadow.segment_capacity; i += 1)
     if (shadow.segments[i].segment != SHADOW_EMPTY_SEGMENT)
       free(shadow.segments[i].bits);
+  for (i = 0; i < shadow.segment_capacity; i += 1)
+    if (shadow.segments[i].segment != SHADOW_EMPTY_SEGMENT)
+      free(shadow.segments[i].official_bits);
   free(shadow.segments);
   free(shadow.work);
+  free(shadow.ephemerons);
   memset(&shadow, 0, sizeof(shadow));
 }
 
 #include "heapcheck.inc"
+
+static void shadow_seed_checked_pointer(ptr *pp, ptr p, uptr seg, ISPC s) {
+  seginfo *si;
+
+  if (shadow.phase != SHADOW_PHASE_PREPARING
+      || (si = MaybeSegInfo(seg)) == NULL
+      || si->generation != static_generation)
+    return;
+
+  if (s == space_weakpair) {
+    uptr word = ((uptr)TO_PTR(pp) - (uptr)build_ptr(seg, 0)) / sizeof(ptr);
+    if ((word & 1) != 0) shadow_expected_pointer(p);
+  } else if (s == space_ephemeron) {
+    uptr offset = ((uptr)TO_PTR(pp) - (uptr)build_ptr(seg, 0))
+                % size_ephemeron;
+    if (offset == 0)
+      shadow_ephemeron(TYPE(TO_PTR(pp), type_pair));
+  } else {
+    shadow_expected_pointer(p);
+  }
+}
+
+void S_checkheap_begin_mark_check(IGEN mcg, ptr count_roots_ls) {
+  IGEN g;
+  ISPC s;
+  uptr i;
+  ptr ls;
+
+  shadow_reset();
+  if (mcg < S_G.max_nonstatic_generation) return;
+
+  shadow.phase = SHADOW_PHASE_PREPARING;
+  shadow.maximum_collected_generation = mcg;
+
+  for (g = 0; g <= mcg; INCRGEN(g))
+    for (s = 0; s <= max_real_space; s += 1) {
+      seginfo *si;
+      for (si = S_G.occupied_segments[g][s]; si != NULL; si = si->next) {
+        shadow_segment *ss = shadow_find_segment(si->number, 1);
+        ss->official_bits = (uptr *)calloc(SHADOW_OFFICIAL_WORDS,
+                                           sizeof(uptr));
+        if (ss->official_bits == NULL)
+          S_error_abort("check_heap: cannot allocate official-mark bitmap");
+      }
+    }
+
+  shadow_expected_pointer(S_threads);
+  for (i = 0; i < S_G.protect_next; i += 1)
+    shadow_expected_pointer(*S_G.protected[i]);
+  for (g = 0; g <= static_generation; INCRGEN(g))
+    shadow_expected_pointer(S_G.locked_objects[g]);
+
+  if (count_roots_ls != Sfalse)
+    for (ls = count_roots_ls; ls != Snil; ls = Scdr(ls)) {
+      seginfo *si = MaybeSegInfo(ptr_get_segment(ls));
+      if (si == NULL
+          || (si->space != space_weakpair && si->space != space_ephemeron))
+        shadow_expected_pointer(Scar(ls));
+    }
+
+  for (i = 0; i < (uptr)S_G.oblist_length; i += 1) {
+    bucket *b;
+    for (b = S_G.oblist[i]; b != NULL; b = b->next) {
+      ptr sym = b->sym;
+      if (SYMVAL(sym) != sunbound
+          || SYMPLIST(sym) != Snil
+          || SYMSPLIST(sym) != Snil)
+        shadow_expected_pointer(sym);
+    }
+  }
+}
+
+void S_checkheap_finish_mark_check(void) {
+  if (shadow.phase != SHADOW_PHASE_PREPARING) return;
+  shadow_drain_expected();
+  shadow.phase = SHADOW_PHASE_COLLECTING;
+}
+
+void S_checkheap_note_reached(ptr p) {
+  shadow_segment *ss;
+  uptr byte, word, shift, mask, old;
+
+  if (shadow.phase != SHADOW_PHASE_COLLECTING) return;
+  ss = shadow_find_segment(ptr_get_segment(p), 0);
+  if (ss == NULL || ss->official_bits == NULL)
+    S_error_abort("check_heap: collector reached an uninventoried segment");
+
+  byte = segment_bitmap_byte(p);
+  word = byte / sizeof(uptr);
+  shift = (byte % sizeof(uptr)) * 8;
+  mask = ((uptr)segment_bitmap_bit(p)) << shift;
+  do {
+    old = ss->official_bits[word];
+  } while (!COMPARE_AND_SWAP_PTR(&ss->official_bits[word],
+                                  (ptr)old, (ptr)(old | mask)));
+}
+
+void S_checkheap_verify_mark_check(void) {
+  size_t i;
+
+  if (shadow.phase != SHADOW_PHASE_COLLECTING) return;
+  for (i = 0; i < shadow.segment_capacity; i += 1) {
+    shadow_segment *ss = &shadow.segments[i];
+    uptr byte;
+    IBOOL described_segment = 0;
+    if (ss->segment == SHADOW_EMPTY_SEGMENT
+        || ss->generation > shadow.maximum_collected_generation)
+      continue;
+    for (byte = 0; byte < segment_bitmap_bytes; byte += 1) {
+      uptr word = byte / sizeof(uptr);
+      uptr shift = (byte % sizeof(uptr)) * 8;
+      unsigned int official = (unsigned int)
+        ((ss->official_bits[word] >> shift) & 0xff);
+      unsigned int expected = ss->bits[byte];
+      unsigned int missing = expected & ~official;
+      unsigned int extra = official & ~expected;
+      unsigned int bit_index;
+      if ((missing != 0 || extra != 0) && !described_segment) {
+        segment_tell(ss->segment);
+        described_segment = 1;
+      }
+      for (bit_index = 0; bit_index < 8; bit_index += 1) {
+        unsigned int bit = 1U << bit_index;
+        if (missing & bit) {
+          S_checkheap_errors += 1;
+          fprintf(stderr,
+                  "!!! checkmark found reachable object omitted by collector at %p\n",
+                  TO_VOIDP(build_ptr(ss->segment,
+                    ((byte << 3) + bit_index) << log2_ptr_bytes)));
+        }
+      }
+      for (bit_index = 0; bit_index < 8; bit_index += 1) {
+        unsigned int bit = 1U << bit_index;
+        if (extra & bit) {
+          S_checkheap_errors += 1;
+          fprintf(stderr,
+                  "!!! checkmark found unreachable object retained by collector at %p\n",
+                  TO_VOIDP(build_ptr(ss->segment,
+                    ((byte << 3) + bit_index) << log2_ptr_bytes)));
+        }
+      }
+    }
+  }
+  shadow_reset();
+}
 
 static void shadow_check_heap(IGEN mcg) {
   IGEN g;

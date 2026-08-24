@@ -184,6 +184,10 @@ extern ptr S_locked_objects(void);
 extern ptr S_unregister_guardian(ptr tconc);
 extern void S_compact_heap(void);
 extern void S_check_heap(IBOOL aftergc, IGEN target_gen);
+extern void S_checkheap_begin_mark_check(IGEN target_gen, ptr count_roots_ls);
+extern void S_checkheap_finish_mark_check(void);
+extern void S_checkheap_note_reached(ptr p);
+extern void S_checkheap_verify_mark_check(void);
 
 /* gc-011.c */
 extern void S_gc_011(ptr tc);
