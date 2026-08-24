@@ -1140,7 +1140,81 @@
     (#3%$record-set! fiber 11 0)
     (guard (condition [else #t])
       (#3%$native-fiber-try-claim! fiber)
-      #f)))
+      #f))
+  (let ([fiber (#3%$native-fiber-create values values #b100)])
+    ;; Initial entry roots form one indivisible trampoline state.
+    (#3%$record-set! fiber 3 #f)
+    (guard (condition [else #t])
+      (#3%$native-fiber-try-claim! fiber)
+      #f))
+  (let* ([scheduler (#3%$current-native-fiber)]
+         [fiber (#3%$native-fiber-create values values #b100)]
+         [handlers (cons values #f)])
+    ;; A saved handler chain must be proper and acyclic.
+    (#3%$native-fiber-try-claim! fiber)
+    (set-cdr! handlers handlers)
+    (#3%$record-set! fiber 2 handlers)
+    (guard (condition [else #t])
+      (#3%$native-fiber-switch scheduler fiber 'corrupt)
+      #f))
+  (let ([old (#3%$fiber-switch-prohibited-depth)] [rejected? #f])
+    (dynamic-wind
+      (lambda () (#3%$fiber-switch-prohibited-depth -1))
+      (lambda ()
+        (set! rejected?
+          (guard (condition [else #t])
+            (#3%$native-fiber-create values values #b100)
+            #f)))
+      (lambda () (#3%$fiber-switch-prohibited-depth old)))
+    rejected?)
+  (let ([old (#3%$current-native-fiber)] [rejected? #f])
+    (dynamic-wind
+      (lambda () (#3%$current-native-fiber 'invalid))
+      (lambda ()
+        (set! rejected?
+          (guard (condition [else #t])
+            (#3%$native-fiber-create values values #b100)
+            #f)))
+      (lambda () (#3%$current-native-fiber old)))
+    rejected?)
+  (let ([old (#3%$native-fiber-transition)] [rejected? #f])
+    (dynamic-wind
+      (lambda () (#3%$native-fiber-transition #t))
+      (lambda ()
+        (set! rejected?
+          (guard (condition [else #t])
+            (#3%$native-fiber-create values values #b100)
+            #f)))
+      (lambda () (#3%$native-fiber-transition old)))
+    rejected?)
+  (let ([tc (#3%$tc)]
+        [old (#3%$native-fiber-preempt-active)]
+        [rejected? #f])
+    (dynamic-wind
+      (lambda ()
+        (#3%$tc-field 'native-fiber-preempt-active tc 'corrupt))
+      (lambda ()
+        (set! rejected?
+          (guard (condition [else #t])
+            (#3%$native-fiber-create values values #b100)
+            #f)))
+      (lambda ()
+        (#3%$tc-field 'native-fiber-preempt-active tc old)))
+    rejected?)
+  (let ([tc (#3%$tc)] [rejected? #f])
+    (dynamic-wind
+      (lambda ()
+        (#3%$tc-field 'native-fiber-preempt-payload tc 'pending)
+        (#3%$tc-field 'native-fiber-preempt-target tc 'corrupt))
+      (lambda ()
+        (set! rejected?
+          (guard (condition [else #t])
+            (#3%$native-fiber-create values values #b100)
+            #f)))
+      (lambda ()
+        (#3%$tc-field 'native-fiber-preempt-target tc #f)
+        (#3%$tc-field 'native-fiber-preempt-payload tc #f)))
+    rejected?))
 
 (mat native-fiber-single-thread-switch
   (error? (#3%$native-fiber-create values values 0))
