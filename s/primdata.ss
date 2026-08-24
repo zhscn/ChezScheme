@@ -1989,6 +1989,8 @@
   ($native-fiber-try-claim! [flags single-valued])
   ($native-fiber-switch [flags])
   ($native-fiber-finish [flags])
+  ($native-fiber-pin! [flags single-valued])
+  ($native-fiber-unpin! [flags single-valued])
   ($native-fiber-allocate-descriptor [flags single-valued alloc])
   ($native-fiber-make-context [flags single-valued alloc])
   ($native-fiber-switch-entry [flags single-valued])

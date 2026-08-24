@@ -1845,6 +1845,8 @@
 (define $native-fiber-try-claim!)
 (define $native-fiber-switch)
 (define $native-fiber-finish)
+(define $native-fiber-pin!)
+(define $native-fiber-unpin!)
 (define $native-fiber-allocate-descriptor
   (lambda ()
     ($native-fiber-allocate-descriptor)))
@@ -1898,6 +1900,7 @@
 (define native-fiber-commit-transfer!)
 (define native-fiber-exchange)
 (define native-fiber-start)
+(define native-fiber-check-running!)
 
 (set! $native-fiber?
   (lambda (x)
@@ -1962,6 +1965,19 @@
   (lambda ()
     (fx+ (#3%get-thread-id) 1)))
 
+(set! native-fiber-check-running!
+  (lambda (who fiber)
+    (unless ($native-fiber? fiber)
+      ($oops who "~s is not a native fiber" fiber))
+    (let ([control (native-fiber-control fiber)]
+          [owner (native-fiber-current-owner)])
+      (unless (and (eq? fiber ($current-native-fiber))
+                   (fx= (native-fiber-control-state control)
+                        (constant native-fiber-state-running))
+                   (fx= (native-fiber-control-owner control) owner))
+        ($oops who "native fiber ~s is not running on the current native thread"
+          (native-fiber-id fiber))))))
+
 (set! native-fiber-valid-flags?
   (lambda (flags)
     (and (fixnum? flags)
@@ -2015,6 +2031,52 @@
                        #t
                        (loop))))]
             [else #f]))))))
+
+(set! $native-fiber-pin!
+  (lambda (fiber)
+    (native-fiber-check-running! '$native-fiber-pin! fiber)
+    (let ([flags (native-fiber-flags fiber)])
+      (unless (and (fx= (fxlogand flags
+                           (constant native-fiber-flag-scheduler))
+                         0)
+                   (fx= (fxlogand flags
+                           (constant native-fiber-flag-pinned))
+                         0)
+                   (not (fx= (fxlogand flags
+                               (constant native-fiber-flag-migratable))
+                             0)))
+        ($oops '$native-fiber-pin!
+          "native fiber ~s is not an unpinned migratable task"
+          (native-fiber-id fiber))))
+    (native-fiber-flags-set! fiber
+      (fxlogor
+        (fxlogand (native-fiber-flags fiber)
+          (fxlognot (constant native-fiber-flag-migratable)))
+        (constant native-fiber-flag-pinned)))
+    (void)))
+
+(set! $native-fiber-unpin!
+  (lambda (fiber)
+    (native-fiber-check-running! '$native-fiber-unpin! fiber)
+    (let ([flags (native-fiber-flags fiber)])
+      (unless (and (fx= (fxlogand flags
+                           (constant native-fiber-flag-scheduler))
+                         0)
+                   (not (fx= (fxlogand flags
+                               (constant native-fiber-flag-pinned))
+                             0))
+                   (fx= (fxlogand flags
+                           (constant native-fiber-flag-migratable))
+                         0))
+        ($oops '$native-fiber-unpin!
+          "native fiber ~s is not a pinned task"
+          (native-fiber-id fiber))))
+    (native-fiber-flags-set! fiber
+      (fxlogor
+        (fxlogand (native-fiber-flags fiber)
+          (fxlognot (constant native-fiber-flag-pinned)))
+        (constant native-fiber-flag-migratable)))
+    (void)))
 
 (set! native-fiber-check-transfer
   (lambda (who current target)

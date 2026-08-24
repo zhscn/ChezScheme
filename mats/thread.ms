@@ -1766,6 +1766,317 @@
       (for-each thread-join threads)
       (andmap (lambda (result) (eq? result #t)) (vector->list results)))))
 
+(mat native-fiber-cross-thread-migration
+  (let* ([main-scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [current-scheduler main-scheduler]
+         [task #f]
+         [owners '()]
+         [wind-log '()]
+         [root (cons 'native-fiber-migration-root (make-bytevector 4096 42))]
+         [marks-ok? #t])
+    (define (note-owner!)
+      (set! owners (cons (get-thread-id) owners))
+      (set! marks-ok?
+        (and marks-ok?
+             (not (continuation-marks-first
+                    (current-continuation-marks)
+                    'native-fiber-worker
+                    #f)))))
+    (define (yield payload)
+      (note-owner!)
+      (#3%$native-fiber-try-claim! current-scheduler)
+      (let ([transfer
+             (#3%$native-fiber-switch task current-scheduler payload)])
+        (set! current-scheduler (car transfer))
+        (cdr transfer)))
+    (define (resume-on-new-thread payload)
+      (let ([result #f])
+        (thread-join
+          (fork-thread
+            (lambda ()
+              (let ([scheduler (#3%$native-fiber-adopt 0)])
+                (set! result
+                  (and (#3%$native-fiber-try-claim! task)
+                       (with-continuation-mark 'native-fiber-worker scheduler
+                         (#3%$native-fiber-switch scheduler task payload))))))))
+        result))
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (dynamic-wind
+            (lambda () (set! wind-log (cons 'in wind-log)))
+            (lambda ()
+              (let down ([depth 3000])
+                (if (fx= depth 0)
+                    (let ([multi #f])
+                      (let ([phase
+                             (call/cc
+                               (lambda (k)
+                                 (set! multi k)
+                                 'initial))])
+                        (case phase
+                          [(initial) (yield 'first) (multi 'migrated)]
+                          [(migrated) (yield 'second) (multi 'migrated-again)]
+                          [(migrated-again)
+                           (note-owner!)
+                           (and marks-ok?
+                                (eq? (car root) 'native-fiber-migration-root)
+                                (fx= (bytevector-u8-ref (cdr root) 2048) 42)
+                                1)]
+                          [else (error 'native-fiber-cross-thread-migration
+                                  "unexpected continuation phase")])))
+                    (fx+ 1 (down (fx- depth 1))))))
+            (lambda () (set! wind-log (cons 'out wind-log)))))
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! current-scheduler)
+          (#3%$native-fiber-finish fiber current-scheduler outcome))
+        #b100))
+    (#3%$native-fiber-try-claim! task)
+    (let ([first (#3%$native-fiber-switch main-scheduler task 'start)])
+      (and (eq? (car first) task)
+           (eq? (cdr first) 'first)
+           (not (#3%$native-fiber-owner task))
+           (equal? wind-log '(in))
+           (begin
+             (collect (collect-maximum-generation))
+             #t)
+           (let ([second (resume-on-new-thread 'resume-1)])
+             (and (eq? (car second) task)
+                  (eq? (cdr second) 'second)
+                  (not (#3%$native-fiber-owner task))))
+           (begin
+             (collect (collect-maximum-generation))
+             #t)
+           (let ([finished (resume-on-new-thread 'resume-2)])
+             (and (eq? (car finished) task)
+                  (equal? (cdr finished) (cons 'return (fx+ 3000 1)))))
+           (eq? (#3%$native-fiber-state task) 'finished)
+           marks-ok?
+           (equal? wind-log '(out in))
+           (fx= (length (remv (car owners) owners)) 2)
+           (fx= (length owners) 3)))))
+
+(mat native-fiber-many-thread-migration
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [current-scheduler scheduler]
+         [task #f]
+         [n 32])
+    (define (yield value)
+      (#3%$native-fiber-try-claim! current-scheduler)
+      (let ([transfer
+             (#3%$native-fiber-switch task current-scheduler value)])
+        (set! current-scheduler (car transfer))))
+    (define (resume-on-new-thread value)
+      (let ([result #f])
+        (thread-join
+          (fork-thread
+            (lambda ()
+              (let ([worker (#3%$native-fiber-adopt 0)])
+                (set! result
+                  (and (#3%$native-fiber-try-claim! task)
+                       (#3%$native-fiber-switch worker task value)))))))
+        result))
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (let down ([depth 2000])
+            (if (fx= depth 0)
+                (begin
+                  (do ([i 0 (fx+ i 1)])
+                      ((fx= i n))
+                    (yield i))
+                  n)
+                (fx+ 1 (down (fx- depth 1))))))
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! current-scheduler)
+          (#3%$native-fiber-finish fiber current-scheduler outcome))
+        #b100))
+    (#3%$native-fiber-try-claim! task)
+    (let ([first (#3%$native-fiber-switch scheduler task 'start)])
+      (and (eq? (car first) task)
+           (fx= (cdr first) 0)
+           (let loop ([i 1])
+             (cond
+               [(fx= i n)
+                (let ([finished (resume-on-new-thread 'resume)])
+                  (and (eq? (car finished) task)
+                       (equal? (cdr finished)
+                         (cons 'return (fx+ 2000 n)))
+                       (eq? (#3%$native-fiber-state task) 'finished)))]
+               [else
+                (when (fx= (fxlogand i 7) 0)
+                  (collect (collect-maximum-generation)))
+                (let ([yielded (resume-on-new-thread 'resume)])
+                  (and (eq? (car yielded) task)
+                       (fx= (cdr yielded) i)
+                       (not (#3%$native-fiber-owner task))
+                       (loop (fx+ i 1))))]))))))
+
+(mat native-fiber-claim-race
+  (let* ([main-scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [current-scheduler main-scheduler]
+         [task #f]
+         [n 8]
+         [m (make-mutex)]
+         [c (make-condition)]
+         [ready 0]
+         [go? #f]
+         [won (make-vector n #f)]
+         [valid (make-vector n #t)])
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (#3%$native-fiber-try-claim! current-scheduler)
+          (let ([transfer
+                 (#3%$native-fiber-switch task current-scheduler 'parked)])
+            (set! current-scheduler (car transfer))
+            'winner))
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! current-scheduler)
+          (#3%$native-fiber-finish fiber current-scheduler outcome))
+        #b100))
+    (#3%$native-fiber-try-claim! task)
+    (let ([parked (#3%$native-fiber-switch main-scheduler task 'start)])
+      (and (eq? (car parked) task)
+           (eq? (cdr parked) 'parked)
+           (let ([threads
+                  (let loop ([i 0])
+                    (if (fx= i n)
+                        '()
+                        (cons
+                          (fork-thread
+                            (lambda ()
+                              (let ([scheduler (#3%$native-fiber-adopt 0)])
+                                (with-mutex m
+                                  (set! ready (fx+ ready 1))
+                                  (condition-broadcast c)
+                                  (let wait ()
+                                    (unless go?
+                                      (condition-wait c m)
+                                      (wait))))
+                                (when (#3%$native-fiber-try-claim! task)
+                                  (vector-set! won i #t)
+                                  (let ([finished
+                                         (#3%$native-fiber-switch
+                                           scheduler task 'resume)])
+                                    (vector-set! valid i
+                                      (and (eq? (car finished) task)
+                                           (equal? (cdr finished)
+                                             '(return . winner)))))))))
+                          (loop (fx+ i 1)))))])
+             (with-mutex m
+               (let wait ()
+                 (unless (fx= ready n)
+                   (condition-wait c m)
+                   (wait)))
+               (set! go? #t)
+               (condition-broadcast c))
+             (for-each thread-join threads)
+             (and (fx= (length (filter values (vector->list won))) 1)
+                  (andmap values (vector->list valid))
+                  (eq? (#3%$native-fiber-state task) 'finished)))))))
+
+(mat native-fiber-pinned-owner
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [task #f])
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-switch task scheduler 'parked)
+          'done)
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-finish fiber scheduler outcome))
+        #b001))
+    (#3%$native-fiber-try-claim! task)
+    (let ([first (#3%$native-fiber-switch scheduler task 'start)]
+          [foreign-claim #t])
+      (thread-join
+        (fork-thread
+          (lambda ()
+            (#3%$native-fiber-adopt 0)
+            (set! foreign-claim (#3%$native-fiber-try-claim! task)))))
+      (and (eq? (car first) task)
+           (eq? (cdr first) 'parked)
+           (not foreign-claim)
+           (fx= (#3%$native-fiber-owner task) (get-thread-id))
+           (#3%$native-fiber-try-claim! task)
+           (let ([finished (#3%$native-fiber-switch scheduler task 'resume)])
+             (and (eq? (car finished) task)
+                  (equal? (cdr finished) '(return . done))))
+           (eq? (#3%$native-fiber-state task) 'finished)))))
+
+(mat native-fiber-pin-transition
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [current-scheduler scheduler]
+         [task #f]
+         [foreign-claim #t]
+         [duplicate-pin-error? #f]
+         [duplicate-unpin-error? #f])
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (#3%$native-fiber-pin! task)
+          (set! duplicate-pin-error?
+            (guard (c [else #t])
+              (#3%$native-fiber-pin! task)
+              #f))
+          (#3%$native-fiber-try-claim! current-scheduler)
+          (let ([transfer
+                 (#3%$native-fiber-switch task current-scheduler 'pinned)])
+            (set! current-scheduler (car transfer)))
+          (#3%$native-fiber-unpin! task)
+          (set! duplicate-unpin-error?
+            (guard (c [else #t])
+              (#3%$native-fiber-unpin! task)
+              #f))
+          (#3%$native-fiber-try-claim! current-scheduler)
+          (let ([transfer
+                 (#3%$native-fiber-switch task current-scheduler 'migratable)])
+            (set! current-scheduler (car transfer)))
+          'done)
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! current-scheduler)
+          (#3%$native-fiber-finish fiber current-scheduler outcome))
+        #b100))
+    (#3%$native-fiber-try-claim! task)
+    (let ([pinned (#3%$native-fiber-switch scheduler task 'start)])
+      (thread-join
+        (fork-thread
+          (lambda ()
+            (#3%$native-fiber-adopt 0)
+            (set! foreign-claim (#3%$native-fiber-try-claim! task)))))
+      (and (eq? (car pinned) task)
+           (eq? (cdr pinned) 'pinned)
+           (not foreign-claim)
+           duplicate-pin-error?
+           (fx= (#3%$native-fiber-flags task) #b001)
+           (#3%$native-fiber-try-claim! task)
+           (let ([migratable
+                  (#3%$native-fiber-switch scheduler task 'resume)])
+             (and (eq? (car migratable) task)
+                  (eq? (cdr migratable) 'migratable)))
+           (not (#3%$native-fiber-owner task))
+           duplicate-unpin-error?
+           (fx= (#3%$native-fiber-flags task) #b100)
+           (let ([finished #f])
+             (thread-join
+               (fork-thread
+                 (lambda ()
+                   (let ([worker (#3%$native-fiber-adopt 0)])
+                     (set! finished
+                       (and (#3%$native-fiber-try-claim! task)
+                            (#3%$native-fiber-switch worker task 'resume)))))))
+             (and (eq? (car finished) task)
+                  (equal? (cdr finished) '(return . done))))
+           (eq? (#3%$native-fiber-state task) 'finished)))))
+
 (mat wait-for-threads
   (begin
     ;; To avoid breaking later tests that use `(collect)`,
