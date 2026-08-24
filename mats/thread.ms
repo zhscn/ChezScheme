@@ -2141,6 +2141,36 @@
                   (equal? (cdr finished) '(return . done))))
            (eq? (#3%$native-fiber-state task) 'finished)))))
 
+(mat native-fiber-adopt-foreign-callback-boundary
+  (let ([result #f])
+    (let ([thread
+           (fork-thread
+             (lambda ()
+               (let* ([call-callback
+                       (foreign-procedure
+                         "call_for_interrupt_test" (void* int) int)]
+                      [callback
+                       (foreign-callable
+                         (lambda (value)
+                           (let ([depth
+                                  (#3%$fiber-switch-prohibited-depth)])
+                             (guard (condition
+                                      [else
+                                       (set! result
+                                         (and (fx= depth 1)
+                                              (not (#3%$current-native-fiber))))
+                                       value])
+                               (#3%$native-fiber-adopt 0)
+                               (set! result #f)
+                               value)))
+                         (int) int)])
+                 (call-callback
+                   (foreign-callable-entry-point callback)
+                   37)
+                 (keep-live callback))))])
+      (thread-join thread)
+      result)))
+
 (mat native-fiber-engine-boundary
   (let* ([scheduler
           (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]

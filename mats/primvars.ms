@@ -1093,6 +1093,43 @@
               (eq? (#3%$native-fiber-state task) 'finished)
               (eq? (#3%$native-fiber-state scheduler) 'running))]))))
 
+(mat native-fiber-descriptor-reuse
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [rounds 1000]
+         [task #f]
+         [cached-descriptor #f])
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (let loop ([i rounds])
+            (unless (fx= i 0)
+              (#3%$native-fiber-try-claim! scheduler)
+              (#3%$native-fiber-switch task scheduler i)
+              (loop (fx- i 1))))
+          'done)
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-finish fiber scheduler outcome))
+        #b001))
+    (let loop ([remaining rounds])
+      (#3%$native-fiber-try-claim! task)
+      (let* ([transfer
+              (#3%$native-fiber-switch scheduler task 'resume)]
+             [cache (#3%$tc-field 'cached-frame (#3%$tc))])
+        (and (eq? (car transfer) task)
+             cache
+             (or (not cached-descriptor)
+                 (eq? cache cached-descriptor))
+             (begin
+               (unless cached-descriptor
+                 (set! cached-descriptor cache))
+               (if (fx= remaining 0)
+                   (and (equal? (cdr transfer) '(return . done))
+                        (eq? (#3%$native-fiber-state task) 'finished))
+                   (and (fx= (cdr transfer) remaining)
+                        (loop (fx- remaining 1))))))))))
+
 (mat native-fiber-collector-stack
   (parameterize ([#%$enable-check-heap #t]
                  [collect-trip-bytes 256])
