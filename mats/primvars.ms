@@ -1107,6 +1107,41 @@
   (error? (#3%$native-fiber-adopt 16))
   (error? (#3%$native-fiber-adopt 'debug)))
 
+(mat native-fiber-invariant-rejection
+  ;; The record mutation primitives are intentionally unsafe. Use them here
+  ;; to ensure corrupted lifecycle and root metadata is rejected at the same
+  ;; boundaries where the VM would otherwise acquire stack ownership.
+  (let ([fiber (#3%$native-fiber-create values values #b100)])
+    ;; state=new with a nonzero owner
+    (#3%$record-set! fiber 0 #b1000)
+    (guard (condition [else #t])
+      (#3%$native-fiber-try-claim! fiber)
+      #f))
+  (let ([fiber (#3%$native-fiber-create values values #b100)])
+    ;; reserved lifecycle state
+    (#3%$record-set! fiber 0 #b111)
+    (guard (condition [else #t])
+      (#3%$native-fiber-state fiber)
+      #f))
+  (let ([fiber (#3%$native-fiber-create values values #b100)])
+    ;; missing parked-stack descriptor
+    (#3%$record-set! fiber 1 #f)
+    (guard (condition [else #t])
+      (#3%$native-fiber-try-claim! fiber)
+      #f))
+  (let ([fiber (#3%$native-fiber-create values values #b100)])
+    ;; transition scratch must be empty in every externally visible state
+    (#3%$record-set! fiber 6 fiber)
+    (guard (condition [else #t])
+      (#3%$native-fiber-try-claim! fiber)
+      #f))
+  (let ([fiber (#3%$native-fiber-create values values #b100)])
+    ;; task flags must select exactly one of pinned or migratable
+    (#3%$record-set! fiber 11 0)
+    (guard (condition [else #t])
+      (#3%$native-fiber-try-claim! fiber)
+      #f)))
+
 (mat native-fiber-single-thread-switch
   (error? (#3%$native-fiber-create values values 0))
   (error? (#3%$native-fiber-create values values #b101))

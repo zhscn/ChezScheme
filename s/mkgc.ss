@@ -227,6 +227,9 @@
          (copy-stack-length continuation-stack-length continuation-stack-clength)
          (mark one-bit counting-root)]
         [else
+         (case-mode
+          [check (check_continuation_layout _)]
+          [else])
          (copy-clos-code code)
          (copy-stack-length continuation-stack-length continuation-stack-clength)
          (copy continuation-stack-clength)

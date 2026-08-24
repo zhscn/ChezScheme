@@ -627,6 +627,62 @@ static void check_bignum(ptr p) {
     printf("!!! not a bignum %p\n", TO_VOIDP(p));
 }
 
+static void malformed_continuation(ptr p, const char *reason) {
+  fprintf(stderr,
+          "malformed continuation %p: %s"
+          " (stack=%p length="Ptd" clength="Ptd" link=%p ret=%p)\n",
+          TO_VOIDP(p), reason, TO_VOIDP(CONTSTACK(p)),
+          (ptrdiff_t)CONTLENGTH(p), (ptrdiff_t)CONTCLENGTH(p),
+          TO_VOIDP(CONTLINK(p)), TO_VOIDP(CONTRET(p)));
+  S_error_abort("check_heap: malformed continuation");
+}
+
+/* Validate the metadata used to walk a continuation stack before heapcheck
+ * dereferences its return points. */
+static void check_continuation_layout(ptr p) {
+  iptr length = CONTLENGTH(p);
+  iptr clength = CONTCLENGTH(p);
+  uptr base, span, limit, seg, limit_seg;
+  seginfo *first_si, *si;
+
+  if (length == scaled_shot_1_shot_flag) {
+    if (clength != scaled_shot_1_shot_flag)
+      malformed_continuation(p, "shot marker mismatch");
+    return;
+  }
+
+  if (clength < 0
+      || (clength & (ptr_bytes - 1)) != 0
+      || (length != opportunistic_1_shot_flag
+          && (length < clength
+              || (length & (ptr_bytes - 1)) != 0)))
+    malformed_continuation(p, "invalid stack length");
+
+  base = (uptr)CONTSTACK(p);
+  span = (uptr)(length == opportunistic_1_shot_flag ? clength : length);
+  if (base == 0 || (base & (ptr_bytes - 1)) != 0 || base + span < base)
+    malformed_continuation(p, "invalid stack bounds");
+
+  first_si = MaybeSegInfo(addr_get_segment((ptr)base));
+  if (first_si == NULL
+      || (first_si->space != space_new && first_si->space != space_data))
+    malformed_continuation(p, "stack base is not in stack storage");
+
+  limit = base + (span == 0 ? 0 : span - 1);
+  seg = addr_get_segment((ptr)base);
+  limit_seg = addr_get_segment((ptr)limit);
+  for (;;) {
+    si = MaybeSegInfo(seg);
+    if (si == NULL
+        || si->space != first_si->space
+        || si->generation != first_si->generation)
+      malformed_continuation(p, "stack range crosses unrelated storage");
+    if (seg == limit_seg)
+      break;
+    seg += 1;
+  }
+}
+
 #include "heapcheck.inc"
 
 #ifdef PTHREADS

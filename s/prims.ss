@@ -1993,6 +1993,10 @@
 (define native-fiber-check-running!)
 (define native-fiber-check-stable!)
 (define native-fiber-context-valid?)
+(define native-fiber-empty-context-valid?)
+(define native-fiber-control-valid?)
+(define native-fiber-transition-valid?)
+(define native-fiber-check-exchange-plan!)
 
 (set! $native-fiber?
   (lambda (x)
@@ -2102,17 +2106,91 @@
                 (fx>= length 0)
                 (fx>= clength 0)
                 (fx<= clength length)))
-         ($continuation? ($continuation-link context))
+         (let ([link ($continuation-link context)])
+           (and ($continuation? link)
+                (not (eq? link context))))
          (list? ($continuation-winders context))
          (let ([attachments ($continuation-attachments context)])
            (or (not attachments) (list? attachments))))))
 
+(set! native-fiber-empty-context-valid?
+  (lambda (context)
+    ;; A descriptor taken from CACHEDFRAME is poisoned until the raw switch
+    ;; fills every stack field.  Keeping this state recognizable prevents a
+    ;; partially initialized descriptor from becoming a collector root.
+    (and context
+         ($continuation? context)
+         (fx= ($continuation-stack-length context)
+              (constant unscaled-shot-1-shot-flag))
+         (fx= ($continuation-stack-clength context)
+              (constant unscaled-shot-1-shot-flag))
+         (not ($continuation-link context))
+         (list? ($continuation-winders context))
+         (list? ($continuation-attachments context)))))
+
+(set! native-fiber-control-valid?
+  (lambda (control flags stable?)
+    (and (fixnum? control)
+         (fx>= control 0)
+         (native-fiber-valid-flags? flags)
+         (let ([state (native-fiber-control-state control)]
+               [owner (native-fiber-control-owner control)]
+               [pinned?
+                (not (fx= (fxlogand flags
+                              (constant native-fiber-flag-pinned))
+                           0))]
+               [migratable?
+                (not (fx= (fxlogand flags
+                              (constant native-fiber-flag-migratable))
+                           0))])
+           (and (or (not stable?)
+                    (not (or (fx= state (constant native-fiber-state-parking))
+                             (fx= state (constant native-fiber-state-finishing)))))
+                (case state
+                  [(0) (fx= owner 0)]
+                  [(1 2 3 5) (fx> owner 0)]
+                  [(4) (if pinned? (fx> owner 0)
+                           (and migratable? (fx= owner 0)))]
+                  [(6) (fx= owner 0)]
+                  [else #f]))))))
+
+(set! native-fiber-transition-valid?
+  (lambda (flags from to)
+    ;; This table makes stack ownership transfer an executable contract.
+    (and (native-fiber-control-valid? from flags #f)
+         (native-fiber-control-valid? to flags #f)
+         (let ([from-state (native-fiber-control-state from)]
+               [from-owner (native-fiber-control-owner from)]
+               [to-state (native-fiber-control-state to)]
+               [to-owner (native-fiber-control-owner to)])
+           (cond
+             [(or (fx= from-state (constant native-fiber-state-new))
+                  (fx= from-state (constant native-fiber-state-parked)))
+              (and (fx= to-state (constant native-fiber-state-claimed))
+                   (fx> to-owner 0))]
+             [(fx= from-state (constant native-fiber-state-claimed))
+              (and (fx= to-state (constant native-fiber-state-running))
+                   (fx= to-owner from-owner))]
+             [(fx= from-state (constant native-fiber-state-running))
+              (and (or (fx= to-state (constant native-fiber-state-parking))
+                       (fx= to-state (constant native-fiber-state-finishing)))
+                   (fx= to-owner from-owner))]
+             [(fx= from-state (constant native-fiber-state-parking))
+              (and (fx= to-state (constant native-fiber-state-parked))
+                   (if (fx= (fxlogand flags
+                              (constant native-fiber-flag-pinned))
+                            0)
+                       (fx= to-owner 0)
+                       (fx= to-owner from-owner)))]
+             [(fx= from-state (constant native-fiber-state-finishing))
+              (and (fx= to-state (constant native-fiber-state-finished))
+                   (fx= to-owner 0))]
+             [else #f])))))
+
 (set! native-fiber-check-stable!
   (lambda (who fiber)
     ;; This checker runs only outside the noninterruptible exchange. It makes
-    ;; the lifecycle/stack-root agreement explicit in the same way that Go's
-    ;; g-status checks and OCaml's stack_info assertions guard their switch
-    ;; paths.
+    ;; the lifecycle/stack-root agreement explicit at every public boundary.
     (unless ($native-fiber? fiber)
       ($oops who "~s is not a native fiber" fiber))
     (let* ([control (native-fiber-read-control fiber)]
@@ -2133,6 +2211,9 @@
                            (and migratable? (not pinned?)))))
         ($oops who "native fiber ~s has invalid flags ~s"
           (native-fiber-id fiber) flags))
+      (unless (native-fiber-control-valid? control flags #t)
+        ($oops who "native fiber ~s has invalid stable control word ~s"
+          (native-fiber-id fiber) control))
       (unless (and (not (native-fiber-incoming-source fiber))
                    (not (native-fiber-incoming-payload fiber))
                    (not (native-fiber-switch-control fiber))
@@ -2224,6 +2305,11 @@
                  (let ([new (native-fiber-pack-control
                               (constant native-fiber-state-claimed)
                               owner)])
+                   (unless (native-fiber-transition-valid?
+                             (native-fiber-flags fiber) old new)
+                     ($oops '$native-fiber-try-claim!
+                       "native fiber ~s has an invalid claim transition"
+                       (native-fiber-id fiber)))
                    (if ($record-cas! fiber 0 old new)
                        (begin
                          (native-fiber-check-stable! '$native-fiber-try-claim! fiber)
@@ -2309,6 +2395,27 @@
           (native-fiber-id target)))
       owner)))
 
+(set! native-fiber-check-exchange-plan!
+  (lambda (who current target source-context source-switch-control
+           source-commit-control target-switch-control finish?)
+    (let ([current-control (native-fiber-read-control current)]
+          [target-control (native-fiber-read-control target)])
+      (unless (and
+                (native-fiber-transition-valid?
+                  (native-fiber-flags current)
+                  current-control source-switch-control)
+                (native-fiber-transition-valid?
+                  (native-fiber-flags current)
+                  source-switch-control source-commit-control)
+                (native-fiber-transition-valid?
+                  (native-fiber-flags target)
+                  target-control target-switch-control)
+                (if finish?
+                    (not source-context)
+                    (native-fiber-empty-context-valid? source-context))
+                (native-fiber-context-valid? (native-fiber-context target)))
+        ($oops who "invalid native-fiber stack-ownership transition plan")))))
+
 (set! native-fiber-exchange
   (lambda (who current target payload finish?)
     (let* ([owner (native-fiber-check-transfer who current target)]
@@ -2337,6 +2444,9 @@
               (constant native-fiber-state-running) owner)]
            [cache-context?
             (fx= (#3%$generation (native-fiber-context target)) 0)])
+      (native-fiber-check-exchange-plan! who current target source-context
+        source-switch-control source-commit-control target-switch-control
+        finish?)
       ;; The target-side return path balances this call. No Scheme event may
       ;; observe the transition fields between here and the hand-coded entry.
       (disable-interrupts)
