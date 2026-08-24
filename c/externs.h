@@ -390,6 +390,8 @@ extern void S_native_fiber_test_hook_arm(iptr point, iptr mode, iptr action);
 extern void S_native_fiber_test_hook_release(void);
 extern iptr S_native_fiber_test_hook_hit(void);
 extern iptr S_native_fiber_test_hook_saw_gc(void);
+extern void S_native_fiber_test_hook_request_exit(void);
+extern iptr S_native_fiber_test_hook_saw_exit(void);
 extern void S_native_fiber_test_hook_reset(void);
 #ifdef DEFINE_MATHERR
 #include <math.h>

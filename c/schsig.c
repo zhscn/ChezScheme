@@ -33,7 +33,7 @@ static void (*register_modified_signal)(int);
 
 /* Native-fiber transition fault injection is dormant unless a debug fiber
    reaches an explicitly armed point. The state contains no Scheme pointers. */
-static iptr S_native_fiber_test_state[6];
+static iptr S_native_fiber_test_state[8];
 #ifdef PTHREADS
 static s_thread_mutex_t S_native_fiber_test_mutex;
 # define native_fiber_test_lock() \
@@ -50,6 +50,8 @@ static s_thread_mutex_t S_native_fiber_test_mutex;
 #define native_fiber_test_hit S_native_fiber_test_state[3]
 #define native_fiber_test_release S_native_fiber_test_state[4]
 #define native_fiber_test_saw_gc S_native_fiber_test_state[5]
+#define native_fiber_test_exit_requested S_native_fiber_test_state[6]
+#define native_fiber_test_saw_exit S_native_fiber_test_state[7]
 
 void S_native_fiber_test_hook_arm(iptr point, iptr mode, iptr action) {
   native_fiber_test_lock();
@@ -58,6 +60,8 @@ void S_native_fiber_test_hook_arm(iptr point, iptr mode, iptr action) {
   native_fiber_test_hit = 0;
   native_fiber_test_release = 0;
   native_fiber_test_saw_gc = 0;
+  native_fiber_test_exit_requested = 0;
+  native_fiber_test_saw_exit = 0;
   native_fiber_test_point = point;
   native_fiber_test_unlock();
 }
@@ -84,6 +88,20 @@ iptr S_native_fiber_test_hook_saw_gc(void) {
   return saw_gc;
 }
 
+void S_native_fiber_test_hook_request_exit(void) {
+  native_fiber_test_lock();
+  native_fiber_test_exit_requested = 1;
+  native_fiber_test_unlock();
+}
+
+iptr S_native_fiber_test_hook_saw_exit(void) {
+  iptr saw_exit;
+  native_fiber_test_lock();
+  saw_exit = native_fiber_test_saw_exit;
+  native_fiber_test_unlock();
+  return saw_exit;
+}
+
 void S_native_fiber_test_hook_reset(void) {
   native_fiber_test_lock();
   native_fiber_test_point = 0;
@@ -92,6 +110,8 @@ void S_native_fiber_test_hook_reset(void) {
   native_fiber_test_hit = 0;
   native_fiber_test_release = 1;
   native_fiber_test_saw_gc = 0;
+  native_fiber_test_exit_requested = 0;
+  native_fiber_test_saw_exit = 0;
   native_fiber_test_unlock();
 }
 
@@ -107,6 +127,9 @@ static iptr native_fiber_test_hook(iptr point) {
   action = native_fiber_test_action;
   mode = native_fiber_test_mode;
   native_fiber_test_hit = point;
+  /* One arm describes one transition window. Later resume/finish exchanges
+     must not replay the same injected event. */
+  native_fiber_test_point = 0;
   native_fiber_test_unlock();
 
   while (mode != 0) {
@@ -123,6 +146,14 @@ static iptr native_fiber_test_hook(iptr point) {
       native_fiber_test_unlock();
       break;
     }
+    if (mode == 3) {
+      iptr exit_requested;
+      native_fiber_test_lock();
+      exit_requested = native_fiber_test_exit_requested;
+      if (exit_requested) native_fiber_test_saw_exit = 1;
+      native_fiber_test_unlock();
+      if (exit_requested) break;
+    }
 #ifdef PTHREADS
 # ifdef WIN32
     Sleep(0);
@@ -134,6 +165,11 @@ static iptr native_fiber_test_hook(iptr point) {
 #endif
   }
   return action;
+}
+
+static void native_fiber_test_request_timer(ptr tc) {
+  TIMERTICKS(tc) = FIX(0);
+  SOMETHINGPENDING(tc) = Strue;
 }
 
 #ifndef tc_native_fiber_test_active_disp
@@ -718,6 +754,7 @@ void S_handle_event_detour() {
           iptr action = native_fiber_test_hook(2);
           if (action == 3)
             CONTRET(RECORDINSTIT(target, native_fiber_context_index)) = Sfalse;
+          if (action == 6) native_fiber_test_request_timer(tc);
         }
         NATIVEFIBERTRANSITION(tc) = Strue;
         return;
@@ -735,6 +772,8 @@ void S_handle_event_detour() {
 
         if (native_fiber_test_activep(tc, source, target))
           action = native_fiber_test_hook(phase == FIX(1) ? 1 : 3);
+
+        if (action == 6) native_fiber_test_request_timer(tc);
 
         if (phase == FIX(1)) {
           if (action == 4)
@@ -786,9 +825,12 @@ void S_handle_event_detour() {
               && (UNFIX(RECORDINSTIT(source, 11)) & 2) == 0)
             native_fiber_unregister_pinned(tc, source);
 #endif
-          if (native_fiber_test_activep(tc, source, target)
-              && native_fiber_test_hook(4) == 5)
-            RECORDINSTIT(source, native_fiber_switch_control_index) = Strue;
+          if (native_fiber_test_activep(tc, source, target)) {
+            iptr post_action = native_fiber_test_hook(4);
+            if (post_action == 5)
+              RECORDINSTIT(source, native_fiber_switch_control_index) = Strue;
+            if (post_action == 6) native_fiber_test_request_timer(tc);
+          }
           if (RECORDINSTIT(source, native_fiber_switch_control_index) != Sfalse
               || RECORDINSTIT(source, native_fiber_commit_control_index) != Sfalse)
             S_error_abort("native-fiber post-commit source corruption");

@@ -215,6 +215,10 @@ void S_prim_init(void) {
                     (void *)S_native_fiber_test_hook_hit);
     Sforeign_symbol("(cs)native_fiber_test_hook_saw_gc",
                     (void *)S_native_fiber_test_hook_saw_gc);
+    Sforeign_symbol("(cs)native_fiber_test_hook_request_exit",
+                    (void *)S_native_fiber_test_hook_request_exit);
+    Sforeign_symbol("(cs)native_fiber_test_hook_saw_exit",
+                    (void *)S_native_fiber_test_hook_saw_exit);
     Sforeign_symbol("(cs)native_fiber_test_hook_reset",
                     (void *)S_native_fiber_test_hook_reset);
     Sforeign_symbol("(cs)count_size_increments", (void *)S_count_size_increments);

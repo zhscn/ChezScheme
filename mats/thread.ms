@@ -1701,6 +1701,10 @@
   (foreign-procedure "(cs)native_fiber_test_hook_hit" () iptr))
 (define native-fiber-test-hook-saw-gc
   (foreign-procedure "(cs)native_fiber_test_hook_saw_gc" () iptr))
+(define native-fiber-test-hook-request-exit
+  (foreign-procedure "(cs)native_fiber_test_hook_request_exit" () void))
+(define native-fiber-test-hook-saw-exit
+  (foreign-procedure "(cs)native_fiber_test_hook_saw_exit" () iptr))
 (define native-fiber-test-hook-reset
   (foreign-procedure "(cs)native_fiber_test_hook_reset" () void))
 
@@ -1775,6 +1779,97 @@
                        (eq? (#3%$native-fiber-state scheduler) 'finished)))))))
       native-fiber-test-hook-reset)))
 
+(define (native-fiber-run-hook-preemption point)
+  (let ([task #f]
+        [scheduler #f]
+        [first-result #f]
+        [final-result #f]
+        [handler-count 0]
+        [requested? #f])
+    (dynamic-wind
+      (lambda () (native-fiber-test-hook-arm point 1 6))
+      (lambda ()
+        (let ([worker
+               (fork-thread
+                 (lambda ()
+                   (guard (condition
+                            [else
+                             (set! final-result
+                               (cons 'exception
+                                 (with-output-to-string
+                                   (lambda ()
+                                     (display-condition condition)))))])
+                     (parameterize
+                       ([timer-interrupt-handler
+                         (lambda ()
+                           (set! handler-count (fx+ handler-count 1))
+                           (set! requested?
+                             (#3%$native-fiber-preempt
+                               scheduler 'transition-preempted)))])
+                       (set! scheduler (#3%$native-fiber-adopt #b1000))
+                       (set! task
+                         (#3%$native-fiber-create
+                           (lambda () 'done)
+                           (lambda (fiber outcome)
+                             (#3%$native-fiber-try-claim! scheduler)
+                             (#3%$native-fiber-finish
+                               fiber scheduler outcome))
+                           #b1100))
+                       (#3%$native-fiber-try-claim! task)
+                       (set! first-result
+                         (#3%$native-fiber-switch scheduler task 'start))
+                       (when (eq? first-result 'transition-preempted)
+                         (#3%$native-fiber-try-claim! task)
+                         (set! final-result
+                           (#3%$native-fiber-switch
+                             scheduler task 'resume)))))))])
+          (let ([hit? (native-fiber-wait-for-hook point)])
+            (native-fiber-test-hook-release)
+            (thread-join worker)
+            (let ([snapshot
+                   (list hit? requested? handler-count first-result final-result
+                     (and task (#3%$native-fiber-state task))
+                     (and scheduler (#3%$native-fiber-state scheduler)))])
+              (unless (equal? snapshot
+                        '(#t #t 1 transition-preempted
+                          (return . done) finished finished))
+                (error 'native-fiber-run-hook-preemption
+                  "unexpected transition-preemption result"
+                  point snapshot))
+              #t))))
+      native-fiber-test-hook-reset)))
+
+(define (native-fiber-run-hook-exit point)
+  (let ([task #f] [scheduler #f] [result #f])
+    (dynamic-wind
+      (lambda () (native-fiber-test-hook-arm point 3 0))
+      (lambda ()
+        (let ([worker
+               (fork-thread
+                 (lambda ()
+                   (set! scheduler (#3%$native-fiber-adopt #b1000))
+                   (set! task
+                     (#3%$native-fiber-create
+                       (lambda () 'done)
+                       (lambda (fiber outcome)
+                         (#3%$native-fiber-try-claim! scheduler)
+                         (#3%$native-fiber-finish fiber scheduler outcome))
+                       #b1100))
+                   (#3%$native-fiber-try-claim! task)
+                   (set! result
+                     (#3%$native-fiber-switch scheduler task 'start))))])
+          (let ([hit? (native-fiber-wait-for-hook point)])
+            (if hit?
+                (native-fiber-test-hook-request-exit)
+                (native-fiber-test-hook-release))
+            (thread-join worker)
+            (and hit?
+                 (fx= (native-fiber-test-hook-saw-exit) 1)
+                 (equal? result '(return . done))
+                 (eq? (#3%$native-fiber-state task) 'finished)
+                 (eq? (#3%$native-fiber-state scheduler) 'finished)))))
+      native-fiber-test-hook-reset)))
+
 (define (native-fiber-death-test point action expected)
   (define (slurp port)
     (let loop ([chars '()])
@@ -1822,6 +1917,12 @@
 (mat native-fiber-concurrent-gc-handshake
   (andmap (lambda (point) (native-fiber-run-hook-point point #t))
     '(1 2 3 4)))
+
+(mat native-fiber-transition-preemption
+  (andmap native-fiber-run-hook-preemption '(1 2 3 4)))
+
+(mat native-fiber-transition-worker-exit
+  (andmap native-fiber-run-hook-exit '(1 2 3 4)))
 
 (mat native-fiber-transition-death-tests
   (native-fiber-death-test 1 1 "native-fiber source publication raced")
@@ -1889,6 +1990,89 @@
                (eq? (#3%$native-fiber-state task) 'new)
                (not (#3%$native-fiber-owner task))
                (rounds (fx+ round 1)))))))
+
+(mat native-fiber-contended-lifecycle
+  (let* ([main-scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [current-scheduler main-scheduler]
+         [task #f]
+         [round-count 12]
+         [worker-count 6])
+    (define (race-to-resume expected)
+      (let ([m (make-mutex)]
+            [c (make-condition)]
+            [ready 0]
+            [attempted 0]
+            [go? #f]
+            [wins 0]
+            [transfer #f])
+        (let ([threads
+               (let loop ([i 0])
+                 (if (fx= i worker-count)
+                     '()
+                     (cons
+                       (fork-thread
+                         (lambda ()
+                           (let ([scheduler (#3%$native-fiber-adopt 0)])
+                             (with-mutex m
+                               (set! ready (fx+ ready 1))
+                               (condition-broadcast c)
+                               (let wait ()
+                                 (unless go?
+                                   (condition-wait c m)
+                                   (wait))))
+                             (let ([won?
+                                    (#3%$native-fiber-try-claim! task)])
+                               (with-mutex m
+                                 (when won? (set! wins (fx+ wins 1)))
+                                 (set! attempted (fx+ attempted 1))
+                                 (condition-broadcast c)
+                                 (when won?
+                                   (let wait ()
+                                     (unless (fx= attempted worker-count)
+                                       (condition-wait c m)
+                                       (wait)))))
+                               (when won?
+                                 (set! current-scheduler scheduler)
+                                 (set! transfer
+                                   (#3%$native-fiber-switch
+                                     scheduler task expected)))))))
+                       (loop (fx+ i 1)))))])
+          (with-mutex m
+            (let wait ()
+              (unless (fx= ready worker-count)
+                (condition-wait c m)
+                (wait)))
+            (set! go? #t)
+            (condition-broadcast c))
+          (for-each thread-join threads)
+          (and (fx= wins 1)
+               (if (fx= expected round-count)
+                   (equal? transfer '(return . done))
+                   (fx= transfer expected))))))
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (let loop ([i 0])
+            (if (fx= i round-count)
+                'done
+                (begin
+                  (#3%$native-fiber-try-claim! current-scheduler)
+                  (#3%$native-fiber-switch task current-scheduler i)
+                  (loop (fx+ i 1))))))
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! current-scheduler)
+          (#3%$native-fiber-finish fiber current-scheduler outcome))
+        #b100))
+    (#3%$native-fiber-try-claim! task)
+    (and (fx= (#3%$native-fiber-switch main-scheduler task 'start) 0)
+         (let loop ([expected 1])
+           (and (race-to-resume expected)
+                (if (fx= expected round-count)
+                    #t
+                    (loop (fx+ expected 1)))))
+         (eq? (#3%$native-fiber-state task) 'finished)
+         (not (#3%$native-fiber-owner task)))))
 
 (mat native-fiber-claimed-gc-root
   (let* ([task (#3%$native-fiber-create values values #b100)]
@@ -1964,16 +2148,25 @@
          (not (#3%$native-fiber-owner task))
          (eq? (#3%$native-fiber-state scheduler) 'finished)
          (or (not cached-weak) (bwp-object? (car cached-weak)))))
-  (let ([payload (vector 'worker-exit-preemption-root)] [weak #f])
-    (set! weak (weak-cons payload #f))
+  (let ([payload (vector 'worker-exit-preemption-root)]
+        [payload-weak #f]
+        [target-weak #f])
+    (set! payload-weak (weak-cons payload #f))
     (thread-join
       (fork-thread
         (lambda ()
-          (#3%$native-fiber-adopt #b1000)
-          (#3%$tc-field 'native-fiber-preempt-payload (#3%$tc) payload))))
+          (let ([scheduler (#3%$native-fiber-adopt #b1000)])
+            (set! target-weak (weak-cons scheduler #f))
+            ;; Prevent the ordinary event epilogue from consuming this stale
+            ;; request before the fork-thread exit path sanitizes its roots.
+            (disable-interrupts)
+            (#3%$tc-field 'native-fiber-preempt-payload (#3%$tc) payload)
+            (#3%$tc-field 'native-fiber-preempt-target
+              (#3%$tc) scheduler)))))
     (set! payload #f)
     (collect (collect-maximum-generation))
-    (bwp-object? (car weak))))
+    (and (bwp-object? (car payload-weak))
+         (bwp-object? (car target-weak)))))
 
 (mat native-fiber-parallel-collector
   (let* ([n 4]

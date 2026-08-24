@@ -3050,19 +3050,20 @@
 (set! native-fiber-start
   (lambda ()
     ;; A first entry has no suspended switch wrapper in which to balance the
-    ;; source's disable-interrupts call. The raw entry has already committed
-    ;; the transfer before invoking this trampoline.
-    (enable-interrupts)
-    (native-fiber-check-stable-internal!
-      '$native-fiber-start ($current-native-fiber))
+    ;; source's disable-interrupts call. Move the startup procedures from the
+    ;; public fiber record to stack roots before enabling events, so a timer
+    ;; interrupt can publish only the ordinary parked representation.
     (let* ([fiber ($current-native-fiber)]
            [entry (native-fiber-entry fiber)]
            [on-return (native-fiber-on-return fiber)])
       (unless entry
+        (enable-interrupts)
         ($oops '$native-fiber-start "native fiber ~s has no entry procedure"
           (native-fiber-id fiber)))
       (native-fiber-entry-set! fiber #f)
       (native-fiber-on-return-set! fiber #f)
+      (enable-interrupts)
+      (native-fiber-check-stable-internal! '$native-fiber-start fiber)
       (let ([outcome
              (guard (condition [else (cons 'exception condition)])
                (cons 'return (entry)))])
