@@ -1977,7 +1977,7 @@
 
 (define native-fiber-read-control
   (lambda (fiber)
-    ;; The control word is published by the target-side receive path.
+    ;; The control word is published by the raw switch publication block.
     ;; Keep every observation behind one acquire operation instead of relying
     ;; on ordinary record reads.
     (let ([control (native-fiber-control fiber)])
@@ -1988,7 +1988,6 @@
 (define native-fiber-valid-flags?)
 (define native-fiber-task-flags?)
 (define native-fiber-check-transfer)
-(define native-fiber-receive)
 (define native-fiber-exchange)
 (define native-fiber-start)
 (define native-fiber-check-running!)
@@ -2141,6 +2140,11 @@
                    (not (native-fiber-cache-context fiber)))
         ($oops who "native fiber ~s retains transition state"
           (native-fiber-id fiber)))
+      (unless (eq? (eq? state (constant native-fiber-state-running))
+                   (eq? fiber ($current-native-fiber)))
+        ($oops who
+          "native fiber ~s has state ~s inconsistent with the current fiber root"
+          (native-fiber-id fiber) state))
       (case state
         [(0) ; new
          (unless (and (fx= owner 0)
@@ -2348,17 +2352,13 @@
       ;; A collection clears CACHEDFRAME, so only a descriptor still in
       ;; generation zero may enter the cache during the nonallocating exchange.
       (native-fiber-cache-context-set! target cache-context?)
-      (#3%$native-fiber-switch-entry target)
-      (let ([payload (native-fiber-receive)])
+      (let ([payload (#3%$native-fiber-switch-entry target)])
+        ;; The hand-coded entry returns only after the target stack is active,
+        ;; the source stable state is release-published, and every transition
+        ;; root has been cleared.
         (enable-interrupts)
         (native-fiber-check-stable! who ($current-native-fiber))
         payload))))
-
-(set! native-fiber-receive
-  (lambda ()
-    ;; The VM epilogue is a closed, nonallocating, noninterruptible entry. It
-    ;; validates both transient controls before publishing the source.
-    (#3%$native-fiber-switch-entry #f)))
 
 (set! $native-fiber-switch
   (lambda (current target payload)
@@ -2434,8 +2434,8 @@
 (set! native-fiber-start
   (lambda ()
     ;; A first entry has no suspended switch wrapper in which to balance the
-    ;; source's disable-interrupts call.
-    (native-fiber-receive)
+    ;; source's disable-interrupts call. The raw entry has already committed
+    ;; the transfer before invoking this trampoline.
     (enable-interrupts)
     (native-fiber-check-stable! '$native-fiber-start ($current-native-fiber))
     (let* ([fiber ($current-native-fiber)]

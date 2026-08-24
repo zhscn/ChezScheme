@@ -994,6 +994,102 @@
    (error? (trace-output-port (open-input-string "hello")))
  )
 
+(mat native-fiber-transaction-model
+  (let ()
+    ;; Model the interval after the target stack is installed. The old worker
+    ;; publishes the source exactly once; a foreign worker may claim it at any
+    ;; later point while target-only cleanup is still in progress.
+    (define source-state 0)
+    (define source-context 1)
+    (define source-switch 2)
+    (define source-commit 3)
+    (define target-incoming 4)
+    (define target-switch 5)
+    (define target-descriptor 6)
+    (define target-payload 7)
+    (define transition 8)
+    (define source-owner 9)
+    (define (changed state . updates)
+      (let ([next (vector-copy state)])
+        (let loop ([updates updates])
+          (unless (null? updates)
+            (vector-set! next (car updates) (cadr updates))
+            (loop (cddr updates))))
+        next))
+    (define (valid? state)
+      (let ([state-name (vector-ref state source-state)]
+            [owner (vector-ref state source-owner)])
+        (and (vector-ref state source-context)
+             (case state-name
+               [(parking) (= owner 1)]
+               [(parked)
+                (and (= owner 0)
+                     (not (vector-ref state source-switch))
+                     (not (vector-ref state source-commit)))]
+               [(claimed)
+                (and (= owner 2)
+                     (not (vector-ref state source-switch))
+                     (not (vector-ref state source-commit)))]
+               [else #f])
+             (or (vector-ref state transition)
+                 (and (not (vector-ref state target-incoming))
+                      (not (vector-ref state target-switch))
+                      (not (vector-ref state target-descriptor))
+                      (not (vector-ref state target-payload)))))))
+    (define (successors state)
+      (let ([next '()])
+        (define (add! state) (set! next (cons state next)))
+        ;; Publication is ordered: clear source-private scratch, then perform
+        ;; the release publication. No old-worker action after publication
+        ;; writes any source field.
+        (cond
+          [(vector-ref state source-switch)
+           (add! (changed state source-switch #f))]
+          [(vector-ref state source-commit)
+           (add! (changed state source-commit #f))]
+          [(eq? (vector-ref state source-state) 'parking)
+           (add! (changed state source-state 'parked source-owner 0))]
+          [else
+           (cond
+             [(vector-ref state target-incoming)
+              (add! (changed state target-incoming #f))]
+             [(vector-ref state target-switch)
+              (add! (changed state target-switch #f))]
+             [(or (vector-ref state target-descriptor)
+                  (vector-ref state target-payload))
+              (add! (changed state
+                      target-descriptor #f target-payload #f))]
+             [(vector-ref state transition)
+              (add! (changed state transition #f))])])
+        ;; This action is independent of every target-cleanup action above, so
+        ;; the search covers each possible claim/cleanup interleaving.
+        (when (eq? (vector-ref state source-state) 'parked)
+          (add! (changed state source-state 'claimed source-owner 2)))
+        next))
+    (let loop ([work
+                (list
+                  (vector 'parking #t #t #t #t #t #t #t #t 1))]
+               [seen '()]
+               [stable-parked? #f]
+               [stable-claimed? #f])
+      (if (null? work)
+          (and stable-parked? stable-claimed?)
+          (let* ([state (car work)]
+                 [key (vector->list state)])
+            (cond
+              [(member key seen)
+               (loop (cdr work) seen stable-parked? stable-claimed?)]
+              [(not (valid? state)) #f]
+              [else
+               (let ([stable? (not (vector-ref state transition))]
+                     [state-name (vector-ref state source-state)])
+                 (loop (append (successors state) (cdr work))
+                   (cons key seen)
+                   (or stable-parked?
+                       (and stable? (eq? state-name 'parked)))
+                   (or stable-claimed?
+                       (and stable? (eq? state-name 'claimed)))))]))))))
+
 (mat native-fiber-representation
   (not (#3%$native-fiber? #f))
   (let ([fiber (#3%$native-fiber-adopt 0)])
