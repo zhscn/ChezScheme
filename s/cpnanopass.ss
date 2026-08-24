@@ -5233,6 +5233,28 @@
                         ,(make-info-c-simple-call #t
                            (lookup-c-entry handle-event-detour))
                         ,%c-simple-call)))))))
+        (define native-fiber-publish-control
+          (lambda (phase)
+            (with-output-language (L13 Effect)
+              (%seq
+                (set! ,(%tc-ref native-fiber-transition)
+                  (immediate ,(fix phase)))
+                ,(with-saved-ret-reg
+                   (if (fx= phase 1)
+                       (with-saved-scheme-state
+                         (in %ac1)
+                         (out %ts %td %ac0 %cp %xp %yp scheme-args extra-regs)
+                         `(inline
+                            ,(make-info-c-simple-call #t
+                               (lookup-c-entry handle-event-detour))
+                            ,%c-simple-call))
+                       (with-saved-scheme-state
+                         (in)
+                         (out %ts %td %ac0 %ac1 %cp %xp %yp scheme-args extra-regs)
+                         `(inline
+                            ,(make-info-c-simple-call #t
+                               (lookup-c-entry handle-event-detour))
+                            ,%c-simple-call))))))))
         (define-who verify-native-fiber-raw-entry
           (lambda (name le)
             ;; This entry executes while NATIVE-FIBER-TRANSITION is true and
@@ -5616,11 +5638,12 @@
                            (set! ,(%mref ,%xp ,(constant continuation-winders-disp)) ,%ts)
                            (set! ,%ts ,(%tc-ref attachments))
                            (set! ,(%mref ,%xp ,(constant continuation-attachments-disp)) ,%ts)))
-                    (set! ,%ts ,(%mref ,%td ,(constant native-fiber-switch-control-disp)))
-                    (set! ,(%mref ,%td ,(constant native-fiber-control-disp)) ,%ts)
+                    ;; Both transient controls are published with atomic RMWs
+                    ;; by a nonallocating runtime primitive. Keeping CAS out of
+                    ;; this entry avoids the backend's extra unspillable CAS
+                    ;; temporaries on register-constrained architectures.
+                    ,(native-fiber-publish-control 1)
                     (set! ,%xp ,(ref-reg %ac1))
-                    (set! ,%ts ,(%mref ,%xp ,(constant native-fiber-switch-control-disp)))
-                    (set! ,(%mref ,%xp ,(constant native-fiber-control-disp)) ,%ts)
                     (set! ,(%tc-ref current-native-fiber) ,%xp)
                     (set! ,%td ,%xp)
                     (set! ,%xp ,(%mref ,%td ,(constant native-fiber-context-disp)))
@@ -5679,30 +5702,11 @@
                   ;; The target stack is active. Clear every source scratch
                   ;; field before publishing its stable control. The remaining
                   ;; target-only cleanup never mutates the published source.
-                  (set! ,%ts ,(%tc-ref current-native-fiber))
-                  (set! ,%ts
-                    ,(%mref ,%ts ,(constant native-fiber-incoming-source-disp)))
-                  ;; Once SOURCE is loaded, TARGET remains available through
-                  ;; CURRENT-NATIVE-FIBER. Reuse TD for the commit control so
-                  ;; the raw publication path needs only two unspillable
-                  ;; registers and never synthesizes a memory-to-memory move.
-                  (set! ,%td
-                    ,(%mref ,%ts ,(constant native-fiber-commit-control-disp)))
-                  (set! ,%ts ,(%tc-ref current-native-fiber))
-                  (set! ,%ts
-                    ,(%mref ,%ts ,(constant native-fiber-incoming-source-disp)))
-                  (set! ,(%mref ,%ts ,(constant native-fiber-switch-control-disp))
-                    ,(%constant sfalse))
-                  (set! ,(%mref ,%ts ,(constant native-fiber-commit-control-disp))
-                    ,(%constant sfalse))
-                  ,(if-feature pthreads
-                     (constant-case architecture
-                       [(arm32 arm64 riscv64 loongarch64 pb)
-                        `(%seq ,(%inline release-fence))]
-                       [else `(nop)])
-                     `(nop))
-                  (set! ,(%mref ,%ts ,(constant native-fiber-control-disp))
-                    ,%td)
+                  ;; The source's stable parked/finished state is the release
+                  ;; publication record for every preceding stack and root
+                  ;; write. The runtime primitive clears source scratch first,
+                  ;; then performs the release CAS and rejects a second writer.
+                  ,(native-fiber-publish-control 2)
                   (set! ,%td ,(%tc-ref current-native-fiber))
                   (set! ,(%mref ,%td ,(constant native-fiber-incoming-source-disp))
                     ,(%constant sfalse))

@@ -26,6 +26,9 @@ static void s_link_code_object(ptr co, ptr objs);
 static IBOOL s_check_heap_enabledp(void);
 static void s_enable_check_heap(IBOOL b);
 static uptr s_check_heap_errors(void);
+static void s_native_fiber_invariant_failure(void);
+static iptr s_native_fiber_worker_state_mask(void);
+static ptr s_native_fiber_current_root(void);
 
 static void install_library_entry(ptr n, ptr x) {
     if (!Sfixnump(n) || UNFIX(n) < 0 || UNFIX(n) >= library_entry_vector_size)
@@ -198,6 +201,12 @@ void S_prim_init(void) {
     Sforeign_symbol("(cs)check_heap_enabledp", (void *)s_check_heap_enabledp);
     Sforeign_symbol("(cs)enable_check_heap", (void *)s_enable_check_heap);
     Sforeign_symbol("(cs)check_heap_errors", (void *)s_check_heap_errors);
+    Sforeign_symbol("(cs)native_fiber_invariant_failure",
+                    (void *)s_native_fiber_invariant_failure);
+    Sforeign_symbol("(cs)native_fiber_worker_state_mask",
+                    (void *)s_native_fiber_worker_state_mask);
+    Sforeign_symbol("(cs)native_fiber_current_root",
+                    (void *)s_native_fiber_current_root);
     Sforeign_symbol("(cs)count_size_increments", (void *)S_count_size_increments);
     Sforeign_symbol("(cs)lookup_library_entry", (void *)S_lookup_library_entry);
     Sforeign_symbol("(cs)link_code_object", (void *)s_link_code_object);
@@ -345,4 +354,27 @@ static void s_enable_check_heap(IBOOL b) {
 
 static uptr s_check_heap_errors(void) {
   return S_checkheap_errors;
+}
+
+static void s_native_fiber_invariant_failure(void) {
+  S_error_abort("native-fiber internal invariant violated");
+}
+
+static iptr s_native_fiber_worker_state_mask(void) {
+  ptr tc = get_thread_context();
+  ptr depth = FIBERSWITCHPROHIBITEDDEPTH(tc);
+  iptr mask = 0;
+
+  if (!Sfixnump(depth) || UNFIX(depth) < 0) mask |= 1;
+#ifdef tc_native_fiber_transition_disp
+  if (NATIVEFIBERTRANSITION(tc) != Sfalse) mask |= 2;
+  if (NATIVEFIBERPREEMPTACTIVE(tc) != Sfalse
+      && NATIVEFIBERPREEMPTACTIVE(tc) != Strue)
+    mask |= 4;
+#endif
+  return mask;
+}
+
+static ptr s_native_fiber_current_root(void) {
+  return CURRENTNATIVEFIBER(get_thread_context());
 }

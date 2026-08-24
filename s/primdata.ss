@@ -1951,6 +1951,7 @@
   ($constituent?  [sig [(char) -> (boolean)]] [flags pure mifoldable safeongoodargs])
   ($constituent-ports [flags])
   ($continuation? [sig [(ptr) -> (boolean)]] [flags pure unrestricted mifoldable])
+  ($native-fiber-context? [sig [(ptr) -> (boolean)]] [flags pure unrestricted mifoldable])
   ($continuation-link [flags single-valued])
   ($continuation-return-code [flags single-valued])
   ($continuation-return-frame-words [flags single-valued])

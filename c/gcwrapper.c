@@ -637,13 +637,223 @@ static void malformed_continuation(ptr p, const char *reason) {
   S_error_abort("check_heap: malformed continuation");
 }
 
+typedef struct {
+  uptr base;
+  uptr limit;
+  ptr owner;
+  const char *kind;
+} checked_stack_range;
+
+static checked_stack_range *checked_stack_ranges = NULL;
+static size_t checked_stack_range_count = 0;
+static size_t checked_stack_range_capacity = 0;
+
+static IBOOL continuation_objectp(ptr p) {
+  ptr code;
+  seginfo *si;
+
+  if (!Sprocedurep(p)) return 0;
+  code = CLOSCODE(p);
+  si = MaybeSegInfo(ptr_get_segment(code));
+  return si != NULL
+      && si->space == space_code
+      && Scodep(code)
+      && (CODETYPE(code) & (code_flag_continuation << code_flags_offset));
+}
+
+static IBOOL native_fiber_contextp(ptr p) {
+  return continuation_objectp(p)
+      && CODENAME(CLOSCODE(p)) == S_G.native_fiber_context_id;
+}
+
+static void malformed_stack(const char *kind, ptr owner, const char *reason) {
+  fprintf(stderr, "malformed %s stack owned by %p: %s\n",
+          kind, TO_VOIDP(owner), reason);
+  S_error_abort("check_heap: malformed stack");
+}
+
+static void check_stack_storage(const char *kind, ptr owner,
+                                uptr base, uptr span) {
+  uptr seg, limit_seg;
+  seginfo *first_si, *si;
+
+  if (base == 0 || (base & (ptr_bytes - 1)) != 0 || base + span < base)
+    malformed_stack(kind, owner, "invalid stack bounds");
+
+  first_si = MaybeSegInfo(addr_get_segment((ptr)base));
+  if (first_si == NULL
+      || (first_si->space != space_new && first_si->space != space_data))
+    malformed_stack(kind, owner, "stack base is not in stack storage");
+
+  seg = addr_get_segment((ptr)base);
+  limit_seg = addr_get_segment((ptr)(base + (span == 0 ? 0 : span - 1)));
+  for (;;) {
+    si = MaybeSegInfo(seg);
+    if (si == NULL
+        || si->space != first_si->space
+        || si->generation != first_si->generation)
+      malformed_stack(kind, owner, "stack range crosses unrelated storage");
+    if (seg == limit_seg) break;
+    seg += 1;
+  }
+}
+
+static void remember_stack_range(const char *kind, ptr owner,
+                                 uptr base, uptr span) {
+  checked_stack_range *ranges;
+  size_t capacity;
+
+  if (span == 0) return;
+  if (checked_stack_range_count == checked_stack_range_capacity) {
+    capacity = checked_stack_range_capacity == 0
+                 ? 64 : checked_stack_range_capacity * 2;
+    ranges = (checked_stack_range *)realloc(
+      checked_stack_ranges, capacity * sizeof(checked_stack_range));
+    if (ranges == NULL)
+      S_error_abort("check_heap: cannot allocate stack ownership inventory");
+    checked_stack_ranges = ranges;
+    checked_stack_range_capacity = capacity;
+  }
+  checked_stack_ranges[checked_stack_range_count].base = base;
+  checked_stack_ranges[checked_stack_range_count].limit = base + span;
+  checked_stack_ranges[checked_stack_range_count].owner = owner;
+  checked_stack_ranges[checked_stack_range_count].kind = kind;
+  checked_stack_range_count += 1;
+}
+
+static void check_code_address_range(uptr base, uptr span,
+                                     const char *kind, ptr owner) {
+  uptr seg, limit_seg;
+  seginfo *si;
+
+  if (base == 0 || base + span < base)
+    malformed_stack(kind, owner, "invalid return-point header bounds");
+  seg = addr_get_segment((ptr)base);
+  limit_seg = addr_get_segment((ptr)(base + (span == 0 ? 0 : span - 1)));
+  for (;;) {
+    si = MaybeSegInfo(seg);
+    if (si == NULL || si->space != space_code)
+      malformed_stack(kind, owner, "return point is outside code storage");
+    if (seg == limit_seg) break;
+    seg += 1;
+  }
+}
+
+static iptr check_return_point(const char *kind, ptr owner, ptr ret,
+                               IBOOL terminal) {
+  uptr address = (uptr)ret;
+  iptr code_delta, frame_size;
+  ptr code;
+  seginfo *si;
+
+  if (address < size_rp_header)
+    malformed_stack(kind, owner, "invalid return point");
+  check_code_address_range(address - size_rp_header, size_rp_header,
+                           kind, owner);
+
+  code_delta = ENTRYOFFSET(ret)
+             + (iptr)(address - (uptr)TO_PTR(ENTRYOFFSETADDR(ret)));
+  if (code_delta < 0 || (uptr)code_delta > address)
+    malformed_stack(kind, owner, "invalid return-point code offset");
+  code = (ptr)(address - (uptr)code_delta);
+  si = MaybeSegInfo(ptr_get_segment(code));
+  if (si == NULL || si->space != space_code || !Scodep(code))
+    malformed_stack(kind, owner, "return point has no code object");
+  if (address < (uptr)TO_PTR(&CODEIT(code, 0))
+      || address > (uptr)TO_PTR(&CODEIT(code, CODELEN(code))))
+    malformed_stack(kind, owner, "return point lies outside its code object");
+
+  frame_size = ENTRYFRAMESIZE(ret);
+  if (frame_size < 0 || (!terminal && frame_size == 0)
+      || (frame_size & (ptr_bytes - 1)) != 0)
+    malformed_stack(kind, owner, "invalid frame size");
+  return frame_size;
+}
+
+static void check_stack_frames(const char *kind, ptr owner,
+                               uptr base, uptr fp, ptr ret) {
+  while (fp != base) {
+    iptr frame_size = check_return_point(kind, owner, ret, 0);
+    if (fp < base || (uptr)frame_size > fp - base)
+      malformed_stack(kind, owner, "frame extends outside stack bounds");
+    fp -= (uptr)frame_size;
+    ret = *(ptr *)TO_VOIDP(fp);
+  }
+  check_return_point(kind, owner, ret, 1);
+}
+
+static void check_cached_native_fiber_context(ptr tc) {
+  ptr p = CACHEDFRAME(tc);
+  seginfo *si;
+
+  if (p == Sfalse) return;
+  si = (!FIXMEDIATE(p) ? MaybeSegInfo(ptr_get_segment(p)) : NULL);
+  if (si == NULL || si->generation != 0
+      || !continuation_objectp(p)
+      || CONTLENGTH(p) != scaled_shot_1_shot_flag
+      || CONTCLENGTH(p) != scaled_shot_1_shot_flag
+      || (native_fiber_contextp(p)
+          && (CONTSTACK(p) != Sfalse
+              || CONTLINK(p) != Sfalse
+              || CONTRET(p) != Sfalse
+              || CONTWINDERS(p) != Snil
+              || CONTATTACHMENTS(p) != Snil)))
+    malformed_stack("cached native-fiber descriptor", p,
+                    "descriptor is not poisoned or uniquely cacheable");
+}
+
+static void check_worker_stack_geometry(void) {
+  ptr ls;
+
+  for (ls = S_threads; ls != Snil; ls = Scdr(ls)) {
+    ptr tc = (ptr)THREADTC(Scar(ls));
+    uptr base = (uptr)SCHEMESTACK(tc);
+    uptr size = (uptr)SCHEMESTACKSIZE(tc);
+    uptr fp = (uptr)SFP(tc);
+    uptr esp = (uptr)ESP(tc);
+
+    if (size < stack_slop || fp < base || fp >= base + size
+        || esp != base + size - stack_slop)
+      malformed_stack("worker", tc, "invalid base, SFP, ESP, or size");
+    check_stack_storage("worker", tc, base, size);
+    check_stack_frames("worker", tc, base, fp, FRAME(tc, 0));
+    remember_stack_range("worker", tc, base, size);
+    check_cached_native_fiber_context(tc);
+  }
+}
+
+static int compare_stack_ranges(const void *left, const void *right) {
+  const checked_stack_range *a = (const checked_stack_range *)left;
+  const checked_stack_range *b = (const checked_stack_range *)right;
+  return a->base < b->base ? -1 : a->base > b->base ? 1 : 0;
+}
+
+static void check_stack_range_ownership(void) {
+  size_t i;
+
+  qsort(checked_stack_ranges, checked_stack_range_count,
+        sizeof(checked_stack_range), compare_stack_ranges);
+  for (i = 1; i < checked_stack_range_count; i += 1) {
+    checked_stack_range *previous = &checked_stack_ranges[i - 1];
+    checked_stack_range *current = &checked_stack_ranges[i];
+    if (current->base < previous->limit) {
+      fprintf(stderr,
+              "overlapping stack ownership: %s %p [%p,%p) and %s %p [%p,%p)\n",
+              previous->kind, TO_VOIDP(previous->owner),
+              TO_VOIDP(previous->base), TO_VOIDP(previous->limit),
+              current->kind, TO_VOIDP(current->owner),
+              TO_VOIDP(current->base), TO_VOIDP(current->limit));
+      S_error_abort("check_heap: stack ownership alias");
+    }
+  }
+}
+
 /* Validate the metadata used to walk a continuation stack before heapcheck
  * dereferences its return points. */
 static void check_continuation_layout(ptr p) {
   iptr length = CONTLENGTH(p);
   iptr clength = CONTCLENGTH(p);
-  uptr base, span, limit, seg, limit_seg;
-  seginfo *first_si, *si;
+  uptr base, span;
 
   if (length == scaled_shot_1_shot_flag) {
     if (clength != scaled_shot_1_shot_flag)
@@ -660,27 +870,14 @@ static void check_continuation_layout(ptr p) {
 
   base = (uptr)CONTSTACK(p);
   span = (uptr)(length == opportunistic_1_shot_flag ? clength : length);
-  if (base == 0 || (base & (ptr_bytes - 1)) != 0 || base + span < base)
-    malformed_continuation(p, "invalid stack bounds");
-
-  first_si = MaybeSegInfo(addr_get_segment((ptr)base));
-  if (first_si == NULL
-      || (first_si->space != space_new && first_si->space != space_data))
-    malformed_continuation(p, "stack base is not in stack storage");
-
-  limit = base + (span == 0 ? 0 : span - 1);
-  seg = addr_get_segment((ptr)base);
-  limit_seg = addr_get_segment((ptr)limit);
-  for (;;) {
-    si = MaybeSegInfo(seg);
-    if (si == NULL
-        || si->space != first_si->space
-        || si->generation != first_si->generation)
-      malformed_continuation(p, "stack range crosses unrelated storage");
-    if (seg == limit_seg)
-      break;
-    seg += 1;
-  }
+  check_stack_storage("continuation", p, base, span);
+  if ((uptr)clength > span)
+    malformed_continuation(p, "copied stack exceeds storage");
+  check_stack_frames("continuation", p, base, base + (uptr)clength,
+                     CONTRET(p));
+  remember_stack_range(native_fiber_contextp(p)
+                         ? "parked native fiber" : "continuation",
+                       p, base, span);
 }
 
 #include "heapcheck.inc"
@@ -738,6 +935,8 @@ void S_check_heap(IBOOL aftergc, IGEN mcg) {
   uptr nonstatic_segments = 0;
 
   check_dirty();
+  checked_stack_range_count = 0;
+  check_worker_stack_geometry();
 
   {
     ptr ls;
@@ -1105,6 +1304,8 @@ void S_check_heap(IBOOL aftergc, IGEN mcg) {
         check_locked_object(Scar(l), 0, g, aftergc, mcg);
     }
   }
+
+  check_stack_range_ownership();
 
   if (S_checkheap_errors) {
     printf("heap check failed%s\n", (aftergc ? " after gc" : ""));

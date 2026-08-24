@@ -995,6 +995,12 @@
       (trace-pure (tc-handler-stack tc))
       (trace-pure (tc-current-native-fiber tc))
       (trace-pure (tc-fiber-switch-prohibited-depth tc))
+      ;; A deferred preemption request remains live from timer publication
+      ;; until the event epilogue consumes it. Treat both fields as precise
+      ;; roots even though the ordinary window is nonallocating; another
+      ;; collection request may rendezvous at the same event boundary.
+      (trace-pure (tc-native-fiber-preempt-target tc))
+      (trace-pure (tc-native-fiber-preempt-payload tc))
       (case-mode
        [sweep
         (set! (tc-cached-frame tc) Sfalse)]

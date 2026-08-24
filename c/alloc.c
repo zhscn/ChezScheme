@@ -393,8 +393,7 @@ FORCEINLINE void mark_segment_dirty(seginfo *si, IGEN from_g, IGEN to_g) {
   }
 }
 
-void S_dirty_set(ptr *loc, ptr x) {
-  *loc = x;
+void S_dirty_mark(ptr *loc, ptr x) {
   if (!Sfixnump(x)) {
     seginfo *si = SegInfo(addr_get_segment(TO_PTR(loc)));
     if (si->use_marks) {
@@ -414,6 +413,11 @@ void S_dirty_set(ptr *loc, ptr x) {
       }
     }
   }
+}
+
+void S_dirty_set(ptr *loc, ptr x) {
+  *loc = x;
+  S_dirty_mark(loc, x);
 }
 
 /* only called by GC, so no other thread is running */

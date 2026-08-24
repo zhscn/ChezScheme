@@ -737,6 +737,10 @@
 
 (define $continuation? (lambda (x) ($continuation? x)))
 
+(define $native-fiber-context?
+  (lambda (x)
+    ($native-fiber-context? x)))
+
 (define $continuation-stack-length
    (lambda (x)
       (unless ($continuation? x)
@@ -1957,6 +1961,12 @@
   (lambda (target)
     ($native-fiber-switch-entry target)))
 (let ()
+(define native-fiber-invariant-failure
+  (foreign-procedure "(cs)native_fiber_invariant_failure" () void))
+(define native-fiber-worker-state-mask
+  (foreign-procedure "(cs)native_fiber_worker_state_mask" () iptr))
+(define native-fiber-current-root
+  (foreign-procedure "(cs)native_fiber_current_root" () scheme-object))
 (define-record-type (native-fiber-record make-native-fiber-record native-fiber-record?)
   (fields
     (mutable control native-fiber-control native-fiber-control-set!)
@@ -2030,6 +2040,14 @@
 (define native-fiber-preemption-request-valid?)
 (define native-fiber-check-preemption-request!)
 (define native-fiber-check-worker!)
+(define native-fiber-check-stable-internal!)
+(define native-fiber-worker-snapshot
+  (lambda ()
+    ;; Read the physical TC through the VM boundary. Invariant checks must not
+    ;; inherit the type/range assumptions maintained by ordinary parameter
+    ;; setters, since those assumptions are what the checker validates.
+    (values (native-fiber-worker-state-mask)
+            (native-fiber-current-root))))
 
 (set! $native-fiber?
   (lambda (x)
@@ -2093,7 +2111,7 @@
                       (constant native-fiber-flag-scheduler))
                     (native-fiber-allocate-id))])
       ($current-native-fiber fiber)
-      (native-fiber-check-stable! '$native-fiber-adopt fiber)
+      (native-fiber-check-stable-internal! '$native-fiber-adopt fiber)
       fiber)))
 
 (set! native-fiber-current-owner
@@ -2129,22 +2147,65 @@
                (and migratable? (not pinned?)))))))
 
 (set! native-fiber-context-valid?
-  (lambda (context)
-    (and context
-         ($continuation? context)
-         (let ([length ($continuation-stack-length context)]
-               [clength ($continuation-stack-clength context)])
-           (and (fixnum? length)
-                (fixnum? clength)
-                (fx>= length 0)
-                (fx>= clength 0)
-                (fx<= clength length)))
-         (let ([link ($continuation-link context)])
-           (and ($continuation? link)
-                (not (eq? link context))))
-         (list? ($continuation-winders context))
-         (let ([attachments ($continuation-attachments context)])
-           (or (not attachments) (list? attachments))))))
+  (case-lambda
+    [(context) (native-fiber-context-valid? context ($enable-check-heap))]
+    [(context deep?)
+     (define list-shape-valid?
+       (lambda (x)
+         (if deep? (list? x) (or (null? x) (pair? x)))))
+     (define node-valid?
+       (lambda (node)
+         (and ($continuation? node)
+              (let ([length ($continuation-stack-length node)]
+                    [clength ($continuation-stack-clength node)])
+                (and (fixnum? length)
+                     (fixnum? clength)
+                     (or (and (fx>= length 0)
+                              (fx>= clength 0)
+                              (fx<= clength length))
+                         (and (fx= length
+                                  (constant unscaled-shot-1-shot-flag))
+                              (fx= clength
+                                  (constant unscaled-shot-1-shot-flag))))))
+              (list-shape-valid? ($continuation-winders node))
+              (let ([attachments ($continuation-attachments node)])
+                (or (not attachments) (list-shape-valid? attachments))))))
+     (and context
+          ;; Only the private VM entry may own a native-fiber stack. This
+          ;; prevents an ordinary continuation with plausible fields from
+          ;; crossing the raw switch boundary.
+          ($native-fiber-context? context)
+          (node-valid? context)
+          (let ([link ($continuation-link context)])
+            (and ($continuation? link)
+                 (not (eq? link context))))
+          (or (not deep?)
+              ;; Validate the complete underflow chain and reject arbitrary
+              ;; cycles. The outer descriptor is private; linked descriptors
+              ;; are ordinary continuation segments created by stack growth.
+              (let loop ([slow context] [fast context])
+                (define advance
+                  (lambda (node)
+                    (cond
+                      ((eq? node $null-continuation) 'end)
+                      ((not (node-valid? node)) #f)
+                      (else
+                        (let ([link ($continuation-link node)])
+                          (and ($continuation? link) link))))))
+                (let ([fast (advance fast)])
+                  (cond
+                    ((not fast) #f)
+                    ((eq? fast 'end) #t)
+                    (else
+                      (let ([fast (advance fast)]
+                            [slow (advance slow)])
+                        (cond
+                          ((not fast) #f)
+                          ((eq? fast 'end) #t)
+                          ((or (not slow) (eq? slow 'end)) #f)
+                          (else
+                            (and (not (eq? slow fast))
+                                 (loop slow fast)))))))))))]))
 
 (set! native-fiber-empty-context-valid?
   (lambda (context)
@@ -2152,7 +2213,7 @@
     ;; fills every stack field.  Keeping this state recognizable prevents a
     ;; partially initialized descriptor from becoming a collector root.
     (and context
-         ($continuation? context)
+         ($native-fiber-context? context)
          (fx= ($continuation-stack-length context)
               (constant unscaled-shot-1-shot-flag))
          (fx= ($continuation-stack-clength context)
@@ -2221,29 +2282,33 @@
              [else #f])))))
 
 (set! native-fiber-handler-stack-valid?
-  (lambda (stack)
-    ;; Handler stacks are proper, acyclic chains of procedures terminated by
-    ;; #f. Use a tortoise/hare walk so corrupted internal state cannot turn an
-    ;; invariant check into an unbounded traversal.
-    (define valid-node?
-      (lambda (node)
-        (or (not node)
-            (and (pair? node) (procedure? (car node))))))
-    (let loop ([slow stack] [fast stack])
-      (cond
-        [(not fast) #t]
-        [(not (valid-node? fast)) #f]
-        [else
-         (let ([fast (cdr fast)])
-           (cond
-             [(not fast) #t]
-             [(not (valid-node? fast)) #f]
-             [(not (valid-node? slow)) #f]
-             [else
-              (let ([slow (and slow (cdr slow))]
-                    [fast (cdr fast)])
-                (and (not (eq? slow fast))
-                     (loop slow fast)))]))]))))
+  (case-lambda
+    [(stack)
+     (native-fiber-handler-stack-valid? stack ($enable-check-heap))]
+    [(stack deep?)
+     ;; The always-on check covers the current node in O(1). Heap-check mode
+     ;; verifies the complete proper, acyclic procedure chain.
+     (define valid-node?
+       (lambda (node)
+         (or (not node)
+             (and (pair? node) (procedure? (car node))))))
+     (and (valid-node? stack)
+          (or (not deep?)
+              (let loop ([slow stack] [fast stack])
+                (cond
+                  ((not fast) #t)
+                  ((not (valid-node? fast)) #f)
+                  (else
+                    (let ([fast (cdr fast)])
+                      (cond
+                        ((not fast) #t)
+                        ((not (valid-node? fast)) #f)
+                        ((not (valid-node? slow)) #f)
+                        (else
+                          (let ([slow (and slow (cdr slow))]
+                                [fast (cdr fast)])
+                            (and (not (eq? slow fast))
+                                 (loop slow fast)))))))))))]))
 
 (set! native-fiber-transition-scratch-clear?
   (lambda (fiber)
@@ -2306,18 +2371,15 @@
   (lambda (who)
     ;; These fields are worker-owned and are therefore checked as one stable
     ;; snapshot outside the closed exchange.
-    (let ([depth ($fiber-switch-prohibited-depth)]
-          [transition ($native-fiber-transition)]
-          [preempt-active ($native-fiber-preempt-active)]
-          [current ($current-native-fiber)])
-      (unless (and (fixnum? depth) (fx>= depth 0))
-        ($oops who "invalid native-fiber switch-prohibition depth ~s" depth))
-      (when transition
+    (let-values ([(state-mask current)
+                  ($app/no-inline native-fiber-worker-snapshot)])
+      (unless (fx= (fxlogand state-mask 1) 0)
+        ($oops who "invalid native-fiber switch-prohibition depth"))
+      (unless (fx= (fxlogand state-mask 2) 0)
         ($oops who "native-fiber transition is visible at a stable boundary"))
-      (unless (boolean? preempt-active)
+      (unless (fx= (fxlogand state-mask 4) 0)
         ($native-fiber-preempt-active #f)
-        ($oops who "invalid native-fiber preemption-window state ~s"
-          preempt-active))
+        ($oops who "invalid native-fiber preemption-window state"))
       (when current
         (unless ($native-fiber? current)
           ($oops who "the current native-fiber root is malformed"))
@@ -2432,6 +2494,18 @@
            (native-fiber-id fiber) state)])
       (native-fiber-check-worker! who))))
 
+(set! native-fiber-check-stable-internal!
+  (lambda (who fiber)
+    ;; Once ownership or stack publication has committed, an invariant
+    ;; failure cannot be delivered as a recoverable Scheme exception: doing
+    ;; so would expose a half-transitioned fiber to user code.
+    (guard (condition
+             [else
+              (display-condition condition (current-error-port))
+              (newline (current-error-port))
+              (native-fiber-invariant-failure)])
+      (native-fiber-check-stable! who fiber))))
+
 (set! $native-fiber-create
   (lambda (entry on-return flags)
     (unless (procedure? entry)
@@ -2462,6 +2536,11 @@
           (cond
             [(or (fx= state (constant native-fiber-state-new))
                  (fx= state (constant native-fiber-state-parked)))
+             ;; Validate all worker-owned fields before CAS transfers
+             ;; ownership. A malformed object is rejected while its original
+             ;; stable state remains intact; failures after CAS are internal
+             ;; and therefore fatal.
+             (native-fiber-check-stable! '$native-fiber-try-claim! fiber)
              (if (and (not (fx= (fxlogand (native-fiber-flags fiber)
                                            (constant native-fiber-flag-pinned))
                                   0))
@@ -2478,7 +2557,8 @@
                        (native-fiber-id fiber)))
                    (if ($record-cas! fiber 0 old new)
                        (begin
-                         (native-fiber-check-stable! '$native-fiber-try-claim! fiber)
+                         (native-fiber-check-stable-internal!
+                           '$native-fiber-try-claim! fiber)
                          #t)
                        (loop))))]
             [else #f]))))))
@@ -2504,7 +2584,7 @@
         (fxlogand (native-fiber-flags fiber)
           (fxlognot (constant native-fiber-flag-migratable)))
         (constant native-fiber-flag-pinned)))
-    (native-fiber-check-stable! '$native-fiber-pin! fiber)
+    (native-fiber-check-stable-internal! '$native-fiber-pin! fiber)
     (void)))
 
 (set! $native-fiber-unpin!
@@ -2528,7 +2608,7 @@
         (fxlogand (native-fiber-flags fiber)
           (fxlognot (constant native-fiber-flag-pinned)))
         (constant native-fiber-flag-migratable)))
-    (native-fiber-check-stable! '$native-fiber-unpin! fiber)
+    (native-fiber-check-stable-internal! '$native-fiber-unpin! fiber)
     (void)))
 
 (set! native-fiber-check-transfer
@@ -2633,7 +2713,7 @@
         ;; the source stable state is release-published, and every transition
         ;; root has been cleared.
         (enable-interrupts)
-        (native-fiber-check-stable! who ($current-native-fiber))
+        (native-fiber-check-stable-internal! who ($current-native-fiber))
         payload))))
 
 (set! $native-fiber-switch
@@ -2723,7 +2803,8 @@
     ;; source's disable-interrupts call. The raw entry has already committed
     ;; the transfer before invoking this trampoline.
     (enable-interrupts)
-    (native-fiber-check-stable! '$native-fiber-start ($current-native-fiber))
+    (native-fiber-check-stable-internal!
+      '$native-fiber-start ($current-native-fiber))
     (let* ([fiber ($current-native-fiber)]
            [entry (native-fiber-entry fiber)]
            [on-return (native-fiber-on-return fiber)])

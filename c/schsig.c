@@ -533,8 +533,63 @@ void S_handle_event_detour() {
     iptr argcnt, stack_avail, i;
 
 #ifdef tc_native_fiber_transition_disp
-    if (NATIVEFIBERTRANSITION(tc) == Strue)
+    if (NATIVEFIBERTRANSITION(tc) != Sfalse) {
+      ptr phase = NATIVEFIBERTRANSITION(tc);
+      enum {
+        native_fiber_control_index = 0,
+        native_fiber_incoming_source_index = 6,
+        native_fiber_switch_control_index = 8,
+        native_fiber_commit_control_index = 9
+      };
+
+      if (phase == FIX(1) || phase == FIX(2)) {
+        ptr source, target, control, old_control;
+        ptr *field;
+
+        target = phase == FIX(1) ? AC1(tc) : CURRENTNATIVEFIBER(tc);
+        source = phase == FIX(1)
+                   ? CURRENTNATIVEFIBER(tc)
+                   : RECORDINSTIT(target, native_fiber_incoming_source_index);
+
+        if (phase == FIX(1)) {
+          control = RECORDINSTIT(source, native_fiber_switch_control_index);
+          field = &RECORDINSTIT(source, native_fiber_control_index);
+          old_control = *field;
+          /* The CAS is the release publication. Mark the destination card
+             first so a younger control remains visible to a generational
+             collection as soon as another worker can observe it. */
+          S_dirty_mark(field, control);
+          if (!COMPARE_AND_SWAP_PTR(field, TO_VOIDP(old_control),
+                                    TO_VOIDP(control)))
+            S_error_abort("native-fiber source publication raced");
+
+          control = RECORDINSTIT(target, native_fiber_switch_control_index);
+          field = &RECORDINSTIT(target, native_fiber_control_index);
+          old_control = *field;
+          S_dirty_mark(field, control);
+          if (!COMPARE_AND_SWAP_PTR(field, TO_VOIDP(old_control),
+                                    TO_VOIDP(control)))
+            S_error_abort("native-fiber target publication raced");
+        } else {
+          control = RECORDINSTIT(source, native_fiber_commit_control_index);
+          /* Clear private transaction state before release-publishing the
+             stable parked/finished control word. */
+          RECORDINSTIT(source, native_fiber_switch_control_index) = Sfalse;
+          RECORDINSTIT(source, native_fiber_commit_control_index) = Sfalse;
+          field = &RECORDINSTIT(source, native_fiber_control_index);
+          old_control = *field;
+          S_dirty_mark(field, control);
+          if (!COMPARE_AND_SWAP_PTR(field, TO_VOIDP(old_control),
+                                    TO_VOIDP(control)))
+            S_error_abort("native-fiber commit publication raced");
+        }
+
+        NATIVEFIBERTRANSITION(tc) = Strue;
+        return;
+      }
+
       S_error_abort("native-fiber transition invariant violated");
+    }
 #endif
 
     argcnt = (iptr)AC0(tc);
@@ -900,6 +955,10 @@ void S_schsig_init(void) {
 
         S_protect(&S_G.null_continuation_id);
         S_G.null_continuation_id = S_intern((const unsigned char *)"$null-continuation");
+
+        S_protect(&S_G.native_fiber_context_id);
+        S_G.native_fiber_context_id =
+          S_intern((const unsigned char *)"native-fiber-context");
 
         S_protect(&S_G.collect_request_pending_id);
         S_G.collect_request_pending_id = S_intern((const unsigned char *)"$collect-request-pending");

@@ -8039,6 +8039,16 @@
       (define-inline 2 $continuation?
         [(e) (bind #t (e)
                (build-continuation?-test e))])
+      (define-inline 2 $native-fiber-context?
+        [(e) (bind #t (e)
+               (build-and
+                 (build-continuation?-test e)
+                 (%inline eq?
+                   ,(%mref ,e ,(constant continuation-code-disp))
+                   (literal
+                     ,(make-info-literal #f 'library
+                        (lookup-libspec native-fiber-context)
+                        (constant code-data-disp))))))])
       (define-inline 2 $assert-continuation
         [(e) (bind #t (e)
                `(if ,(build-and

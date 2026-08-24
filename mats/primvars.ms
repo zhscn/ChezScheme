@@ -1126,9 +1126,25 @@
   (let ([fiber (#3%$native-fiber-create values values #b100)])
     ;; missing parked-stack descriptor
     (#3%$record-set! fiber 1 #f)
-    (guard (condition [else #t])
-      (#3%$native-fiber-try-claim! fiber)
-      #f))
+    (and (guard (condition [else #t])
+           (#3%$native-fiber-try-claim! fiber)
+           #f)
+         ;; Validation precedes the ownership CAS, so rejection cannot poison
+         ;; the otherwise intact lifecycle state.
+         (eq? (#3%$native-fiber-state fiber) 'new)))
+  (let ([fiber (#3%$native-fiber-create values values #b100)]
+        [ordinary-context #f])
+    (call/cc
+      (lambda (k)
+        (set! ordinary-context k)
+        (void)))
+    ;; A generic continuation is not a native stack descriptor even when all
+    ;; of its public continuation metadata is structurally plausible.
+    (#3%$record-set! fiber 1 ordinary-context)
+    (and (guard (condition [else #t])
+           (#3%$native-fiber-try-claim! fiber)
+           #f)
+         (eq? (#3%$native-fiber-state fiber) 'new)))
   (let ([fiber (#3%$native-fiber-create values values #b100)])
     ;; transition scratch must be empty in every externally visible state
     (#3%$record-set! fiber 6 fiber)
@@ -1154,38 +1170,54 @@
     (#3%$native-fiber-try-claim! fiber)
     (set-cdr! handlers handlers)
     (#3%$record-set! fiber 2 handlers)
-    (guard (condition [else #t])
-      (#3%$native-fiber-switch scheduler fiber 'corrupt)
-      #f))
-  (let ([old (#3%$fiber-switch-prohibited-depth)] [rejected? #f])
+    (parameterize ([#%$enable-check-heap #t])
+      (guard (condition [else #t])
+        (#3%$native-fiber-switch scheduler fiber 'corrupt)
+        #f)))
+  (let* ([tc (#3%$tc)]
+         [old (#3%$fiber-switch-prohibited-depth)]
+         [rejected? #f])
     (dynamic-wind
-      (lambda () (#3%$fiber-switch-prohibited-depth -1))
+      (lambda ()
+        (#3%$tc-field 'fiber-switch-prohibited-depth tc -1))
       (lambda ()
         (set! rejected?
           (guard (condition [else #t])
-            (#3%$native-fiber-create values values #b100)
+            (#3%$native-fiber-try-claim!
+              (#3%$native-fiber-create values values #b100))
             #f)))
-      (lambda () (#3%$fiber-switch-prohibited-depth old)))
+      (lambda ()
+        (#3%$tc-field 'fiber-switch-prohibited-depth tc old)))
     rejected?)
-  (let ([old (#3%$current-native-fiber)] [rejected? #f])
+  (let* ([tc (#3%$tc)]
+         [old (#3%$current-native-fiber)]
+         [rejected? #f])
     (dynamic-wind
-      (lambda () (#3%$current-native-fiber 'invalid))
+      (lambda ()
+        (#3%$tc-field 'current-native-fiber tc 'invalid))
       (lambda ()
         (set! rejected?
           (guard (condition [else #t])
-            (#3%$native-fiber-create values values #b100)
+            (#3%$native-fiber-try-claim!
+              (#3%$native-fiber-create values values #b100))
             #f)))
-      (lambda () (#3%$current-native-fiber old)))
+      (lambda ()
+        (#3%$tc-field 'current-native-fiber tc old)))
     rejected?)
-  (let ([old (#3%$native-fiber-transition)] [rejected? #f])
+  (let* ([tc (#3%$tc)]
+         [old (#3%$native-fiber-transition)]
+         [rejected? #f])
     (dynamic-wind
-      (lambda () (#3%$native-fiber-transition #t))
+      (lambda ()
+        (#3%$tc-field 'native-fiber-transition tc #t))
       (lambda ()
         (set! rejected?
           (guard (condition [else #t])
-            (#3%$native-fiber-create values values #b100)
+            (#3%$native-fiber-try-claim!
+              (#3%$native-fiber-create values values #b100))
             #f)))
-      (lambda () (#3%$native-fiber-transition old)))
+      (lambda ()
+        (#3%$tc-field 'native-fiber-transition tc old)))
     rejected?)
   (let ([tc (#3%$tc)]
         [old (#3%$native-fiber-preempt-active)]
@@ -1416,6 +1448,27 @@
                   (cons 'return (fx+ depth (fxquotient (fx* rounds (fx- rounds 1)) 2))))
                 (eq? (#3%$native-fiber-state task) 'finished)
                 (eq? (#3%$native-fiber-state scheduler) 'running))])))))
+
+(mat native-fiber-preemption-gc-roots
+  (parameterize ([#%$enable-check-heap #t])
+    (let* ([tc (#3%$tc)]
+           [payload (vector 'deferred-preemption-payload)]
+           [weak (weak-cons payload #f)])
+      (dynamic-wind
+        (lambda ()
+          (#3%$tc-field 'native-fiber-preempt-payload tc payload))
+        (lambda ()
+          ;; Leave the TC slot as the sole strong reference across a maximal
+          ;; collection. The independent heap walk also verifies that the
+          ;; collector marked the object reached through this root.
+          (set! payload #f)
+          (collect (collect-maximum-generation))
+          (let ([root (#3%$tc-field 'native-fiber-preempt-payload tc)])
+            (and (vector? root)
+                 (eq? (vector-ref root 0) 'deferred-preemption-payload)
+                 (eq? (car weak) root))))
+        (lambda ()
+          (#3%$tc-field 'native-fiber-preempt-payload tc #f))))))
 
 (mat native-fiber-dynamic-unwind
   (let* ([scheduler (#3%$current-native-fiber)]
