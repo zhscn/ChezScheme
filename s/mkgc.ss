@@ -26,6 +26,7 @@
 ;;   - size        : immediate size, so does not recur
 ;;   - measure     : recurs for reachable size
 ;;   - check
+;;   - shadow      : independently mark reachable objects after collection
 
 ;; For the specification, there are a few declaration forms described
 ;; below, such as `trace` to declare a pointer-valued field within an
@@ -179,7 +180,7 @@
        [(copy)
         (set! (ephemeron-prev-ref _copy_) 0)
         (set! (ephemeron-next _copy_) 0)]
-       [(check)
+       [(check shadow)
         (trace pair-car)
         (trace pair-cdr)]
        [else])
@@ -957,7 +958,7 @@
                           (cast iptr (port-buffer _))))
       (trace port-buffer)
       (set! (port-last _) (cast ptr (+ (cast iptr (port-buffer _)) n))))]
-   [(sweep-in-old check)
+   [(sweep-in-old check shadow)
     (when (& (cast uptr _tf_) flag)
       (trace port-buffer))]
    [else
@@ -1075,7 +1076,7 @@
            (set! mask >>= 1)))]
        [else
         (case-mode
-         [(check) (check-bignum num)]
+         [(check shadow) (check-bignum num)]
          [else
           (define n_si : seginfo* (SegInfo (ptr_get_segment num)))
           (cond
@@ -1579,7 +1580,7 @@
                         (code
                          "/* Do not inspect the type or first field of the rtd, because"
                          "   it may have been overwritten for forwarding. */")])]
-                    [(measure sweep sweep-in-old check)
+                    [(measure sweep sweep-in-old check shadow)
                      (statements `((trace-early ,field)) (cons `(early-rtd? #t) config))]
                     [else #f])
                   (statements (cdr l) (cons `(copy-extra-rtd ,field) config)))]
@@ -1688,7 +1689,7 @@
                (statements (cons `(copy-bytes ,offset (* ptr_bytes ,len))
                                  (cdr l))
                            config)]
-              [(sweep measure sweep-in-old check self-test)
+              [(sweep measure sweep-in-old check shadow self-test)
                (code
                 (loop-over-pointers
                  (field-expression offset config "p" #t)
@@ -2121,6 +2122,9 @@
                  [else "1"])
                (if (eq? purity/kind 'reference) "1" "0")
                (expression '_ config))]
+      [(eq? mode 'shadow)
+       (format "shadow_pointer(~a);"
+               (reference->object (field-expression field config "p" #f)))]
       [else #f]))
 
   (define (relocate-statement purity/kind e config)
@@ -2590,6 +2594,8 @@
      (parameterize ([current-output-port (open-output-file ofn 'replace)])
        (print-code (generate "check_object"
                              `((mode check))))
+       (print-code (generate "shadow_object"
+                             `((mode shadow))))
        (print-code (generate "size_object"
                              `((mode size)))))))
 

@@ -1732,8 +1732,6 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
     }
 #endif /* !NO_DIRTY_NEWSPACE_POINTERS */
 
-    if (S_checkheap) S_check_heap(1, MAX_CG);
-
    /* post-collection rehashing of tlcs.
       must come after any use of relocate.
       logically comes after gc is entirely complete */
@@ -1785,6 +1783,8 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
     }
 
     S_resize_oblist();
+
+    if (S_checkheap) S_check_heap(1, MAX_CG);
 
     /* tell profile_release_counters to look for bwp'd counters at least through max_tg */
     if (S_G.prcgeneration < MAX_TG) S_G.prcgeneration = MAX_TG;

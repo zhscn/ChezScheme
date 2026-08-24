@@ -832,6 +832,12 @@ static void sweep(thread_gc *tgc, ptr p, IGEN from_g)
             relocate_pure(&(HANDLERSTACK(tc)));
             relocate_pure(&(CURRENTNATIVEFIBER(tc)));
             relocate_pure(&(FIBERSWITCHPROHIBITEDDEPTH(tc)));
+            relocate_pure(&(NATIVEFIBERCLAIMED(tc)));
+            relocate_pure(&(NATIVEFIBERCLAIMEDCONTROL(tc)));
+            relocate_pure(&(NATIVEFIBERPINNEDHEAD(tc)));
+            relocate_pure(&(NATIVEFIBERTESTACTIVE(tc)));
+            relocate_pure(&(NATIVEFIBERPREEMPTTARGET(tc)));
+            relocate_pure(&(NATIVEFIBERPREEMPTPAYLOAD(tc)));
             CACHEDFRAME(tc) = Sfalse;
             {
               ptr xcp = FRAME(tc, 0);
@@ -1479,6 +1485,12 @@ static void sweep_object_in_old(thread_gc *tgc, ptr p)
             relocate_pure(&(HANDLERSTACK(tc)));
             relocate_pure(&(CURRENTNATIVEFIBER(tc)));
             relocate_pure(&(FIBERSWITCHPROHIBITEDDEPTH(tc)));
+            relocate_pure(&(NATIVEFIBERCLAIMED(tc)));
+            relocate_pure(&(NATIVEFIBERCLAIMEDCONTROL(tc)));
+            relocate_pure(&(NATIVEFIBERPINNEDHEAD(tc)));
+            relocate_pure(&(NATIVEFIBERTESTACTIVE(tc)));
+            relocate_pure(&(NATIVEFIBERPREEMPTTARGET(tc)));
+            relocate_pure(&(NATIVEFIBERPREEMPTPAYLOAD(tc)));
             {
               ptr xcp = FRAME(tc, 0);
               {
@@ -2364,6 +2376,12 @@ static void sweep_thread(thread_gc *tgc, ptr p)
         relocate_pure(&(HANDLERSTACK(tc)));
         relocate_pure(&(CURRENTNATIVEFIBER(tc)));
         relocate_pure(&(FIBERSWITCHPROHIBITEDDEPTH(tc)));
+        relocate_pure(&(NATIVEFIBERCLAIMED(tc)));
+        relocate_pure(&(NATIVEFIBERCLAIMEDCONTROL(tc)));
+        relocate_pure(&(NATIVEFIBERPINNEDHEAD(tc)));
+        relocate_pure(&(NATIVEFIBERTESTACTIVE(tc)));
+        relocate_pure(&(NATIVEFIBERPREEMPTTARGET(tc)));
+        relocate_pure(&(NATIVEFIBERPREEMPTPAYLOAD(tc)));
         CACHEDFRAME(tc) = Sfalse;
         {
           ptr xcp = FRAME(tc, 0);

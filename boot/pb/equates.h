@@ -337,7 +337,7 @@ typedef uint64_t U64;
 #define int_bits 0x20
 #define integer_divide_instruction 1
 #define keyboard_interrupt_index 0x3
-#define library_entry_vector_size 0x282
+#define library_entry_vector_size 0x28A
 #define libspec_closure_index 0xD
 #define libspec_does_not_expect_headroom_index 0x0
 #define libspec_error_index 0xE
@@ -528,6 +528,8 @@ typedef uint64_t U64;
 #define most_positive_fixnum (iptr)0xFFFFFFFFFFFFFFF
 #define nan_single_comparison_truep 1
 #define native_endianness unknown
+#define native_fiber_cache_context_disp 0x59
+#define native_fiber_commit_control_disp 0x51
 #define native_fiber_context_disp 0x11
 #define native_fiber_control_disp 0x9
 #define native_fiber_entry_disp 0x21
@@ -535,11 +537,15 @@ typedef uint64_t U64;
 #define native_fiber_flag_migratable 0x4
 #define native_fiber_flag_pinned 0x1
 #define native_fiber_flag_scheduler 0x2
-#define native_fiber_flags_disp 0x31
+#define native_fiber_flags_disp 0x61
 #define native_fiber_flags_mask 0xF
 #define native_fiber_handler_stack_disp 0x19
-#define native_fiber_id_disp 0x39
+#define native_fiber_id_disp 0x69
+#define native_fiber_incoming_payload_disp 0x41
+#define native_fiber_incoming_source_disp 0x39
 #define native_fiber_on_return_disp 0x29
+#define native_fiber_pinned_next_disp 0x71
+#define native_fiber_starter_disp 0x31
 #define native_fiber_state_bits 0x3
 #define native_fiber_state_claimed 0x1
 #define native_fiber_state_finished 0x6
@@ -549,6 +555,7 @@ typedef uint64_t U64;
 #define native_fiber_state_parked 0x4
 #define native_fiber_state_parking 0x3
 #define native_fiber_state_running 0x2
+#define native_fiber_switch_control_disp 0x49
 #define native_fiber_type_disp 0x1
 #define never_immutable_flag 0x0
 #define one_shot_headroom 0xC00
@@ -1083,7 +1090,7 @@ typedef uint64_t U64;
 #define size_forward 0x10
 #define size_guardian_entry 0x30
 #define size_inexactnum 0x20
-#define size_native_fiber 0x40
+#define size_native_fiber 0x80
 #define size_pair 0x10
 #define size_phantom 0x10
 #define size_port 0x50
@@ -1093,7 +1100,7 @@ typedef uint64_t U64;
 #define size_rp_header 0x20
 #define size_rtd_counts 0x810
 #define size_symbol 0x30
-#define size_tc 0x7F0
+#define size_tc 0x830
 #define size_thread 0x10
 #define size_tlc 0x20
 #define size_typed_object 0x10
@@ -1195,6 +1202,14 @@ typedef uint64_t U64;
 #define tc_keyboard_interrupt_pending_disp 0x1E0
 #define tc_lz4_out_buffer_disp 0x2A0
 #define tc_meta_level_disp 0x240
+#define tc_native_fiber_claimed_control_disp 0x7F8
+#define tc_native_fiber_claimed_disp 0x7F0
+#define tc_native_fiber_pinned_head_disp 0x800
+#define tc_native_fiber_preempt_active_disp 0x810
+#define tc_native_fiber_preempt_payload_disp 0x820
+#define tc_native_fiber_preempt_target_disp 0x818
+#define tc_native_fiber_test_active_disp 0x808
+#define tc_native_fiber_transition_disp 0x7E8
 #define tc_optimize_level_disp 0x268
 #define tc_parameters_disp 0x2B8
 #define tc_pb_call_arena_disp 0x3D0
@@ -1652,6 +1667,14 @@ typedef uint64_t U64;
 #define KEYBOARDINTERRUPTPENDING(x) (*((ptr *)TO_VOIDP((uptr)(x)+480)))
 #define LZ4OUTBUFFER(x) (*((xptr *)TO_VOIDP((uptr)(x)+672)))
 #define METALEVEL(x) (*((ptr *)TO_VOIDP((uptr)(x)+576)))
+#define NATIVEFIBERCLAIMED(x) (*((ptr *)TO_VOIDP((uptr)(x)+2032)))
+#define NATIVEFIBERCLAIMEDCONTROL(x) (*((ptr *)TO_VOIDP((uptr)(x)+2040)))
+#define NATIVEFIBERPINNEDHEAD(x) (*((ptr *)TO_VOIDP((uptr)(x)+2048)))
+#define NATIVEFIBERPREEMPTACTIVE(x) (*((ptr *)TO_VOIDP((uptr)(x)+2064)))
+#define NATIVEFIBERPREEMPTPAYLOAD(x) (*((ptr *)TO_VOIDP((uptr)(x)+2080)))
+#define NATIVEFIBERPREEMPTTARGET(x) (*((ptr *)TO_VOIDP((uptr)(x)+2072)))
+#define NATIVEFIBERTESTACTIVE(x) (*((ptr *)TO_VOIDP((uptr)(x)+2056)))
+#define NATIVEFIBERTRANSITION(x) (*((ptr *)TO_VOIDP((uptr)(x)+2024)))
 #define OPTIMIZELEVEL(x) (*((ptr *)TO_VOIDP((uptr)(x)+616)))
 #define PARAMETERS(x) (*((ptr *)TO_VOIDP((uptr)(x)+696)))
 #define PBCALLARENA(x,i) (((uptr *)TO_VOIDP((uptr)(x)+976))[i])
@@ -1688,5 +1711,5 @@ typedef uint64_t U64;
 /* library entries we access from C code */
 #define library_nonprocedure_code 162
 #define library_dounderflow 164
-#define library_popcount_slow 638
-#define library_cpu_features 640
+#define library_popcount_slow 646
+#define library_cpu_features 648

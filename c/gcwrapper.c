@@ -880,7 +880,185 @@ static void check_continuation_layout(ptr p) {
                        p, base, span);
 }
 
+/* A full post-collection check uses storage that is independent of the
+ * collector's mark masks. Object layout is shared with the collector, while
+ * roots, worklist state, and visited bits are reconstructed here. */
+typedef struct {
+  uptr segment;
+  unsigned char *bits;
+} shadow_segment;
+
+typedef struct {
+  shadow_segment *segments;
+  size_t segment_capacity;
+  size_t segment_count;
+  ptr *work;
+  size_t work_capacity;
+  size_t work_count;
+} shadow_state;
+
+static shadow_state shadow;
+
+#define SHADOW_EMPTY_SEGMENT ((uptr)-1)
+
+static size_t shadow_segment_hash(uptr segment, size_t capacity) {
+  segment ^= segment >> 17;
+  segment *= (uptr)0xed5ad4bbU;
+  segment ^= segment >> 11;
+  return (size_t)segment & (capacity - 1);
+}
+
+static void shadow_rehash(size_t capacity) {
+  shadow_segment *old_segments = shadow.segments;
+  size_t old_capacity = shadow.segment_capacity;
+  size_t i;
+
+  shadow.segments = (shadow_segment *)malloc(capacity * sizeof(shadow_segment));
+  if (shadow.segments == NULL)
+    S_error_abort("check_heap: cannot allocate shadow-mark segment table");
+  shadow.segment_capacity = capacity;
+  shadow.segment_count = 0;
+  for (i = 0; i < capacity; i += 1) {
+    shadow.segments[i].segment = SHADOW_EMPTY_SEGMENT;
+    shadow.segments[i].bits = NULL;
+  }
+
+  if (old_segments != NULL) {
+    for (i = 0; i < old_capacity; i += 1) {
+      if (old_segments[i].segment != SHADOW_EMPTY_SEGMENT) {
+        size_t at = shadow_segment_hash(old_segments[i].segment, capacity);
+        while (shadow.segments[at].segment != SHADOW_EMPTY_SEGMENT)
+          at = (at + 1) & (capacity - 1);
+        shadow.segments[at] = old_segments[i];
+        shadow.segment_count += 1;
+      }
+    }
+    free(old_segments);
+  }
+}
+
+static unsigned char *shadow_segment_bits(uptr segment) {
+  size_t at;
+
+  if (shadow.segment_capacity == 0)
+    shadow_rehash(64);
+  else if ((shadow.segment_count + 1) * 2 >= shadow.segment_capacity)
+    shadow_rehash(shadow.segment_capacity * 2);
+
+  at = shadow_segment_hash(segment, shadow.segment_capacity);
+  while (shadow.segments[at].segment != SHADOW_EMPTY_SEGMENT) {
+    if (shadow.segments[at].segment == segment)
+      return shadow.segments[at].bits;
+    at = (at + 1) & (shadow.segment_capacity - 1);
+  }
+
+  shadow.segments[at].bits = (unsigned char *)calloc(1, segment_bitmap_bytes);
+  if (shadow.segments[at].bits == NULL)
+    S_error_abort("check_heap: cannot allocate shadow-mark bitmap");
+  shadow.segments[at].segment = segment;
+  shadow.segment_count += 1;
+  return shadow.segments[at].bits;
+}
+
+static void shadow_push(ptr p) {
+  ptr *work;
+  size_t capacity;
+
+  if (shadow.work_count == shadow.work_capacity) {
+    capacity = shadow.work_capacity == 0 ? 1024 : shadow.work_capacity * 2;
+    work = (ptr *)realloc(shadow.work, capacity * sizeof(ptr));
+    if (work == NULL)
+      S_error_abort("check_heap: cannot enlarge shadow-mark worklist");
+    shadow.work = work;
+    shadow.work_capacity = capacity;
+  }
+  shadow.work[shadow.work_count++] = p;
+}
+
+static void shadow_pointer(ptr p) {
+  seginfo *si;
+  unsigned char *bits;
+  uptr byte;
+  unsigned char bit;
+
+  if (FIXMEDIATE(p) || (si = MaybeSegInfo(ptr_get_segment(p))) == NULL)
+    return;
+
+  if (si->space == space_empty
+      || si->old_space
+      || (si->marked_mask
+          && !(si->marked_mask[segment_bitmap_byte(p)] & segment_bitmap_bit(p))
+          && !(Sflonump(p)
+               && ((si->space == space_data) || (si->space == space_new))
+               && maybe_inexactnum_marked(p, si)))) {
+    S_checkheap_errors += 1;
+    fprintf(stderr,
+            "!!! shadow marking reached an object rejected by the collector at %p\n",
+            TO_VOIDP(p));
+    segment_tell(ptr_get_segment(p));
+    return;
+  }
+
+  bits = shadow_segment_bits(ptr_get_segment(p));
+  byte = segment_bitmap_byte(p);
+  bit = (unsigned char)segment_bitmap_bit(p);
+  if (bits[byte] & bit) return;
+  bits[byte] |= bit;
+  shadow_push(p);
+}
+
+static void shadow_reset(void) {
+  size_t i;
+
+  for (i = 0; i < shadow.segment_capacity; i += 1)
+    if (shadow.segments[i].segment != SHADOW_EMPTY_SEGMENT)
+      free(shadow.segments[i].bits);
+  free(shadow.segments);
+  free(shadow.work);
+  memset(&shadow, 0, sizeof(shadow));
+}
+
 #include "heapcheck.inc"
+
+static void shadow_check_heap(IGEN mcg) {
+  IGEN g;
+  uptr i;
+  ptr ls;
+
+  if (mcg < S_G.max_nonstatic_generation) return;
+
+  shadow_pointer(S_threads);
+  for (i = 0; i < S_G.protect_next; i += 1)
+    shadow_pointer(*S_G.protected[i]);
+
+  for (g = 0; g <= static_generation; INCRGEN(g)) {
+    shadow_pointer(S_G.locked_objects[g]);
+    shadow_pointer(S_G.unlocked_objects[g]);
+    shadow_pointer(S_G.rtds_with_counts[g]);
+    shadow_pointer(S_G.gcbackreference[g]);
+#ifndef WIN32
+    shadow_pointer(S_child_processes[g]);
+#endif
+    for (ls = S_G.guardians[g]; ls != Snil; ls = GUARDIANNEXT(ls)) {
+      shadow_pointer(GUARDIANREP(ls));
+      shadow_pointer(GUARDIANTCONC(ls));
+    }
+  }
+
+  for (i = 0; i < (uptr)S_G.oblist_length; i += 1) {
+    bucket *b;
+    for (b = S_G.oblist[i]; b != NULL; b = b->next)
+      shadow_pointer(b->sym);
+  }
+
+  while (shadow.work_count != 0)
+    shadow_object(shadow.work[--shadow.work_count]);
+
+  /* The collector may retain objects reached from temporary GC roots that no
+   * longer exist here. The useful independent check is therefore one-way:
+   * every object reachable now must have survived the collector. */
+  shadow_reset();
+}
 
 #ifdef PTHREADS
 
@@ -1306,6 +1484,8 @@ void S_check_heap(IBOOL aftergc, IGEN mcg) {
   }
 
   check_stack_range_ownership();
+
+  if (aftergc) shadow_check_heap(mcg);
 
   if (S_checkheap_errors) {
     printf("heap check failed%s\n", (aftergc ? " after gc" : ""));

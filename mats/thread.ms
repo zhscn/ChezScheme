@@ -2612,6 +2612,284 @@
              (equal? finished '(return . done)))
            (eq? (#3%$native-fiber-state task) 'finished)))))
 
+(mat native-fiber-dead-stack-slots
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [task #f]
+         [running-weak #f]
+         [parked-weak #f])
+    (define (check-running-dead-slot)
+      (let ([dead (vector 'running-dead-slot
+                          (make-bytevector 8192 17))])
+        (set! running-weak (weak-cons dead #f))
+        (unless (eq? (vector-ref dead 0) 'running-dead-slot)
+          (error 'native-fiber-dead-stack-slots "lost running root")))
+      (parameterize ([#%$enable-check-heap #t])
+        (collect (collect-maximum-generation))))
+    (check-running-dead-slot)
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (let ([dead (vector 'parked-dead-slot
+                              (make-bytevector 8192 23))])
+            (set! parked-weak (weak-cons dead #f))
+            (unless (eq? (vector-ref dead 0) 'parked-dead-slot)
+              (error 'native-fiber-dead-stack-slots "lost parked root")))
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-switch task scheduler 'parked)
+          'done)
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-finish fiber scheduler outcome))
+        #b100))
+    (#3%$native-fiber-try-claim! task)
+    (and (eq? (#3%$native-fiber-switch scheduler task 'start) 'parked)
+         (begin
+           (parameterize ([#%$enable-check-heap #t])
+             (collect (collect-maximum-generation)))
+           #t)
+         (bwp-object? (car running-weak))
+         (bwp-object? (car parked-weak))
+         (#3%$native-fiber-try-claim! task)
+         (equal? (#3%$native-fiber-switch scheduler task 'resume)
+                 '(return . done))
+         (eq? (#3%$native-fiber-state task) 'finished))))
+
+(mat native-fiber-stack-shape-matrix
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [current-scheduler scheduler]
+         [task #f]
+         [wide-names
+          (let loop ([i 0])
+            (if (fx= i 96)
+                '()
+                (cons (string->symbol (format "wide-~s" i))
+                      (loop (fx+ i 1)))))]
+         [wide-roots
+          (map (lambda (i) (vector 'wide-root i (make-bytevector 64 i)))
+               (iota 96))]
+         [wide
+          (eval `(lambda (suspend ,@wide-names)
+                   (let ([resume (suspend 'wide)])
+                     (cons resume (list ,@wide-names)))))]
+         [wind-in 0]
+         [wind-out 0]
+         [mark-count 0]
+         [exception-text #f])
+    (define (yield value)
+      (#3%$native-fiber-try-claim! current-scheduler)
+      (#3%$native-fiber-switch task current-scheduler value))
+    (define (wind depth)
+      (with-continuation-mark 'native-fiber-stack-shape depth
+        (dynamic-wind
+          (lambda () (set! wind-in (fx+ wind-in 1)))
+          (lambda ()
+            (if (fx= depth 0)
+                (begin
+                  (set! mark-count
+                    (length
+                      (continuation-marks->list
+                        (current-continuation-marks)
+                        'native-fiber-stack-shape)))
+                  (yield 'wind))
+                (fx+ 1 (wind (fx- depth 1)))))
+          (lambda () (set! wind-out (fx+ wind-out 1))))))
+    (define (deep round depth)
+      (let ([root (vector round depth
+                          (make-bytevector 32 (fxlogand depth 255)))])
+        (if (fx= depth 0)
+            (yield (cons 'deep round))
+            (fx+ (vector-ref root 1) (deep round (fx- depth 1))))))
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (let ([wide-result (apply wide yield wide-roots)])
+            (unless (and (fx= (car wide-result) 7)
+                         (andmap eq? (cdr wide-result) wide-roots))
+              (error 'native-fiber-stack-shape-matrix
+                "non-compact frame roots were corrupted")))
+          (wind 192)
+          (do ([round 0 (fx+ round 1)])
+              ((fx= round 4))
+            (unless (fx= (deep round 6000)
+                         (fx+ 7 (fxquotient (fx* 6000 6001) 2)))
+              (error 'native-fiber-stack-shape-matrix
+                "deep stack result was corrupted" round)))
+          (guard (condition
+                   [else
+                    (set! exception-text
+                      (with-output-to-string
+                        (lambda () (display-condition condition))))])
+            (error 'native-fiber-stack-shape-matrix
+              "stack-shape-backtrace"))
+          (list wind-in wind-out mark-count exception-text))
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! current-scheduler)
+          (#3%$native-fiber-finish fiber current-scheduler outcome))
+        #b100))
+    (#3%$native-fiber-try-claim! task)
+    (let loop ([expected '(wide wind (deep . 0) (deep . 1)
+                                      (deep . 2) (deep . 3))]
+               [transfer
+                (#3%$native-fiber-switch scheduler task 'start)])
+      (cond
+        [(pair? expected)
+         (and (equal? transfer (car expected))
+              (begin
+                (parameterize ([#%$enable-check-heap #t])
+                  (collect (collect-maximum-generation)))
+                #t)
+              (#3%$native-fiber-try-claim! task)
+              (loop (cdr expected)
+                (#3%$native-fiber-switch scheduler task 7)))]
+        [else
+         (and (pair? transfer)
+              (eq? (car transfer) 'return)
+              (let ([result (cdr transfer)])
+                (and (fx= (list-ref result 0) 193)
+                     (fx= (list-ref result 1) 193)
+                     (fx= (list-ref result 2) 193)
+                     (string? (list-ref result 3))
+                     (native-fiber-string-contains?
+                       (list-ref result 3) "stack-shape-backtrace")))
+              (eq? (#3%$native-fiber-state task) 'finished))]))))
+
+(mat native-fiber-foreign-callback-gc
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [call-callback
+          (foreign-procedure "call_for_interrupt_test" (void* int) int)]
+         [task #f]
+         [callback-depth #f]
+         [root-survived? #f])
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (let* ([root (vector 'foreign-callback-root
+                               (make-bytevector 16384 91))]
+                 [callback
+                  (foreign-callable
+                    (lambda (value)
+                      (set! callback-depth
+                        (#3%$fiber-switch-prohibited-depth))
+                      (parameterize ([#%$enable-check-heap #t])
+                        (collect (collect-maximum-generation)))
+                      (set! root-survived?
+                        (and (eq? (vector-ref root 0)
+                                  'foreign-callback-root)
+                             (fx= (bytevector-u8-ref (vector-ref root 1) 8192)
+                                  91)))
+                      (fx+ value 1))
+                    (int) int)]
+                 [result
+                  (call-callback
+                    (foreign-callable-entry-point callback)
+                    41)])
+            (keep-live callback)
+            (#3%$native-fiber-try-claim! scheduler)
+            (#3%$native-fiber-switch task scheduler result)
+            'done))
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-finish fiber scheduler outcome))
+        #b001))
+    (#3%$native-fiber-try-claim! task)
+    (and (fx= (#3%$native-fiber-switch scheduler task 'start) 42)
+         (fx= callback-depth 1)
+         root-survived?
+         (#3%$native-fiber-try-claim! task)
+         (equal? (#3%$native-fiber-switch scheduler task 'resume)
+                 '(return . done))
+         (eq? (#3%$native-fiber-state task) 'finished))))
+
+(if (windows?)
+    (mat native-fiber-signal-preemption-gc #t)
+    (mat native-fiber-signal-preemption-gc
+      (let* ([scheduler
+              (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+             [task #f]
+             [root #f]
+             [signal-seen? #f]
+             [signal-fiber-ok? #f]
+             [signal-root-ok? #f]
+             [signal-gc-finished? #f]
+             [preempt-requested? #f]
+             [resumed? #f]
+             [saved-handler (timer-interrupt-handler)])
+        (set! task
+          (#3%$native-fiber-create
+            (lambda ()
+              (set! root
+                (vector 'signal-preemption-root
+                        (make-bytevector 16384 77)))
+              (set-timer 1000)
+              (guard (condition
+                       [else
+                        (display-condition condition)
+                        (newline)])
+                (system "exec kill -14 $PPID"))
+              (let wait-signal ([fuel 10000000])
+                (unless signal-seen?
+                  (when (fx= fuel 0)
+                    (error 'native-fiber-signal-preemption-gc
+                      "signal was not delivered"))
+                  (vector fuel)
+                  (wait-signal (fx- fuel 1))))
+              (let wait-preemption ([fuel 10000000])
+                (unless resumed?
+                  (when (fx= fuel 0)
+                    (error 'native-fiber-signal-preemption-gc
+                      "timer preemption was not delivered"))
+                  (vector fuel root)
+                  (wait-preemption (fx- fuel 1))))
+              'completed)
+            (lambda (fiber outcome)
+              (#3%$native-fiber-try-claim! scheduler)
+              (#3%$native-fiber-finish fiber scheduler outcome))
+            #b001))
+        (dynamic-wind
+          (lambda ()
+            (register-signal-handler
+              14
+              (lambda (signal)
+                (set! signal-seen? (fx= signal 14))
+                (set! signal-fiber-ok?
+                  (eq? (#3%$current-native-fiber) task))
+                (parameterize ([#%$enable-check-heap #t])
+                  (collect (collect-maximum-generation)))
+                (set! signal-root-ok?
+                  (and (eq? (vector-ref root 0)
+                            'signal-preemption-root)
+                       (fx= (bytevector-u8-ref (vector-ref root 1) 8192)
+                            77)))
+                (set! signal-gc-finished? #t)))
+            (timer-interrupt-handler
+              (lambda ()
+                (if signal-gc-finished?
+                    (set! preempt-requested?
+                      (#3%$native-fiber-preempt
+                        scheduler 'signal-preempted))
+                    (set-timer 1)))))
+          (lambda ()
+            (#3%$native-fiber-try-claim! task)
+            (and (eq? (#3%$native-fiber-switch scheduler task 'start)
+                      'signal-preempted)
+                 signal-seen?
+                 signal-fiber-ok?
+                 signal-root-ok?
+                 signal-gc-finished?
+                 preempt-requested?
+                 (begin (set! resumed? #t) #t)
+                 (#3%$native-fiber-try-claim! task)
+                 (equal? (#3%$native-fiber-switch scheduler task 'resume)
+                         '(return . completed))
+                 (eq? (#3%$native-fiber-state task) 'finished)))
+          (lambda ()
+            (set-timer 0)
+            (timer-interrupt-handler saved-handler)
+            (register-signal-handler 14 void))))))
+
 (mat native-fiber-foreign-callback-boundary
   (let* ([scheduler
           (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]

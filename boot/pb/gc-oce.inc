@@ -960,6 +960,12 @@ static void sweep(thread_gc *tgc, ptr p, IGEN from_g)
             relocate_pure(&(HANDLERSTACK(tc)));
             relocate_pure(&(CURRENTNATIVEFIBER(tc)));
             relocate_pure(&(FIBERSWITCHPROHIBITEDDEPTH(tc)));
+            relocate_pure(&(NATIVEFIBERCLAIMED(tc)));
+            relocate_pure(&(NATIVEFIBERCLAIMEDCONTROL(tc)));
+            relocate_pure(&(NATIVEFIBERPINNEDHEAD(tc)));
+            relocate_pure(&(NATIVEFIBERTESTACTIVE(tc)));
+            relocate_pure(&(NATIVEFIBERPREEMPTTARGET(tc)));
+            relocate_pure(&(NATIVEFIBERPREEMPTPAYLOAD(tc)));
             CACHEDFRAME(tc) = Sfalse;
             {
               ptr xcp = FRAME(tc, 0);
@@ -1598,6 +1604,12 @@ static void sweep_object_in_old(thread_gc *tgc, ptr p)
             relocate_pure(&(HANDLERSTACK(tc)));
             relocate_pure(&(CURRENTNATIVEFIBER(tc)));
             relocate_pure(&(FIBERSWITCHPROHIBITEDDEPTH(tc)));
+            relocate_pure(&(NATIVEFIBERCLAIMED(tc)));
+            relocate_pure(&(NATIVEFIBERCLAIMEDCONTROL(tc)));
+            relocate_pure(&(NATIVEFIBERPINNEDHEAD(tc)));
+            relocate_pure(&(NATIVEFIBERTESTACTIVE(tc)));
+            relocate_pure(&(NATIVEFIBERPREEMPTTARGET(tc)));
+            relocate_pure(&(NATIVEFIBERPREEMPTPAYLOAD(tc)));
             {
               ptr xcp = FRAME(tc, 0);
               {
@@ -2455,6 +2467,12 @@ static void sweep_thread(thread_gc *tgc, ptr p)
         relocate_pure(&(HANDLERSTACK(tc)));
         relocate_pure(&(CURRENTNATIVEFIBER(tc)));
         relocate_pure(&(FIBERSWITCHPROHIBITEDDEPTH(tc)));
+        relocate_pure(&(NATIVEFIBERCLAIMED(tc)));
+        relocate_pure(&(NATIVEFIBERCLAIMEDCONTROL(tc)));
+        relocate_pure(&(NATIVEFIBERPINNEDHEAD(tc)));
+        relocate_pure(&(NATIVEFIBERTESTACTIVE(tc)));
+        relocate_pure(&(NATIVEFIBERPREEMPTTARGET(tc)));
+        relocate_pure(&(NATIVEFIBERPREEMPTPAYLOAD(tc)));
         CACHEDFRAME(tc) = Sfalse;
         {
           ptr xcp = FRAME(tc, 0);
@@ -4575,6 +4593,36 @@ static void measure(thread_gc *tgc, ptr p)
           }
           { /* measure */
             ptr r_p = FIBERSWITCHPROHIBITEDDEPTH(tc);
+            if (!FIXMEDIATE(r_p))
+              push_measure(tgc, r_p);
+          }
+          { /* measure */
+            ptr r_p = NATIVEFIBERCLAIMED(tc);
+            if (!FIXMEDIATE(r_p))
+              push_measure(tgc, r_p);
+          }
+          { /* measure */
+            ptr r_p = NATIVEFIBERCLAIMEDCONTROL(tc);
+            if (!FIXMEDIATE(r_p))
+              push_measure(tgc, r_p);
+          }
+          { /* measure */
+            ptr r_p = NATIVEFIBERPINNEDHEAD(tc);
+            if (!FIXMEDIATE(r_p))
+              push_measure(tgc, r_p);
+          }
+          { /* measure */
+            ptr r_p = NATIVEFIBERTESTACTIVE(tc);
+            if (!FIXMEDIATE(r_p))
+              push_measure(tgc, r_p);
+          }
+          { /* measure */
+            ptr r_p = NATIVEFIBERPREEMPTTARGET(tc);
+            if (!FIXMEDIATE(r_p))
+              push_measure(tgc, r_p);
+          }
+          { /* measure */
+            ptr r_p = NATIVEFIBERPREEMPTPAYLOAD(tc);
             if (!FIXMEDIATE(r_p))
               push_measure(tgc, r_p);
           }
