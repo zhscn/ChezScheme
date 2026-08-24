@@ -207,6 +207,16 @@ void S_prim_init(void) {
                     (void *)s_native_fiber_worker_state_mask);
     Sforeign_symbol("(cs)native_fiber_current_root",
                     (void *)s_native_fiber_current_root);
+    Sforeign_symbol("(cs)native_fiber_test_hook_arm",
+                    (void *)S_native_fiber_test_hook_arm);
+    Sforeign_symbol("(cs)native_fiber_test_hook_release",
+                    (void *)S_native_fiber_test_hook_release);
+    Sforeign_symbol("(cs)native_fiber_test_hook_hit",
+                    (void *)S_native_fiber_test_hook_hit);
+    Sforeign_symbol("(cs)native_fiber_test_hook_saw_gc",
+                    (void *)S_native_fiber_test_hook_saw_gc);
+    Sforeign_symbol("(cs)native_fiber_test_hook_reset",
+                    (void *)S_native_fiber_test_hook_reset);
     Sforeign_symbol("(cs)count_size_increments", (void *)S_count_size_increments);
     Sforeign_symbol("(cs)lookup_library_entry", (void *)S_lookup_library_entry);
     Sforeign_symbol("(cs)link_code_object", (void *)s_link_code_object);
@@ -371,6 +381,9 @@ static iptr s_native_fiber_worker_state_mask(void) {
   if (NATIVEFIBERPREEMPTACTIVE(tc) != Sfalse
       && NATIVEFIBERPREEMPTACTIVE(tc) != Strue)
     mask |= 4;
+# ifdef tc_native_fiber_test_active_disp
+  if (NATIVEFIBERTESTACTIVE(tc) != Sfalse) mask |= 8;
+# endif
 #endif
   return mask;
 }

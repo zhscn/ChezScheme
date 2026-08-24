@@ -1850,6 +1850,22 @@
        ($oops who "invalid native-fiber transition state ~s" value))
      ($native-fiber-transition value)]))
 
+(define-who $native-fiber-claimed
+  (case-lambda
+    [() ($native-fiber-claimed)]
+    [(value)
+     (unless (or (not value) ($native-fiber? value))
+       ($oops who "invalid claimed native fiber ~s" value))
+     ($native-fiber-claimed value)]))
+
+(define-who $native-fiber-claimed-control
+  (case-lambda
+    [() ($native-fiber-claimed-control)]
+    [(value)
+     (unless (or (not value) (and (fixnum? value) (fx>= value 0)))
+       ($oops who "invalid claimed native-fiber control ~s" value))
+     ($native-fiber-claimed-control value)]))
+
 (define-who $native-fiber-preempt-active
   (case-lambda
     [() ($native-fiber-preempt-active)]
@@ -1945,10 +1961,12 @@
 (define $native-fiber-adopt)
 (define $native-fiber-create)
 (define $native-fiber-try-claim!)
+(define $native-fiber-release-claim!)
 (define $native-fiber-preempt)
 (define $native-fiber-service-preemption)
 (define $native-fiber-switch)
 (define $native-fiber-finish)
+(define $native-fiber-thread-teardown)
 (define $native-fiber-pin!)
 (define $native-fiber-unpin!)
 (define $native-fiber-allocate-descriptor
@@ -1981,8 +1999,9 @@
     (mutable commit-control native-fiber-commit-control native-fiber-commit-control-set!)
     (mutable cache-context native-fiber-cache-context native-fiber-cache-context-set!)
     (mutable flags native-fiber-flags native-fiber-flags-set!)
-    (immutable id native-fiber-id))
-  (nongenerative #{native-fiber vm-native-fiber-3})
+    (immutable id native-fiber-id)
+    (mutable pinned-next native-fiber-pinned-next native-fiber-pinned-next-set!))
+  (nongenerative #{native-fiber vm-native-fiber-4})
   (sealed #t)
   (opaque #t))
 
@@ -2041,6 +2060,9 @@
 (define native-fiber-check-preemption-request!)
 (define native-fiber-check-worker!)
 (define native-fiber-check-stable-internal!)
+(define native-fiber-register-pinned!)
+(define native-fiber-unregister-pinned!)
+(define native-fiber-pinned-registered?)
 (define native-fiber-worker-snapshot
   (lambda ()
     ;; Read the physical TC through the VM boundary. Invariant checks must not
@@ -2108,8 +2130,8 @@
                     #f #f #f #f #f #f
                     (fxlogor flags
                       (constant native-fiber-flag-pinned)
-                      (constant native-fiber-flag-scheduler))
-                    (native-fiber-allocate-id))])
+                    (constant native-fiber-flag-scheduler))
+                    (native-fiber-allocate-id) #f)])
       ($current-native-fiber fiber)
       (native-fiber-check-stable-internal! '$native-fiber-adopt fiber)
       fiber)))
@@ -2145,6 +2167,46 @@
                [migratable? (not (fx= (fxlogand flags (constant native-fiber-flag-migratable)) 0))])
            (or (and pinned? (not migratable?))
                (and migratable? (not pinned?)))))))
+
+(set! native-fiber-register-pinned!
+  (lambda (fiber)
+    (let ([flags (native-fiber-flags fiber)])
+      (when (and
+              (fx= (fxlogand flags (constant native-fiber-flag-scheduler)) 0)
+              (not (fx= (fxlogand flags (constant native-fiber-flag-pinned)) 0))
+              (not (native-fiber-pinned-next fiber)))
+        (native-fiber-pinned-next-set! fiber
+          (or (#3%$tc-field 'native-fiber-pinned-head (#3%$tc)) '()))
+        (#3%$tc-field 'native-fiber-pinned-head (#3%$tc) fiber)))))
+
+(set! native-fiber-unregister-pinned!
+  (lambda (fiber)
+    (let loop ([previous #f]
+               [node (#3%$tc-field 'native-fiber-pinned-head (#3%$tc))])
+      (cond
+        [(not node) (void)]
+        [(null? node) (void)]
+        [(eq? node fiber)
+         (let ([next (native-fiber-pinned-next node)])
+           (if previous
+               (native-fiber-pinned-next-set! previous next)
+               (#3%$tc-field 'native-fiber-pinned-head (#3%$tc)
+                 (if (null? next) #f next)))
+           (native-fiber-pinned-next-set! node #f))]
+        [else (loop node (native-fiber-pinned-next node))]))))
+
+(set! native-fiber-pinned-registered?
+  (lambda (fiber)
+    (let ([seen (make-eq-hashtable)])
+      (let loop ([node (#3%$tc-field 'native-fiber-pinned-head (#3%$tc))])
+        (and node
+             (not (null? node))
+             ($native-fiber? node)
+             (not (hashtable-contains? seen node))
+             (or (eq? node fiber)
+                 (begin
+                   (hashtable-set! seen node #t)
+                   (loop (native-fiber-pinned-next node)))))))))
 
 (set! native-fiber-context-valid?
   (case-lambda
@@ -2380,6 +2442,43 @@
       (unless (fx= (fxlogand state-mask 4) 0)
         ($native-fiber-preempt-active #f)
         ($oops who "invalid native-fiber preemption-window state"))
+      (unless (fx= (fxlogand state-mask 8) 0)
+        (#3%$tc-field 'native-fiber-test-active (#3%$tc) #f)
+        ($oops who "native-fiber test hook is visible at a stable boundary"))
+      (let ([claimed ($native-fiber-claimed)]
+            [claimed-control ($native-fiber-claimed-control)])
+        (unless
+          (if claimed
+              (and ($native-fiber? claimed)
+                   (not (eq? claimed current))
+                   (fixnum? claimed-control)
+                   (let ([control (native-fiber-read-control claimed)]
+                         [flags (native-fiber-flags claimed)])
+                     (and
+                       (native-fiber-control-valid? claimed-control flags #t)
+                       (native-fiber-transition-valid?
+                         flags claimed-control control)
+                       (fx= (native-fiber-control-state control)
+                            (constant native-fiber-state-claimed))
+                       (fx= (native-fiber-control-owner control)
+                            (native-fiber-current-owner)))))
+              (not claimed-control))
+          ($oops who "the worker's claimed native-fiber handoff is malformed")))
+      (when ($enable-check-heap)
+        (let ([seen (make-eq-hashtable)])
+          (let loop ([node (#3%$tc-field 'native-fiber-pinned-head (#3%$tc))])
+            (unless (or (not node) (null? node))
+              (unless (and ($native-fiber? node)
+                           (not (hashtable-contains? seen node))
+                           (not (fx= (fxlogand (native-fiber-flags node)
+                                       (constant native-fiber-flag-pinned))
+                                     0))
+                           (fx= (native-fiber-control-owner
+                                  (native-fiber-read-control node))
+                                (native-fiber-current-owner)))
+                ($oops who "the worker's pinned native-fiber registry is malformed"))
+              (hashtable-set! seen node #t)
+              (loop (native-fiber-pinned-next node))))))
       (when current
         (unless ($native-fiber? current)
           ($oops who "the current native-fiber root is malformed"))
@@ -2426,6 +2525,27 @@
           (native-fiber-id fiber) control))
       (unless (native-fiber-transition-scratch-clear? fiber)
         ($oops who "native fiber ~s retains transition state"
+          (native-fiber-id fiber)))
+      (let ([next (native-fiber-pinned-next fiber)])
+        (unless
+          (if scheduler?
+              (not next)
+              (case state
+                [(0 6) (not next)]
+                [(1 2 4)
+                 (if pinned?
+                     (or (null? next) ($native-fiber? next))
+                     (not next))]
+                [else #t]))
+          ($oops who "native fiber ~s has inconsistent pinned ownership"
+            (native-fiber-id fiber))))
+      (when (and ($enable-check-heap)
+                 (not scheduler?)
+                 pinned?
+                 (fx= owner (native-fiber-current-owner))
+                 (memv state '(1 2 4))
+                 (not (native-fiber-pinned-registered? fiber)))
+        ($oops who "native fiber ~s is absent from its worker's pinned registry"
           (native-fiber-id fiber)))
       (unless (eq? (eq? state (constant native-fiber-state-running))
                    (eq? fiber ($current-native-fiber)))
@@ -2520,7 +2640,7 @@
              (#3%$native-fiber-make-context $null-continuation)
              #f entry on-return (lambda () (native-fiber-start))
              #f #f #f #f #f
-             flags (native-fiber-allocate-id))])
+             flags (native-fiber-allocate-id) #f)])
       (native-fiber-check-stable! '$native-fiber-create fiber)
       fiber)))
 
@@ -2528,7 +2648,10 @@
   (lambda (fiber)
     (unless ($native-fiber? fiber)
       ($oops '$native-fiber-try-claim! "~s is not a native fiber" fiber))
-    (let ([owner (native-fiber-current-owner)])
+    (native-fiber-check-worker! '$native-fiber-try-claim!)
+    (if ($native-fiber-claimed)
+        #f
+        (let ([owner (native-fiber-current-owner)])
       (let loop ()
         (let* ([old (native-fiber-read-control fiber)]
                [state (native-fiber-control-state old)]
@@ -2555,13 +2678,41 @@
                      ($oops '$native-fiber-try-claim!
                        "native fiber ~s has an invalid claim transition"
                        (native-fiber-id fiber)))
+                   (disable-interrupts)
                    (if ($record-cas! fiber 0 old new)
                        (begin
+                         ($native-fiber-claimed-control old)
+                         ($native-fiber-claimed fiber)
+                         (native-fiber-register-pinned! fiber)
+                         (enable-interrupts)
                          (native-fiber-check-stable-internal!
                            '$native-fiber-try-claim! fiber)
                          #t)
-                       (loop))))]
-            [else #f]))))))
+                       (begin
+                         (enable-interrupts)
+                         (loop)))))]
+            [else #f])))))))
+
+(set! $native-fiber-release-claim!
+  (lambda (fiber)
+    (unless (eq? fiber ($native-fiber-claimed))
+      ($oops '$native-fiber-release-claim!
+        "native fiber ~s is not the worker's claimed target"
+        (and ($native-fiber? fiber) (native-fiber-id fiber))))
+    (let ([old ($native-fiber-claimed-control)]
+          [claimed (native-fiber-read-control fiber)])
+      (disable-interrupts)
+      (unless ($record-cas! fiber 0 claimed old)
+        (native-fiber-invariant-failure))
+      ($native-fiber-claimed #f)
+      ($native-fiber-claimed-control #f)
+      (when (fx= (native-fiber-control-state old)
+                 (constant native-fiber-state-new))
+        (native-fiber-unregister-pinned! fiber))
+      (enable-interrupts)
+      (native-fiber-check-stable-internal!
+        '$native-fiber-release-claim! fiber)
+      (void))))
 
 (set! $native-fiber-pin!
   (lambda (fiber)
@@ -2579,11 +2730,14 @@
         ($oops '$native-fiber-pin!
           "native fiber ~s is not an unpinned migratable task"
           (native-fiber-id fiber))))
+    (disable-interrupts)
     (native-fiber-flags-set! fiber
       (fxlogor
         (fxlogand (native-fiber-flags fiber)
           (fxlognot (constant native-fiber-flag-migratable)))
         (constant native-fiber-flag-pinned)))
+    (native-fiber-register-pinned! fiber)
+    (enable-interrupts)
     (native-fiber-check-stable-internal! '$native-fiber-pin! fiber)
     (void)))
 
@@ -2603,11 +2757,14 @@
         ($oops '$native-fiber-unpin!
           "native fiber ~s is not a pinned task"
           (native-fiber-id fiber))))
+    (disable-interrupts)
+    (native-fiber-unregister-pinned! fiber)
     (native-fiber-flags-set! fiber
       (fxlogor
         (fxlogand (native-fiber-flags fiber)
           (fxlognot (constant native-fiber-flag-pinned)))
         (constant native-fiber-flag-migratable)))
+    (enable-interrupts)
     (native-fiber-check-stable-internal! '$native-fiber-unpin! fiber)
     (void)))
 
@@ -2631,9 +2788,9 @@
           [target-control (native-fiber-read-control target)])
       (unless (and (fx= (native-fiber-control-state current-control)
                         (constant native-fiber-state-running))
-                   (fx= (native-fiber-control-owner current-control) owner))
-        ($oops who "source fiber ~s is not running on the current native thread"
-          (native-fiber-id current)))
+                   (fx= (native-fiber-control-owner current-control) owner)
+                   (eq? target ($native-fiber-claimed)))
+        ($oops who "source or claimed target disagrees with worker ownership"))
       (unless (and (fx= (native-fiber-control-state target-control)
                         (constant native-fiber-state-claimed))
                    (fx= (native-fiber-control-owner target-control) owner))
@@ -2696,6 +2853,12 @@
       ;; The target-side return path balances this call. No Scheme event may
       ;; observe the transition fields between here and the hand-coded entry.
       (disable-interrupts)
+      (#3%$tc-field 'native-fiber-test-active (#3%$tc)
+        (not (fx= (fxlogand
+                    (fxlogor (native-fiber-flags current)
+                             (native-fiber-flags target))
+                    (constant native-fiber-flag-debug))
+                  0)))
       ($native-fiber-transition #t)
       (native-fiber-context-set! current source-context)
       (native-fiber-handler-stack-set! current
@@ -2744,6 +2907,7 @@
                         0))
              (native-fiber-switch-prohibited?)
              ($native-fiber-transition)
+             ($native-fiber-claimed)
              (not (fx= (#3%$tc-field 'disable-count (#3%$tc)) 0)))
          #f]
         [else
@@ -2796,6 +2960,92 @@
   (lambda (current target outcome)
     (native-fiber-exchange '$native-fiber-finish current target outcome #t)
     ($oops '$native-fiber-finish "a finished native fiber resumed")))
+
+(set! $native-fiber-thread-teardown
+  (lambda ()
+    ;; fork-thread invokes this after its user thunk has returned to the
+    ;; worker's scheduler stack. Roll back an unconsumed handoff before its
+    ;; native-thread owner disappears, then retire the scheduler root.
+    (when (or ($native-fiber-transition)
+              ($native-fiber-preempt-active))
+      (native-fiber-invariant-failure))
+    ($native-fiber-preempt-target #f)
+    ($native-fiber-preempt-payload #f)
+    (let ([claimed ($native-fiber-claimed)]
+          [old ($native-fiber-claimed-control)])
+      (when claimed
+        (disable-interrupts)
+        (unless (and old
+                     ($record-cas! claimed 0
+                       (native-fiber-read-control claimed) old))
+          (native-fiber-invariant-failure))
+        ($native-fiber-claimed #f)
+        ($native-fiber-claimed-control #f)
+        (when (fx= (native-fiber-control-state old)
+                   (constant native-fiber-state-new))
+          (native-fiber-unregister-pinned! claimed))
+        (enable-interrupts)
+        (native-fiber-check-stable-internal!
+          '$native-fiber-thread-teardown claimed)))
+    (disable-interrupts)
+    (let retire ()
+      (let ([fiber (#3%$tc-field 'native-fiber-pinned-head (#3%$tc))])
+        (when fiber
+          (let* ([next (native-fiber-pinned-next fiber)]
+                 [old (native-fiber-read-control fiber)]
+                 [finishing
+                  (native-fiber-pack-control
+                    (constant native-fiber-state-finishing)
+                    (native-fiber-current-owner))]
+                 [finished
+                  (native-fiber-pack-control
+                    (constant native-fiber-state-finished) 0)])
+            (unless (and
+                      (fx= (native-fiber-control-state old)
+                           (constant native-fiber-state-parked))
+                      (fx= (native-fiber-control-owner old)
+                           (native-fiber-current-owner))
+                      ($record-cas! fiber 0 old finishing))
+              (native-fiber-invariant-failure))
+            (#3%$tc-field 'native-fiber-pinned-head (#3%$tc)
+              (if (null? next) #f next))
+            (native-fiber-context-set! fiber #f)
+            (native-fiber-handler-stack-set! fiber #f)
+            (native-fiber-entry-set! fiber #f)
+            (native-fiber-on-return-set! fiber #f)
+            (native-fiber-starter-set! fiber #f)
+            (native-fiber-incoming-source-set! fiber #f)
+            (native-fiber-incoming-payload-set! fiber #f)
+            (native-fiber-switch-control-set! fiber #f)
+            (native-fiber-commit-control-set! fiber #f)
+            (native-fiber-cache-context-set! fiber #f)
+            (native-fiber-pinned-next-set! fiber #f)
+            (unless ($record-cas! fiber 0 finishing finished)
+              (native-fiber-invariant-failure))
+            (retire)))))
+    (enable-interrupts)
+    (let ([current ($current-native-fiber)])
+      (when current
+        (let* ([control (native-fiber-read-control current)]
+               [flags (native-fiber-flags current)]
+               [finished
+                (native-fiber-pack-control
+                  (constant native-fiber-state-finished) 0)])
+          (unless (and
+                    (not (fx= (fxlogand flags
+                                (constant native-fiber-flag-scheduler))
+                              0))
+                    (fx= (native-fiber-control-state control)
+                         (constant native-fiber-state-running))
+                    (fx= (native-fiber-control-owner control)
+                         (native-fiber-current-owner))
+                    ($record-cas! current 0 control finished))
+            (native-fiber-invariant-failure))
+          ($current-native-fiber #f)
+          (native-fiber-check-stable-internal!
+            '$native-fiber-thread-teardown current))))
+    (#3%$tc-field 'cached-frame (#3%$tc) #f)
+    (void)))
 
 (set! native-fiber-start
   (lambda ()
@@ -3061,7 +3311,9 @@
                               (case-lambda [() (k (void))] [(x . args) (k x)])]
                              [reset-handler (lambda () (k (void)))])
                 (t)
-                (void))))))))
+                (void))))
+          ($native-fiber-thread-teardown)
+          (void)))))
 
 (set-who! thread-join
   (lambda (t)

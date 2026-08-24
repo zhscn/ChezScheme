@@ -1596,7 +1596,8 @@
    [ptr commit-control]
    [ptr cache-context]
    [ptr flags]
-   [ptr id]))
+   [ptr id]
+   [ptr pinned-next]))
 
 (define-primitive-structure-disps thread type-typed-object
   ([iptr type] [uptr tc]))
@@ -1690,6 +1691,13 @@
    ;; These fields keep partially prepared transfers rooted while ensuring that
    ;; timer-handler frames have unwound before a migratable fiber is parked.
    [ptr native-fiber-transition]
+   ;; A successful claim is a worker-owned handoff slot until the raw switch
+   ;; installs the target.  The previous stable control word permits thread
+   ;; teardown to roll back an unconsumed claim without a global registry.
+   [ptr native-fiber-claimed]
+   [ptr native-fiber-claimed-control]
+   [ptr native-fiber-pinned-head]
+   [ptr native-fiber-test-active]
    [ptr native-fiber-preempt-active]
    [ptr native-fiber-preempt-target]
    [ptr native-fiber-preempt-payload]))
@@ -2980,6 +2988,10 @@
      ($native-fiber-allocate-descriptor #f 0 #f #f)
      ($native-fiber-make-context #f 1 #f #f)
      ($native-fiber-switch-entry #f 1 #f #f)
+     ($native-fiber-switch-commit-entry #f 0 #f #f)
+     ($native-fiber-switch-finish-entry #f 0 #f #f)
+     ($native-fiber-switch-publish-entry #f 0 #f #f)
+     ($native-fiber-switch-resume-entry #f 0 #f #f)
      (native-fiber-context #f 0 #f #f)
      (dorest0 #f 0 #f #f)
      (dorest1 #f 0 #f #f)

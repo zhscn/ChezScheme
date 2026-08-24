@@ -17,6 +17,9 @@
 #include "system.h"
 #include <setjmp.h>
 #include <errno.h>
+#if defined(PTHREADS) && !defined(WIN32)
+# include <sched.h>
+#endif
 
 /* locally defined functions */
 static void split(ptr k, ptr *s);
@@ -27,6 +30,168 @@ static void init_signal_handlers(void);
 static void keyboard_interrupt(ptr tc);
 
 static void (*register_modified_signal)(int);
+
+/* Native-fiber transition fault injection is dormant unless a debug fiber
+   reaches an explicitly armed point. The state contains no Scheme pointers. */
+static iptr S_native_fiber_test_state[6];
+#ifdef PTHREADS
+static s_thread_mutex_t S_native_fiber_test_mutex;
+# define native_fiber_test_lock() \
+    ((void)s_thread_mutex_lock(&S_native_fiber_test_mutex))
+# define native_fiber_test_unlock() \
+    ((void)s_thread_mutex_unlock(&S_native_fiber_test_mutex))
+#else
+# define native_fiber_test_lock() ((void)0)
+# define native_fiber_test_unlock() ((void)0)
+#endif
+#define native_fiber_test_point S_native_fiber_test_state[0]
+#define native_fiber_test_mode S_native_fiber_test_state[1]
+#define native_fiber_test_action S_native_fiber_test_state[2]
+#define native_fiber_test_hit S_native_fiber_test_state[3]
+#define native_fiber_test_release S_native_fiber_test_state[4]
+#define native_fiber_test_saw_gc S_native_fiber_test_state[5]
+
+void S_native_fiber_test_hook_arm(iptr point, iptr mode, iptr action) {
+  native_fiber_test_lock();
+  native_fiber_test_mode = mode;
+  native_fiber_test_action = action;
+  native_fiber_test_hit = 0;
+  native_fiber_test_release = 0;
+  native_fiber_test_saw_gc = 0;
+  native_fiber_test_point = point;
+  native_fiber_test_unlock();
+}
+
+void S_native_fiber_test_hook_release(void) {
+  native_fiber_test_lock();
+  native_fiber_test_release = 1;
+  native_fiber_test_unlock();
+}
+
+iptr S_native_fiber_test_hook_hit(void) {
+  iptr hit;
+  native_fiber_test_lock();
+  hit = native_fiber_test_hit;
+  native_fiber_test_unlock();
+  return hit;
+}
+
+iptr S_native_fiber_test_hook_saw_gc(void) {
+  iptr saw_gc;
+  native_fiber_test_lock();
+  saw_gc = native_fiber_test_saw_gc;
+  native_fiber_test_unlock();
+  return saw_gc;
+}
+
+void S_native_fiber_test_hook_reset(void) {
+  native_fiber_test_lock();
+  native_fiber_test_point = 0;
+  native_fiber_test_mode = 0;
+  native_fiber_test_action = 0;
+  native_fiber_test_hit = 0;
+  native_fiber_test_release = 1;
+  native_fiber_test_saw_gc = 0;
+  native_fiber_test_unlock();
+}
+
+#ifdef tc_native_fiber_transition_disp
+static iptr native_fiber_test_hook(iptr point) {
+  iptr mode, action;
+
+  native_fiber_test_lock();
+  if (native_fiber_test_point != point) {
+    native_fiber_test_unlock();
+    return 0;
+  }
+  action = native_fiber_test_action;
+  mode = native_fiber_test_mode;
+  native_fiber_test_hit = point;
+  native_fiber_test_unlock();
+
+  while (mode != 0) {
+    iptr released;
+    native_fiber_test_lock();
+    released = native_fiber_test_release;
+    native_fiber_test_unlock();
+    if (released) break;
+    if (mode == 2
+        && Sboolean_value(
+             S_symbol_racy_value(S_G.collect_request_pending_id))) {
+      native_fiber_test_lock();
+      native_fiber_test_saw_gc = 1;
+      native_fiber_test_unlock();
+      break;
+    }
+#ifdef PTHREADS
+# ifdef WIN32
+    Sleep(0);
+# else
+    sched_yield();
+# endif
+#else
+    break;
+#endif
+  }
+  return action;
+}
+
+#ifndef tc_native_fiber_test_active_disp
+static IBOOL native_fiber_debugp(ptr fiber) {
+  enum { native_fiber_flags_index = 11 };
+  ptr flags = RECORDINSTIT(fiber, native_fiber_flags_index);
+  return Sfixnump(flags) && (UNFIX(flags) & 8) != 0;
+}
+#endif
+
+static IBOOL native_fiber_test_activep(ptr tc, ptr source, ptr target) {
+#ifdef tc_native_fiber_test_active_disp
+  (void)source;
+  (void)target;
+  return NATIVEFIBERTESTACTIVE(tc) == Strue;
+#else
+  return native_fiber_debugp(source) || native_fiber_debugp(target);
+#endif
+}
+
+static void native_fiber_check_stack_disjoint(ptr source, ptr target) {
+  enum { native_fiber_context_index = 1 };
+  ptr a = RECORDINSTIT(source, native_fiber_context_index);
+  ptr b = RECORDINSTIT(target, native_fiber_context_index);
+
+  if (a != Sfalse) {
+    uptr alo = (uptr)CONTSTACK(a), alen = (uptr)CONTLENGTH(a);
+    uptr blo = (uptr)CONTSTACK(b), blen = (uptr)CONTLENGTH(b);
+    uptr ahi = alo + alen, bhi = blo + blen;
+    if (ahi < alo || bhi < blo || (alo < bhi && blo < ahi))
+      S_error_abort("native-fiber stack ownership overlaps");
+  }
+}
+
+#ifdef tc_native_fiber_pinned_head_disp
+static void native_fiber_unregister_pinned(ptr tc, ptr fiber) {
+  enum { native_fiber_pinned_next_index = 13 };
+  ptr previous = Sfalse;
+  ptr node = NATIVEFIBERPINNEDHEAD(tc);
+
+  while (node != Sfalse && node != Snil && node != fiber) {
+    previous = node;
+    node = RECORDINSTIT(node, native_fiber_pinned_next_index);
+  }
+  if (node != fiber)
+    S_error_abort("finished native fiber missing from pinned registry");
+  node = RECORDINSTIT(fiber, native_fiber_pinned_next_index);
+  if (previous == Sfalse) {
+    NATIVEFIBERPINNEDHEAD(tc) = node == Snil ? Sfalse : node;
+  } else {
+    ptr *field = &RECORDINSTIT(previous, native_fiber_pinned_next_index);
+    S_dirty_mark(field, node);
+    *field = node;
+  }
+  RECORDINSTIT(fiber, native_fiber_pinned_next_index) = Sfalse;
+}
+#endif
+#endif
 
 #ifdef WIN32
 typedef int *(*get_errno_ptr_t)(void);
@@ -537,21 +702,45 @@ void S_handle_event_detour() {
       ptr phase = NATIVEFIBERTRANSITION(tc);
       enum {
         native_fiber_control_index = 0,
+        native_fiber_context_index = 1,
         native_fiber_incoming_source_index = 6,
         native_fiber_switch_control_index = 8,
         native_fiber_commit_control_index = 9
       };
 
+      if (phase == FIX(5))
+        S_error_abort("native-fiber target return point is invalid");
+
+      if (phase == FIX(3)) {
+        ptr target = CURRENTNATIVEFIBER(tc);
+        ptr source = RECORDINSTIT(target, native_fiber_incoming_source_index);
+        if (native_fiber_test_activep(tc, source, target)) {
+          iptr action = native_fiber_test_hook(2);
+          if (action == 3)
+            CONTRET(RECORDINSTIT(target, native_fiber_context_index)) = Sfalse;
+        }
+        NATIVEFIBERTRANSITION(tc) = Strue;
+        return;
+      }
+
       if (phase == FIX(1) || phase == FIX(2)) {
         ptr source, target, control, old_control;
         ptr *field;
+        iptr action = 0;
 
         target = phase == FIX(1) ? AC1(tc) : CURRENTNATIVEFIBER(tc);
         source = phase == FIX(1)
                    ? CURRENTNATIVEFIBER(tc)
                    : RECORDINSTIT(target, native_fiber_incoming_source_index);
 
+        if (native_fiber_test_activep(tc, source, target))
+          action = native_fiber_test_hook(phase == FIX(1) ? 1 : 3);
+
         if (phase == FIX(1)) {
+          if (action == 4)
+            CONTSTACK(RECORDINSTIT(target, native_fiber_context_index)) =
+              CONTSTACK(RECORDINSTIT(source, native_fiber_context_index));
+          native_fiber_check_stack_disjoint(source, target);
           control = RECORDINSTIT(source, native_fiber_switch_control_index);
           field = &RECORDINSTIT(source, native_fiber_control_index);
           old_control = *field;
@@ -559,6 +748,7 @@ void S_handle_event_detour() {
              first so a younger control remains visible to a generational
              collection as soon as another worker can observe it. */
           S_dirty_mark(field, control);
+          if (action == 1) *field = control;
           if (!COMPARE_AND_SWAP_PTR(field, TO_VOIDP(old_control),
                                     TO_VOIDP(control)))
             S_error_abort("native-fiber source publication raced");
@@ -570,6 +760,13 @@ void S_handle_event_detour() {
           if (!COMPARE_AND_SWAP_PTR(field, TO_VOIDP(old_control),
                                     TO_VOIDP(control)))
             S_error_abort("native-fiber target publication raced");
+
+#ifdef tc_native_fiber_claimed_disp
+          if (NATIVEFIBERCLAIMED(tc) != target)
+            S_error_abort("native-fiber claimed target publication raced");
+          NATIVEFIBERCLAIMED(tc) = Sfalse;
+          NATIVEFIBERCLAIMEDCONTROL(tc) = Sfalse;
+#endif
         } else {
           control = RECORDINSTIT(source, native_fiber_commit_control_index);
           /* Clear private transaction state before release-publishing the
@@ -579,9 +776,22 @@ void S_handle_event_detour() {
           field = &RECORDINSTIT(source, native_fiber_control_index);
           old_control = *field;
           S_dirty_mark(field, control);
+          if (action == 2) *field = control;
           if (!COMPARE_AND_SWAP_PTR(field, TO_VOIDP(old_control),
                                     TO_VOIDP(control)))
             S_error_abort("native-fiber commit publication raced");
+#ifdef tc_native_fiber_pinned_head_disp
+          if ((UNFIX(control) & 7) == 6
+              && (UNFIX(RECORDINSTIT(source, 11)) & 1) != 0
+              && (UNFIX(RECORDINSTIT(source, 11)) & 2) == 0)
+            native_fiber_unregister_pinned(tc, source);
+#endif
+          if (native_fiber_test_activep(tc, source, target)
+              && native_fiber_test_hook(4) == 5)
+            RECORDINSTIT(source, native_fiber_switch_control_index) = Strue;
+          if (RECORDINSTIT(source, native_fiber_switch_control_index) != Sfalse
+              || RECORDINSTIT(source, native_fiber_commit_control_index) != Sfalse)
+            S_error_abort("native-fiber post-commit source corruption");
         }
 
         NATIVEFIBERTRANSITION(tc) = Strue;
@@ -948,6 +1158,10 @@ void S_schsig_init(void) {
     if (S_boot_time) {
         ptr p;
         ptr tc = get_thread_context();
+
+#ifdef PTHREADS
+        s_thread_mutex_init(&S_native_fiber_test_mutex);
+#endif
 
         S_protect(&S_G.nuate_id);
         S_G.nuate_id = S_intern((const unsigned char *)"$nuate");

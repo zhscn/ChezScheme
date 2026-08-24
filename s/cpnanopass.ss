@@ -5576,10 +5576,7 @@
                   (set! ,%ac0 ,%xp)
                   (jump ,%ref-ret (,%ac0))))]
            [($native-fiber-switch-entry)
-            (let ([info (make-named-info-lambda '$native-fiber-switch-entry '(1))]
-                  [Lcommit (make-local-label 'native-fiber-commit)]
-                  [Lpublish (make-local-label 'native-fiber-publish)]
-                  [Lfinish (make-local-label 'native-fiber-finish)])
+            (let ([info (make-named-info-lambda '$native-fiber-switch-entry '(1))])
               (let ([invalid-target
                      (with-output-language (L13 Tail)
                        (%seq
@@ -5665,99 +5662,11 @@
                     (set! ,(%tc-ref winders) ,%ts)
                     (set! ,%ts ,(%mref ,%xp ,(constant continuation-attachments-disp)))
                     (set! ,(%tc-ref attachments) ,%ts)
-                    ;; Local basic-block boundaries keep the closed exchange
-                    ;; below the backend's unspillable-register limit without
-                    ;; returning to Scheme or extending the library-entry ABI.
-                    (goto ,Lcommit)
-                    (label ,Lcommit)
-                  (if ,(%inline eq?
-                         ,(%tc-ref native-fiber-transition)
-                         ,(%constant strue))
-                      (nop)
-                      ,(native-fiber-invariant-failure))
-                  (set! ,%xp ,(%tc-ref current-native-fiber))
-                  (set! ,%xp ,(%mref ,%xp ,(constant native-fiber-context-disp)))
-                  (set! ,%td ,(%tc-ref current-native-fiber))
-                  (set! ,%ts ,(%mref ,%td ,(constant native-fiber-handler-stack-disp)))
-                  (set! ,(%tc-ref handler-stack) ,%ts)
-                  (set! ,(%mref ,%td ,(constant native-fiber-context-disp)) ,(%constant sfalse))
-                  (set! ,(%mref ,%td ,(constant native-fiber-handler-stack-disp)) ,(%constant sfalse))
-                  (if ,(%inline eq?
-                         ,(%mref ,%td ,(constant native-fiber-cache-context-disp))
-                         ,(%constant sfalse))
-                      (nop)
-                      (set! ,(%tc-ref cached-frame) ,%xp))
-                  ;; The cache decision is complete. Carry the descriptor into
-                  ;; the publication block through the target's private
-                  ;; transition scratch.
-                  (set! ,(%mref ,%td ,(constant native-fiber-cache-context-disp))
-                    ,%xp)
-                  (goto ,Lpublish)
-                  (label ,Lpublish)
-                  (if ,(%inline eq?
-                         ,(%tc-ref native-fiber-transition)
-                         ,(%constant strue))
-                      (nop)
-                      ,(native-fiber-invariant-failure))
-                  ;; The target stack is active. Clear every source scratch
-                  ;; field before publishing its stable control. The remaining
-                  ;; target-only cleanup never mutates the published source.
-                  ;; The source's stable parked/finished state is the release
-                  ;; publication record for every preceding stack and root
-                  ;; write. The runtime primitive clears source scratch first,
-                  ;; then performs the release CAS and rejects a second writer.
-                  ,(native-fiber-publish-control 2)
-                  (set! ,%td ,(%tc-ref current-native-fiber))
-                  (set! ,(%mref ,%td ,(constant native-fiber-incoming-source-disp))
-                    ,(%constant sfalse))
-                  (set! ,(%mref ,%td ,(constant native-fiber-switch-control-disp))
-                    ,(%constant sfalse))
-                  (goto ,Lfinish)
-                  (label ,Lfinish)
-                  (if ,(%inline eq?
-                         ,(%tc-ref native-fiber-transition)
-                         ,(%constant strue))
-                      (nop)
-                      ,(native-fiber-invariant-failure))
-                  (set! ,%xp ,(%tc-ref current-native-fiber))
-                  (set! ,%xp
-                    ,(%mref ,%xp ,(constant native-fiber-cache-context-disp)))
-                  (set! ,%td ,(%tc-ref current-native-fiber))
-                  (set! ,(ref-reg %ac1)
-                    ,(%mref ,%td ,(constant native-fiber-starter-disp)))
-                  (set! ,(%mref ,%td ,(constant native-fiber-starter-disp)) ,(%constant sfalse))
-                  (set! ,%ac0
-                    ,(%mref ,%td ,(constant native-fiber-incoming-payload-disp)))
-                  (set! ,(%mref ,%td ,(constant native-fiber-incoming-payload-disp))
-                    ,(%constant sfalse))
-                  (set! ,(%mref ,%td ,(constant native-fiber-cache-context-disp))
-                    ,(%constant sfalse))
-                  ;; Recover the target return address before clearing the
-                  ;; consumed descriptor for reuse.
-                  (set! ,%ts ,(%mref ,%xp ,(constant continuation-return-address-disp)))
-                  (set! ,(%mref ,%xp ,(constant continuation-stack-disp)) ,(%constant sfalse))
-                  (set! ,(%mref ,%xp ,(constant continuation-stack-length-disp))
-                    ,(%constant scaled-shot-1-shot-flag))
-                  (set! ,(%mref ,%xp ,(constant continuation-stack-clength-disp))
-                    ,(%constant scaled-shot-1-shot-flag))
-                  (set! ,(%mref ,%xp ,(constant continuation-link-disp)) ,(%constant sfalse))
-                  (set! ,(%mref ,%xp ,(constant continuation-return-address-disp)) ,(%constant sfalse))
-                  (set! ,(%mref ,%xp ,(constant continuation-winders-disp)) ,(%constant snil))
-                  (set! ,(%mref ,%xp ,(constant continuation-attachments-disp)) ,(%constant snil))
-                  (set! ,(%tc-ref native-fiber-transition) ,(%constant sfalse))
-                  (if ,(%inline eq? ,(ref-reg %ac1) ,(%constant sfalse))
-                      (jump ,%ts (,%ac0))
-                      ,(%seq
-                         (set! ,(ref-reg %cp) ,(ref-reg %ac1))
-                         ,(meta-cond
-                            [(real-register? '%ret)
-                             `(set! ,%ret
-                                (literal ,(make-info-literal #f 'library-code
-                                            (lookup-libspec dounderflow)
-                                            (fx+ (constant code-data-disp)
-                                                 (constant size-rp-header)))))]
-                            [else `(nop)])
-                         ,(do-call 0)))))])
+                    (jump
+                      (literal ,(make-info-literal #f 'library-code
+                                  (lookup-libspec $native-fiber-switch-commit-entry)
+                                  (constant code-data-disp)))
+                      ())))])
               (let ([le
                      `(lambda ,info 0 ()
                         ,(%seq
@@ -5767,6 +5676,194 @@
                                ,switch)))])
                 (verify-native-fiber-raw-entry '$native-fiber-switch-entry le)
                 le)))]
+           [($native-fiber-switch-commit-entry)
+            (let ([info
+                   (make-named-info-lambda
+                     '$native-fiber-switch-commit-entry '(0))])
+              (let ([le
+                     `(lambda ,info 0 ()
+                        ,(%seq
+                           (if ,(%inline eq?
+                                  ,(%tc-ref native-fiber-transition)
+                                  ,(%constant strue))
+                               (nop)
+                               ,(native-fiber-invariant-failure))
+                           ;; This entry begins only after the target stack and
+                           ;; dynamic roots are installed. Isolate the debug
+                           ;; hook from the register-tight install and commit
+                           ;; blocks so no live VM register crosses the call.
+                           (if ,(%inline eq?
+                                  ,(%tc-ref native-fiber-test-active)
+                                  ,(%constant sfalse))
+                               (nop)
+                               ,(native-fiber-publish-control 3))
+                           (jump
+                             (literal
+                               ,(make-info-literal #f 'library-code
+                                  (lookup-libspec $native-fiber-switch-finish-entry)
+                                  (constant code-data-disp)))
+                             ())))])
+                (verify-native-fiber-raw-entry
+                  '$native-fiber-switch-commit-entry le)
+                le))]
+           [($native-fiber-switch-finish-entry)
+            (let ([info
+                   (make-named-info-lambda
+                     '$native-fiber-switch-finish-entry '(0))])
+              (let ([le
+                     `(lambda ,info 0 ()
+                        ,(%seq
+                           (if ,(%inline eq?
+                                  ,(%tc-ref native-fiber-transition)
+                                  ,(%constant strue))
+                               (nop)
+                               ,(native-fiber-invariant-failure))
+                           (set! ,%xp ,(%tc-ref current-native-fiber))
+                           (set! ,%xp
+                             ,(%mref ,%xp
+                                ,(constant native-fiber-context-disp)))
+                           (set! ,%td ,(%tc-ref current-native-fiber))
+                           (set! ,%ts
+                             ,(%mref ,%td
+                                ,(constant native-fiber-handler-stack-disp)))
+                           (set! ,(%tc-ref handler-stack) ,%ts)
+                           (set! ,(%mref ,%td
+                                    ,(constant native-fiber-context-disp))
+                             ,(%constant sfalse))
+                           (set! ,(%mref ,%td
+                                    ,(constant native-fiber-handler-stack-disp))
+                             ,(%constant sfalse))
+                           (if ,(%inline eq?
+                                  ,(%mref ,%td
+                                     ,(constant native-fiber-cache-context-disp))
+                                  ,(%constant sfalse))
+                               (nop)
+                               (set! ,(%tc-ref cached-frame) ,%xp))
+                           (set! ,(%mref ,%td
+                                    ,(constant native-fiber-cache-context-disp))
+                             ,%xp)
+                           (jump
+                             (literal
+                               ,(make-info-literal #f 'library-code
+                                  (lookup-libspec $native-fiber-switch-publish-entry)
+                                  (constant code-data-disp)))
+                             ())))])
+                (verify-native-fiber-raw-entry
+                  '$native-fiber-switch-finish-entry le)
+                le))]
+           [($native-fiber-switch-publish-entry)
+            (let ([info
+                   (make-named-info-lambda
+                     '$native-fiber-switch-publish-entry '(0))])
+              (let ([le
+                     `(lambda ,info 0 ()
+                        ,(%seq
+                           (if ,(%inline eq?
+                                  ,(%tc-ref native-fiber-transition)
+                                  ,(%constant strue))
+                               (nop)
+                               ,(native-fiber-invariant-failure))
+                           ,(native-fiber-publish-control 2)
+                           (set! ,%td ,(%tc-ref current-native-fiber))
+                           (set! ,(%mref ,%td
+                                    ,(constant native-fiber-incoming-source-disp))
+                             ,(%constant sfalse))
+                           (set! ,(%mref ,%td
+                                    ,(constant native-fiber-switch-control-disp))
+                             ,(%constant sfalse))
+                           (jump
+                             (literal
+                               ,(make-info-literal #f 'library-code
+                                  (lookup-libspec $native-fiber-switch-resume-entry)
+                                  (constant code-data-disp)))
+                             ())))])
+                (verify-native-fiber-raw-entry
+                  '$native-fiber-switch-publish-entry le)
+                le))]
+           [($native-fiber-switch-resume-entry)
+            (let ([info
+                   (make-named-info-lambda
+                     '$native-fiber-switch-resume-entry '(0))])
+              (let ([le
+                     `(lambda ,info 0 ()
+                        ,(%seq
+                           (if ,(%inline eq?
+                                  ,(%tc-ref native-fiber-transition)
+                                  ,(%constant strue))
+                               (nop)
+                               ,(native-fiber-invariant-failure))
+                           (set! ,%xp ,(%tc-ref current-native-fiber))
+                           (set! ,%xp
+                             ,(%mref ,%xp
+                                ,(constant native-fiber-cache-context-disp)))
+                           (if ,(%inline eq?
+                                  ,(%mref ,%xp
+                                     ,(constant continuation-return-address-disp))
+                                  ,(%constant sfalse))
+                               ,(native-fiber-publish-control 5)
+                               (nop))
+                           (set! ,(%mref ,%xp
+                                    ,(constant continuation-stack-disp))
+                             ,(%constant sfalse))
+                           (set! ,(%mref ,%xp
+                                    ,(constant continuation-stack-length-disp))
+                             ,(%constant scaled-shot-1-shot-flag))
+                           (set! ,(%mref ,%xp
+                                    ,(constant continuation-stack-clength-disp))
+                             ,(%constant scaled-shot-1-shot-flag))
+                           (set! ,(%mref ,%xp
+                                    ,(constant continuation-link-disp))
+                             ,(%constant sfalse))
+                           (set! ,(%mref ,%xp
+                                    ,(constant continuation-winders-disp))
+                             ,(%constant snil))
+                           (set! ,(%mref ,%xp
+                                    ,(constant continuation-attachments-disp))
+                             ,(%constant snil))
+                           (set! ,%td ,(%tc-ref current-native-fiber))
+                           (set! ,(ref-reg %ac1)
+                             ,(%mref ,%td
+                                ,(constant native-fiber-starter-disp)))
+                           (set! ,(%mref ,%td
+                                    ,(constant native-fiber-starter-disp))
+                             ,(%constant sfalse))
+                           (set! ,%ac0
+                             ,(%mref ,%td
+                                ,(constant native-fiber-incoming-payload-disp)))
+                           (set! ,(%mref ,%td
+                                    ,(constant native-fiber-incoming-payload-disp))
+                             ,(%constant sfalse))
+                           (set! ,(%mref ,%td
+                                    ,(constant native-fiber-cache-context-disp))
+                             ,(%constant sfalse))
+                           (set! ,%ts
+                             ,(%mref ,%xp
+                                ,(constant continuation-return-address-disp)))
+                           (set! ,(%mref ,%xp
+                                    ,(constant continuation-return-address-disp))
+                             ,(%constant sfalse))
+                           (set! ,(%tc-ref native-fiber-transition)
+                             ,(%constant sfalse))
+                           (set! ,(%tc-ref native-fiber-test-active)
+                             ,(%constant sfalse))
+                           (if ,(%inline eq?
+                                  ,(ref-reg %ac1) ,(%constant sfalse))
+                               (jump ,%ts (,%ac0))
+                               ,(%seq
+                                  (set! ,(ref-reg %cp) ,(ref-reg %ac1))
+                                  ,(meta-cond
+                                     [(real-register? '%ret)
+                                      `(set! ,%ret
+                                         (literal
+                                           ,(make-info-literal #f 'library-code
+                                              (lookup-libspec dounderflow)
+                                              (fx+ (constant code-data-disp)
+                                                   (constant size-rp-header)))))]
+                                     [else `(nop)])
+                                  ,(do-call 0)))))])
+                (verify-native-fiber-raw-entry
+                  '$native-fiber-switch-resume-entry le)
+                le))]
            [(native-fiber-context)
             (let ([info (make-named-info-lambda 'native-fiber-context '(-1))])
               (info-lambda-flags-set! info

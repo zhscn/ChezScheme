@@ -3607,6 +3607,8 @@
       (define-tc-parameter $current-native-fiber current-native-fiber)
       (define-tc-parameter $fiber-switch-prohibited-depth fiber-switch-prohibited-depth)
       (define-tc-parameter $native-fiber-transition native-fiber-transition)
+      (define-tc-parameter $native-fiber-claimed native-fiber-claimed)
+      (define-tc-parameter $native-fiber-claimed-control native-fiber-claimed-control)
       (define-tc-parameter $native-fiber-preempt-active native-fiber-preempt-active)
       (define-tc-parameter $native-fiber-preempt-target native-fiber-preempt-target)
       (define-tc-parameter $native-fiber-preempt-payload native-fiber-preempt-payload)

@@ -1693,6 +1693,288 @@
    (void))
 )
 
+(define native-fiber-test-hook-arm
+  (foreign-procedure "(cs)native_fiber_test_hook_arm" (iptr iptr iptr) void))
+(define native-fiber-test-hook-release
+  (foreign-procedure "(cs)native_fiber_test_hook_release" () void))
+(define native-fiber-test-hook-hit
+  (foreign-procedure "(cs)native_fiber_test_hook_hit" () iptr))
+(define native-fiber-test-hook-saw-gc
+  (foreign-procedure "(cs)native_fiber_test_hook_saw_gc" () iptr))
+(define native-fiber-test-hook-reset
+  (foreign-procedure "(cs)native_fiber_test_hook_reset" () void))
+
+(define (native-fiber-wait-for-hook point)
+  (let loop ([attempts 10000])
+    (cond
+      [(fx= (native-fiber-test-hook-hit) point) #t]
+      [(fx= attempts 0) #f]
+      [else
+       (sleep (make-time 'time-duration 100000 0))
+       (loop (fx- attempts 1))])))
+
+(define (native-fiber-string-contains? string needle)
+  (let ([string-length (string-length string)]
+        [needle-length (string-length needle)])
+    (let loop ([start 0])
+      (and (fx<= (fx+ start needle-length) string-length)
+           (or (string=?
+                 (substring string start (fx+ start needle-length))
+                 needle)
+               (loop (fx+ start 1)))))))
+
+(define (native-fiber-run-hook-point point gc?)
+  (let ([task #f] [scheduler #f] [result #f])
+    (dynamic-wind
+      (lambda () (native-fiber-test-hook-arm point (if gc? 2 1) 0))
+      (lambda ()
+        (let ([worker
+               (fork-thread
+                 (lambda ()
+                   (set! scheduler (#3%$native-fiber-adopt #b1000))
+                   (set! task
+                     (#3%$native-fiber-create
+                       (lambda () 'done)
+                       (lambda (fiber outcome)
+                         (#3%$native-fiber-try-claim! scheduler)
+                         (#3%$native-fiber-finish fiber scheduler outcome))
+                       #b1100))
+                   (#3%$native-fiber-try-claim! task)
+                   (set! result
+                     (#3%$native-fiber-switch scheduler task 'start))))])
+          (if (not (native-fiber-wait-for-hook point))
+              (begin
+                (native-fiber-test-hook-release)
+                (thread-join worker)
+                #f)
+              (let ([foreign-claim #t])
+                (thread-join
+                  (fork-thread
+                    (lambda ()
+                      (#3%$native-fiber-adopt #b1000)
+                      (set! foreign-claim
+                        (#3%$native-fiber-try-claim! task)))))
+                (let* ([collector
+                       (and gc?
+                            (fork-thread
+                              (lambda ()
+                                (parameterize ([#%$enable-check-heap #t])
+                                  (collect-rendezvous)))))]
+                       [gc-overlap?
+                        (begin
+                          (when collector (thread-join collector))
+                          (or (not gc?)
+                              (and (fx= (native-fiber-test-hook-hit) point)
+                                   (fx= (native-fiber-test-hook-saw-gc) 1))))])
+                  (native-fiber-test-hook-release)
+                  (thread-join worker)
+                  (and (not foreign-claim)
+                       gc-overlap?
+                       (equal? result '(return . done))
+                       (eq? (#3%$native-fiber-state task) 'finished)
+                       (eq? (#3%$native-fiber-state scheduler) 'finished)))))))
+      native-fiber-test-hook-reset)))
+
+(define (native-fiber-death-test point action expected)
+  (define (slurp port)
+    (let loop ([chars '()])
+      (let ([char (read-char port)])
+        (if (eof-object? char)
+            (list->string (reverse chars))
+            (loop (cons char chars))))))
+  (let-values ([(to-stdin from-stdout from-stderr pid)
+                (open-process-ports
+                  (format "~a -q" (patch-exec-path *scheme*))
+                  (buffer-mode block)
+                  (native-transcoder))])
+    (for-each
+      (lambda (form) (pretty-print form to-stdin))
+      `((define arm
+          (foreign-procedure "(cs)native_fiber_test_hook_arm"
+            (iptr iptr iptr) void))
+        (define scheduler (#3%$native-fiber-adopt #b1000))
+        (define task #f)
+        (set! task
+          (#3%$native-fiber-create
+            (lambda () 'done)
+            (lambda (fiber outcome)
+              (#3%$native-fiber-try-claim! scheduler)
+              (#3%$native-fiber-finish fiber scheduler outcome))
+            #b1100))
+        (arm ,point 0 ,action)
+        (#3%$native-fiber-try-claim! task)
+        (#3%$native-fiber-switch scheduler task 'start)
+        (display "native-fiber-death-test-survived")))
+    (close-port to-stdin)
+    (let ([stdout (slurp from-stdout)]
+          [stderr (slurp from-stderr)])
+      (close-port from-stdout)
+      (close-port from-stderr)
+      (and (not (native-fiber-string-contains? stdout
+                  "native-fiber-death-test-survived"))
+           (native-fiber-string-contains? stderr expected)
+           #t))))
+
+(mat native-fiber-transition-fault-points
+  (andmap (lambda (point) (native-fiber-run-hook-point point #f))
+    '(1 2 3 4)))
+
+(mat native-fiber-concurrent-gc-handshake
+  (andmap (lambda (point) (native-fiber-run-hook-point point #t))
+    '(1 2 3 4)))
+
+(mat native-fiber-transition-death-tests
+  (native-fiber-death-test 1 1 "native-fiber source publication raced")
+  (native-fiber-death-test 3 2 "native-fiber commit publication raced")
+  (native-fiber-death-test 2 3 "native-fiber target return point is invalid")
+  (native-fiber-death-test 1 4 "native-fiber stack ownership overlaps")
+  (native-fiber-death-test 4 5 "native-fiber post-commit source corruption"))
+
+(mat native-fiber-repeated-claim-contention
+  (let rounds ([round 0])
+    (if (fx= round 24)
+        #t
+        (let* ([worker-count 6]
+               [task (#3%$native-fiber-create values values #b100)]
+               [m (make-mutex)]
+               [c (make-condition)]
+               [ready 0]
+               [done 0]
+               [go? #f]
+               [release? #f]
+               [wins 0]
+               [threads
+                (let loop ([i 0])
+                  (if (fx= i worker-count)
+                      '()
+                      (cons
+                        (fork-thread
+                          (lambda ()
+                            (#3%$native-fiber-adopt 0)
+                            (with-mutex m
+                              (set! ready (fx+ ready 1))
+                              (condition-broadcast c)
+                              (let wait ()
+                                (unless go?
+                                  (condition-wait c m)
+                                  (wait))))
+                            (let ([won? (#3%$native-fiber-try-claim! task)])
+                              (with-mutex m
+                                (when won? (set! wins (fx+ wins 1)))
+                                (set! done (fx+ done 1))
+                                (condition-broadcast c)
+                                (when won?
+                                  (let wait ()
+                                    (unless release?
+                                      (condition-wait c m)
+                                      (wait)))))
+                              (when won?
+                                (#3%$native-fiber-release-claim! task)))))
+                        (loop (fx+ i 1)))))])
+          (with-mutex m
+            (let wait ()
+              (unless (fx= ready worker-count)
+                (condition-wait c m)
+                (wait)))
+            (set! go? #t)
+            (condition-broadcast c)
+            (let wait ()
+              (unless (fx= done worker-count)
+                (condition-wait c m)
+                (wait)))
+            (set! release? #t)
+            (condition-broadcast c))
+          (for-each thread-join threads)
+          (and (fx= wins 1)
+               (eq? (#3%$native-fiber-state task) 'new)
+               (not (#3%$native-fiber-owner task))
+               (rounds (fx+ round 1)))))))
+
+(mat native-fiber-claimed-gc-root
+  (let* ([task (#3%$native-fiber-create values values #b100)]
+         [context-weak (weak-cons (#3%$record-ref task 1) #f)]
+         [m (make-mutex)]
+         [c (make-condition)]
+         [claimed? #f]
+         [release? #f]
+         [worker
+          (fork-thread
+            (lambda ()
+              (#3%$native-fiber-adopt 0)
+              (#3%$native-fiber-try-claim! task)
+              (with-mutex m
+                (set! claimed? #t)
+                (condition-broadcast c)
+                (let wait ()
+                  (unless release?
+                    (condition-wait c m)
+                    (wait))))
+              (#3%$native-fiber-release-claim! task)))])
+    (with-mutex m
+      (let wait ()
+        (unless claimed?
+          (condition-wait c m)
+          (wait))))
+    (parameterize ([#%$enable-check-heap #t])
+      (collect-rendezvous))
+    (let ([context (car context-weak)])
+      (with-mutex m
+        (set! release? #t)
+        (condition-broadcast c))
+      (thread-join worker)
+      (and context
+           (eq? (#3%$native-fiber-state task) 'new)
+           (not (#3%$native-fiber-owner task))))))
+
+(mat native-fiber-worker-exit-cleanup
+  (let ([task #f] [scheduler #f])
+    (thread-join
+      (fork-thread
+        (lambda ()
+          (set! scheduler (#3%$native-fiber-adopt #b1000))
+          (set! task (#3%$native-fiber-create values values #b1100))
+          (#3%$native-fiber-try-claim! task))))
+    (and (eq? (#3%$native-fiber-state task) 'new)
+         (not (#3%$native-fiber-owner task))
+         (eq? (#3%$native-fiber-state scheduler) 'finished)))
+  (let ([task #f] [scheduler #f] [cached-weak #f])
+    (thread-join
+      (fork-thread
+        (lambda ()
+          (set! scheduler (#3%$native-fiber-adopt #b1000))
+          (set! task
+            (#3%$native-fiber-create
+              (lambda ()
+                (#3%$native-fiber-try-claim! scheduler)
+                (#3%$native-fiber-switch task scheduler 'parked)
+                'unreachable)
+              (lambda (fiber outcome)
+                (#3%$native-fiber-try-claim! scheduler)
+                (#3%$native-fiber-finish fiber scheduler outcome))
+              #b1001))
+          (#3%$native-fiber-try-claim! task)
+          (#3%$native-fiber-switch scheduler task 'start)
+          ;; Leave a parked pinned task in the claimed handoff slot. Worker
+          ;; teardown must roll the claim back before retiring the task.
+          (#3%$native-fiber-try-claim! task)
+          (let ([cached (#3%$tc-field 'cached-frame (#3%$tc))])
+            (when cached (set! cached-weak (weak-cons cached #f)))))))
+    (collect (collect-maximum-generation))
+    (and (eq? (#3%$native-fiber-state task) 'finished)
+         (not (#3%$native-fiber-owner task))
+         (eq? (#3%$native-fiber-state scheduler) 'finished)
+         (or (not cached-weak) (bwp-object? (car cached-weak)))))
+  (let ([payload (vector 'worker-exit-preemption-root)] [weak #f])
+    (set! weak (weak-cons payload #f))
+    (thread-join
+      (fork-thread
+        (lambda ()
+          (#3%$native-fiber-adopt #b1000)
+          (#3%$tc-field 'native-fiber-preempt-payload (#3%$tc) payload))))
+    (set! payload #f)
+    (collect (collect-maximum-generation))
+    (bwp-object? (car weak))))
+
 (mat native-fiber-parallel-collector
   (let* ([n 4]
          [m (make-mutex)]

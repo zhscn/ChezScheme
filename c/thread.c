@@ -133,6 +133,12 @@ ptr S_create_thread_object(const char *who, ptr p_tc) {
 #ifdef tc_native_fiber_transition_disp
   /* Bootstrap thread-context ABIs may omit trailing extension fields. */
   NATIVEFIBERTRANSITION(tc) = Sfalse;
+#ifdef tc_native_fiber_claimed_disp
+  NATIVEFIBERCLAIMED(tc) = Sfalse;
+  NATIVEFIBERCLAIMEDCONTROL(tc) = Sfalse;
+  NATIVEFIBERPINNEDHEAD(tc) = Sfalse;
+  NATIVEFIBERTESTACTIVE(tc) = Sfalse;
+#endif
   NATIVEFIBERPREEMPTACTIVE(tc) = Sfalse;
   NATIVEFIBERPREEMPTTARGET(tc) = Sfalse;
   NATIVEFIBERPREEMPTPAYLOAD(tc) = Sfalse;
@@ -258,6 +264,18 @@ static IBOOL destroy_thread(ptr tc) {
   ptr *ls; IBOOL status;
 
   status = 0;
+#ifdef tc_native_fiber_claimed_disp
+  if (CURRENTNATIVEFIBER(tc) != Sfalse
+      || NATIVEFIBERTRANSITION(tc) != Sfalse
+      || NATIVEFIBERCLAIMED(tc) != Sfalse
+      || NATIVEFIBERCLAIMEDCONTROL(tc) != Sfalse
+      || NATIVEFIBERPINNEDHEAD(tc) != Sfalse
+      || NATIVEFIBERTESTACTIVE(tc) != Sfalse
+      || NATIVEFIBERPREEMPTACTIVE(tc) != Sfalse
+      || NATIVEFIBERPREEMPTTARGET(tc) != Sfalse
+      || NATIVEFIBERPREEMPTPAYLOAD(tc) != Sfalse)
+    S_error_abort("native-fiber worker exited with live runtime state");
+#endif
   tc_mutex_acquire();
   ls = &S_threads;
   while (*ls != Snil) {

@@ -1170,10 +1170,14 @@
     (#3%$native-fiber-try-claim! fiber)
     (set-cdr! handlers handlers)
     (#3%$record-set! fiber 2 handlers)
-    (parameterize ([#%$enable-check-heap #t])
-      (guard (condition [else #t])
-        (#3%$native-fiber-switch scheduler fiber 'corrupt)
-        #f)))
+    (let ([rejected?
+           (parameterize ([#%$enable-check-heap #t])
+             (guard (condition [else #t])
+               (#3%$native-fiber-switch scheduler fiber 'corrupt)
+               #f))])
+      (#3%$record-set! fiber 2 #f)
+      (#3%$native-fiber-release-claim! fiber)
+      rejected?))
   (let* ([tc (#3%$tc)]
          [old (#3%$fiber-switch-prohibited-depth)]
          [rejected? #f])
