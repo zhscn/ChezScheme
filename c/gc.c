@@ -886,6 +886,10 @@ static ptr copy_stack(thread_gc *tgc, ptr old, iptr *length, iptr clength) {
             pend_final_ls = ls;                                 \
           }                                                     \
         }                                                       \
+      } else {                                                  \
+        if (S_checkheap)                                        \
+          S_checkheap_note_guardian(                            \
+            ls, CHECKHEAP_GUARDIAN_DROP);                       \
       }                                                         \
     }                                                           \
   } while (0)
@@ -980,7 +984,8 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
 
    /* perform after ScanDirty */
     if (S_checkheap) {
-      S_checkheap_begin_mark_check(MAX_CG, count_roots_ls);
+      S_checkheap_begin_mark_check(MAX_CG, MIN_TG, MAX_TG,
+                                   count_roots_ls);
       S_check_heap(0, MAX_CG);
       S_checkheap_finish_mark_check();
     }
@@ -1398,7 +1403,12 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
                 /* Caution: Building in assumption about shape of an ftype pointer */
                   addr = TO_VOIDP(RECORDINSTIT(rep, 0));
                   LOCKED_DECR(addr, b);
-                  if (!b) continue;
+                  if (!b) {
+                    if (S_checkheap)
+                      S_checkheap_note_guardian(
+                        ls, CHECKHEAP_GUARDIAN_DROP);
+                    continue;
+                  }
                 }
 
                 if (!do_ordered && (GUARDIANORDERED(ls) == Strue)) {
@@ -1432,6 +1442,10 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
                 /* if tconc was old it's been forwarded */
                   tconc = GUARDIANTCONC(ls);
 
+                  if (S_checkheap)
+                    S_checkheap_note_guardian(
+                      ls, CHECKHEAP_GUARDIAN_FINAL);
+
                   WITH_TOP_BACKREFERENCE(tconc, relocate_pure_now(&rep));
 
                   old_end = Scdr(tconc);
@@ -1463,7 +1477,12 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
               next = GUARDIANNEXT(ls); 
 
               /* discard static pend_hold_ls entries */
-              if (g == static_generation) continue;
+              if (g == static_generation) {
+                if (S_checkheap)
+                  S_checkheap_note_guardian(
+                    ls, CHECKHEAP_GUARDIAN_DROP);
+                continue;
+              }
               
               tconc = GUARDIANTCONC(ls);
 
@@ -1482,6 +1501,10 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
               rep = GUARDIANREP(ls);
               WITH_TOP_BACKREFERENCE(tconc, relocate_pure_now(&rep));
               relocate_rep = 1;
+
+              if (S_checkheap)
+                S_checkheap_note_guardian(
+                  ls, CHECKHEAP_GUARDIAN_HOLD);
 
 #ifdef ENABLE_OBJECT_COUNTS
                 S_G.countof[g][countof_guardian] += 1;
@@ -1581,6 +1604,9 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
 
    /* still-pending ephemerons all go to bwp */
     finish_pending_ephemerons(tgc, oldspacesegments);
+
+    if (S_checkheap)
+      S_checkheap_verify_finalization_check(oldspacesegments);
 
     ACCUM_REAL_TIME(collect_accum, step, start);
     REPORT_TIME(fprintf(stderr, "%d coll  +%ld ms  %ld ms  [real time]\n",

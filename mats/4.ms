@@ -5033,6 +5033,82 @@
      #t)
   )
 
+(mat gc-finalization-check
+  ;; Ordered guardians defer an object retained by another representative.
+  (parameterize ([#%$enable-check-heap #t])
+    (with-interrupts-disabled
+      (let ([g1 (make-guardian #t)]
+            [g2 (make-guardian #t)]
+            [s (gensym)])
+        (g1 s)
+        (g2 (list s))
+        (set! s #f)
+        (collect (collect-maximum-generation))
+        (and (list? (g2))
+             (not (g1))
+             (begin
+               (collect (collect-maximum-generation))
+               (and (symbol? (g1))
+                    (not (g2))))))))
+
+  ;; Unordered guardians expose all ready representatives in one round.
+  (parameterize ([#%$enable-check-heap #t])
+    (with-interrupts-disabled
+      (let ([g1 (make-guardian)]
+            [g2 (make-guardian)]
+            [s (gensym)])
+        (g1 s)
+        (g2 (list s))
+        (set! s #f)
+        (collect (collect-maximum-generation))
+        (and (list? (g2))
+             (symbol? (g1))
+             (not (g1))
+             (not (g2))))))
+
+  ;; Weak pairs and ephemerons distinguish live and unreachable keys.
+  (parameterize ([#%$enable-check-heap #t])
+    (with-interrupts-disabled
+      (let* ([live (gensym)]
+             [dead (gensym)]
+             [wp-live (weak-cons live #f)]
+             [wp-dead (weak-cons dead #f)]
+             [e-live (ephemeron-cons live '(kept))]
+             [e-dead (ephemeron-cons dead '(dropped))])
+        (set! dead #f)
+        (collect (collect-maximum-generation))
+        (and (eq? (car wp-live) live)
+             (bwp-object? (car wp-dead))
+             (eq? (car e-live) live)
+             (equal? (cdr e-live) '(kept))
+             (bwp-object? (car e-dead))
+             (bwp-object? (cdr e-dead))
+             (begin (keep-live live) #t)))))
+
+  ;; Shared ftype reference counts finalize exactly one wrapper at zero.
+  (parameterize ([#%$enable-check-heap #t])
+    (with-interrupts-disabled
+      (define-ftype A (struct (refcount iptr) (x int)))
+      (define g (ftype-guardian A))
+      (define addr (foreign-alloc (ftype-sizeof A)))
+      (define holder (box #f))
+      (let ([a1 (make-ftype-pointer A addr)]
+            [a2 (make-ftype-pointer A addr)])
+        (ftype-set! A (refcount) a1 0)
+        (ftype-locked-incr! A (refcount) a1)
+        (ftype-locked-incr! A (refcount) a2)
+        (g a1)
+        (g a2)
+        (set-box! holder (cons a1 a2)))
+      (set-box! holder #f)
+      (collect (collect-maximum-generation))
+      (let ([v (g)])
+        (and v
+             (eqv? (ftype-ref A (refcount) v) 0)
+             (not (g))
+             (begin (foreign-free addr) #t)))))
+  )
+
 (mat weak-cons
    (procedure? weak-cons)
    (procedure? weak-pair?)

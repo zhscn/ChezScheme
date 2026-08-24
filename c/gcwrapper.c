@@ -891,6 +891,7 @@ typedef struct {
   uptr segment;
   IGEN generation;
   unsigned char *bits;
+  unsigned char *initial_bits;
   uptr *official_bits;
 } shadow_segment;
 
@@ -902,6 +903,32 @@ typedef struct {
 } shadow_ephemeron_entry;
 
 typedef struct {
+  ptr pair;
+  ptr value;
+} shadow_weak_entry;
+
+typedef struct {
+  ptr entry;
+  ptr object;
+  ptr representative;
+  ptr tconc;
+  size_t ftype_counter;
+  IBOOL eligible;
+  IBOOL ordered;
+  IBOOL target_is_static;
+  int expected_action;
+  int observed_action;
+  int probed;
+  int probe_scanned;
+  int root_added;
+} shadow_guardian_entry;
+
+typedef struct {
+  void *address;
+  iptr remaining;
+} shadow_ftype_counter;
+
+typedef struct {
   shadow_segment *segments;
   size_t segment_capacity;
   size_t segment_count;
@@ -911,7 +938,20 @@ typedef struct {
   shadow_ephemeron_entry *ephemerons;
   size_t ephemeron_capacity;
   size_t ephemeron_count;
+  shadow_weak_entry *weak_entries;
+  size_t weak_capacity;
+  size_t weak_count;
+  shadow_guardian_entry *guardian_entries;
+  size_t guardian_capacity;
+  size_t guardian_count;
+  size_t *guardian_slots;
+  size_t guardian_slot_capacity;
+  shadow_ftype_counter *ftype_counters;
+  size_t ftype_counter_capacity;
+  size_t ftype_counter_count;
   IGEN maximum_collected_generation;
+  IGEN minimum_target_generation;
+  IGEN maximum_target_generation;
   int phase;
 } shadow_state;
 
@@ -947,6 +987,7 @@ static void shadow_rehash(size_t capacity) {
     shadow.segments[i].segment = SHADOW_EMPTY_SEGMENT;
     shadow.segments[i].generation = 0;
     shadow.segments[i].bits = NULL;
+    shadow.segments[i].initial_bits = NULL;
     shadow.segments[i].official_bits = NULL;
   }
 
@@ -1101,12 +1142,33 @@ static void shadow_ephemeron(ptr p) {
 }
 
 static void shadow_weak_pair(ptr p) {
-  (void)p;
+  shadow_weak_entry *entries;
+  size_t capacity;
+
+  /* An ordered guardian can scan through a representative without retaining
+   * the representative itself. Only inventory weak pairs that are themselves
+   * in the expected live set. */
+  if (shadow.phase != SHADOW_PHASE_PREPARING
+      || !shadow_expected_marked(p))
+    return;
+  if (shadow.weak_count == shadow.weak_capacity) {
+    capacity = shadow.weak_capacity == 0 ? 64 : shadow.weak_capacity * 2;
+    entries = (shadow_weak_entry *)realloc(
+      shadow.weak_entries, capacity * sizeof(shadow_weak_entry));
+    if (entries == NULL)
+      S_error_abort("check_heap: cannot enlarge shadow weak-pair inventory");
+    shadow.weak_entries = entries;
+    shadow.weak_capacity = capacity;
+  }
+  shadow.weak_entries[shadow.weak_count].pair = p;
+  shadow.weak_entries[shadow.weak_count].value = Scar(p);
+  shadow.weak_count += 1;
 }
 
 static IBOOL shadow_ephemeron_key_live(ptr key) {
   seginfo *si;
 
+  if (key == Sbwp_object) return 0;
   if (FIXMEDIATE(key)
       || (si = MaybeSegInfo(ptr_get_segment(key))) == NULL
       || si->generation > shadow.maximum_collected_generation)
@@ -1134,6 +1196,309 @@ static void shadow_drain_expected(void) {
   }
 }
 
+#define SHADOW_GUARDIAN_EMPTY ((size_t)-1)
+
+static size_t shadow_guardian_hash(ptr entry, size_t capacity) {
+  uptr n = (uptr)TO_PTR(entry);
+  n ^= n >> 17;
+  n *= (uptr)0xed5ad4bbU;
+  n ^= n >> 11;
+  return (size_t)n & (capacity - 1);
+}
+
+static void shadow_guardian_rehash(size_t capacity) {
+  size_t *old_slots = shadow.guardian_slots;
+  size_t old_capacity = shadow.guardian_slot_capacity;
+  size_t i;
+
+  shadow.guardian_slots = (size_t *)malloc(capacity * sizeof(size_t));
+  if (shadow.guardian_slots == NULL)
+    S_error_abort("check_heap: cannot allocate guardian index");
+  shadow.guardian_slot_capacity = capacity;
+  for (i = 0; i < capacity; i += 1)
+    shadow.guardian_slots[i] = SHADOW_GUARDIAN_EMPTY;
+
+  if (old_slots != NULL) {
+    for (i = 0; i < old_capacity; i += 1) {
+      size_t index = old_slots[i];
+      if (index != SHADOW_GUARDIAN_EMPTY) {
+        size_t at = shadow_guardian_hash(
+          shadow.guardian_entries[index].entry, capacity);
+        while (shadow.guardian_slots[at] != SHADOW_GUARDIAN_EMPTY)
+          at = (at + 1) & (capacity - 1);
+        shadow.guardian_slots[at] = index;
+      }
+    }
+    free(old_slots);
+  }
+}
+
+static shadow_guardian_entry *shadow_find_guardian(ptr entry) {
+  size_t at;
+
+  if (shadow.guardian_slot_capacity == 0) return NULL;
+  at = shadow_guardian_hash(entry, shadow.guardian_slot_capacity);
+  while (shadow.guardian_slots[at] != SHADOW_GUARDIAN_EMPTY) {
+    shadow_guardian_entry *g =
+      &shadow.guardian_entries[shadow.guardian_slots[at]];
+    if (g->entry == entry) return g;
+    at = (at + 1) & (shadow.guardian_slot_capacity - 1);
+  }
+  return NULL;
+}
+
+static IGEN shadow_target_generation(IGEN generation) {
+  if (generation == shadow.maximum_target_generation)
+    return generation;
+  if (generation < shadow.minimum_target_generation)
+    return shadow.minimum_target_generation;
+  return generation + 1;
+}
+
+#define SHADOW_NO_FTYPE_COUNTER ((size_t)-1)
+
+static size_t shadow_add_ftype_counter(void *address) {
+  shadow_ftype_counter *counters;
+  size_t i, capacity;
+
+  for (i = 0; i < shadow.ftype_counter_count; i += 1)
+    if (shadow.ftype_counters[i].address == address)
+      return i;
+
+  if (shadow.ftype_counter_count == shadow.ftype_counter_capacity) {
+    capacity = shadow.ftype_counter_capacity == 0
+                 ? 16 : shadow.ftype_counter_capacity * 2;
+    counters = (shadow_ftype_counter *)realloc(
+      shadow.ftype_counters, capacity * sizeof(shadow_ftype_counter));
+    if (counters == NULL)
+      S_error_abort("check_heap: cannot enlarge ftype-counter inventory");
+    shadow.ftype_counters = counters;
+    shadow.ftype_counter_capacity = capacity;
+  }
+
+  i = shadow.ftype_counter_count++;
+  shadow.ftype_counters[i].address = address;
+  shadow.ftype_counters[i].remaining = *(volatile iptr *)address;
+  return i;
+}
+
+static void shadow_add_guardian(ptr entry, IBOOL eligible) {
+  shadow_guardian_entry *entries, *g;
+  seginfo *entry_si;
+  size_t capacity, at, index;
+
+  if (shadow_find_guardian(entry) != NULL)
+    S_error_abort("check_heap: duplicate guardian inventory entry");
+
+  if (shadow.guardian_slot_capacity == 0)
+    shadow_guardian_rehash(64);
+  else if ((shadow.guardian_count + 1) * 2
+           >= shadow.guardian_slot_capacity)
+    shadow_guardian_rehash(shadow.guardian_slot_capacity * 2);
+
+  if (shadow.guardian_count == shadow.guardian_capacity) {
+    capacity = shadow.guardian_capacity == 0
+                 ? 64 : shadow.guardian_capacity * 2;
+    entries = (shadow_guardian_entry *)realloc(
+      shadow.guardian_entries, capacity * sizeof(shadow_guardian_entry));
+    if (entries == NULL)
+      S_error_abort("check_heap: cannot enlarge guardian inventory");
+    shadow.guardian_entries = entries;
+    shadow.guardian_capacity = capacity;
+  }
+
+  index = shadow.guardian_count++;
+  g = &shadow.guardian_entries[index];
+  memset(g, 0, sizeof(*g));
+  g->entry = entry;
+  g->object = GUARDIANOBJ(entry);
+  g->representative = GUARDIANREP(entry);
+  g->tconc = GUARDIANTCONC(entry);
+  g->ftype_counter = SHADOW_NO_FTYPE_COUNTER;
+  g->eligible = eligible;
+  g->ordered = GUARDIANORDERED(entry) == Strue;
+  entry_si = SegInfo(ptr_get_segment(entry));
+  g->target_is_static =
+    shadow_target_generation(entry_si->generation) == static_generation;
+
+  if (g->representative == ftype_guardian_rep && eligible) {
+    ptr address = RECORDINSTIT(g->object, 0);
+    g->ftype_counter = shadow_add_ftype_counter(TO_VOIDP(address));
+  }
+
+  at = shadow_guardian_hash(entry, shadow.guardian_slot_capacity);
+  while (shadow.guardian_slots[at] != SHADOW_GUARDIAN_EMPTY)
+    at = (at + 1) & (shadow.guardian_slot_capacity - 1);
+  shadow.guardian_slots[at] = index;
+}
+
+static IBOOL shadow_value_live(ptr p) {
+  seginfo *si;
+
+  if (p == Sbwp_object) return 0;
+  if (FIXMEDIATE(p)
+      || (si = MaybeSegInfo(ptr_get_segment(p))) == NULL
+      || si->generation > shadow.maximum_collected_generation)
+    return 1;
+  return shadow_expected_marked(p);
+}
+
+static void shadow_set_guardian_action(shadow_guardian_entry *g,
+                                       int action) {
+  if (g->expected_action != 0)
+    S_error_abort("check_heap: guardian oracle decided an entry twice");
+
+  if (action == CHECKHEAP_GUARDIAN_HOLD && g->target_is_static)
+    action = CHECKHEAP_GUARDIAN_DROP;
+  if (action == CHECKHEAP_GUARDIAN_FINAL
+      && g->ftype_counter != SHADOW_NO_FTYPE_COUNTER) {
+    shadow_ftype_counter *counter =
+      &shadow.ftype_counters[g->ftype_counter];
+    if (counter->remaining <= 0)
+      S_error_abort("check_heap: invalid ftype guardian reference count");
+    counter->remaining -= 1;
+    if (counter->remaining != 0)
+      action = CHECKHEAP_GUARDIAN_DROP;
+  }
+  g->expected_action = action;
+}
+
+static void shadow_apply_guardian_roots(void) {
+  size_t i;
+
+  for (i = 0; i < shadow.guardian_count; i += 1) {
+    shadow_guardian_entry *g = &shadow.guardian_entries[i];
+    if (!g->root_added
+        && (g->expected_action == CHECKHEAP_GUARDIAN_HOLD
+            || g->expected_action == CHECKHEAP_GUARDIAN_FINAL)) {
+      ptr representative =
+        g->representative == ftype_guardian_rep
+          ? g->object : g->representative;
+      g->root_added = 1;
+      shadow_expected_pointer(representative);
+    }
+  }
+  shadow_drain_expected();
+}
+
+static void shadow_scan_guardian_probes(void) {
+  size_t i;
+
+  for (i = 0; i < shadow.guardian_count; i += 1) {
+    shadow_guardian_entry *g = &shadow.guardian_entries[i];
+    if (g->probed && !g->probe_scanned) {
+      ptr representative = g->representative;
+      seginfo *si;
+      g->probe_scanned = 1;
+      if (!FIXMEDIATE(representative)
+          && (si = MaybeSegInfo(ptr_get_segment(representative))) != NULL
+          && si->generation <= shadow.maximum_collected_generation)
+        checkmark_object(representative);
+    }
+  }
+  shadow_drain_expected();
+}
+
+static void shadow_snapshot_guardians(void) {
+  IGEN generation;
+  ptr threads, ls;
+
+  for (threads = S_threads; threads != Snil; threads = Scdr(threads)) {
+    ptr tc = (ptr)THREADTC(Scar(threads));
+    for (ls = GUARDIANENTRIES(tc); ls != Snil; ls = GUARDIANNEXT(ls)) {
+      ptr object = GUARDIANOBJ(ls);
+      seginfo *si = FIXMEDIATE(object)
+                      ? NULL : MaybeSegInfo(ptr_get_segment(object));
+      shadow_add_guardian(
+        ls, si != NULL && si->generation != static_generation);
+    }
+  }
+
+  for (generation = 0;
+       generation <= shadow.maximum_collected_generation;
+       generation += 1)
+    for (ls = S_G.guardians[generation]; ls != Snil;
+         ls = GUARDIANNEXT(ls))
+      shadow_add_guardian(ls, 1);
+}
+
+static void shadow_compute_guardians(void) {
+  size_t i;
+  IBOOL changed;
+
+  /* Unordered guardians finalize in batches. Ordered guardians first expose
+   * the representative's outgoing closure without retaining the
+   * representative itself. */
+  do {
+    changed = 0;
+    for (i = shadow.guardian_count; i != 0; i -= 1) {
+      shadow_guardian_entry *g = &shadow.guardian_entries[i - 1];
+      if (g->expected_action != 0 || g->probed) continue;
+      if (!g->eligible) {
+        shadow_set_guardian_action(g, CHECKHEAP_GUARDIAN_DROP);
+        changed = 1;
+      } else if (shadow_value_live(g->object)) {
+        if (g->target_is_static || shadow_value_live(g->tconc)) {
+          shadow_set_guardian_action(g, CHECKHEAP_GUARDIAN_HOLD);
+          changed = 1;
+        }
+      } else if (shadow_value_live(g->tconc)) {
+        if (g->ordered)
+          g->probed = 1;
+        else
+          shadow_set_guardian_action(g, CHECKHEAP_GUARDIAN_FINAL);
+        changed = 1;
+      }
+    }
+
+    shadow_apply_guardian_roots();
+    shadow_scan_guardian_probes();
+
+    for (i = shadow.guardian_count; i != 0; i -= 1) {
+      shadow_guardian_entry *g = &shadow.guardian_entries[i - 1];
+      if (g->expected_action == 0 && g->probed
+          && shadow_value_live(g->object)) {
+        shadow_set_guardian_action(g, CHECKHEAP_GUARDIAN_HOLD);
+        changed = 1;
+      }
+    }
+    shadow_apply_guardian_roots();
+  } while (changed);
+
+  /* Once probing reaches a fixed point, the remaining ordered candidates are
+   * finalized. Their representatives can make additional pending guardians
+   * actionable, but ordered probing is over for this collection. */
+  for (i = shadow.guardian_count; i != 0; i -= 1) {
+    shadow_guardian_entry *g = &shadow.guardian_entries[i - 1];
+    if (g->expected_action == 0 && g->probed)
+      shadow_set_guardian_action(g, CHECKHEAP_GUARDIAN_FINAL);
+  }
+  shadow_apply_guardian_roots();
+
+  do {
+    changed = 0;
+    for (i = shadow.guardian_count; i != 0; i -= 1) {
+      shadow_guardian_entry *g = &shadow.guardian_entries[i - 1];
+      if (g->expected_action != 0) continue;
+      if (shadow_value_live(g->object)) {
+        if (g->target_is_static || shadow_value_live(g->tconc)) {
+          shadow_set_guardian_action(g, CHECKHEAP_GUARDIAN_HOLD);
+          changed = 1;
+        }
+      } else if (shadow_value_live(g->tconc)) {
+        shadow_set_guardian_action(g, CHECKHEAP_GUARDIAN_FINAL);
+        changed = 1;
+      }
+    }
+    shadow_apply_guardian_roots();
+  } while (changed);
+
+  for (i = 0; i < shadow.guardian_count; i += 1)
+    if (shadow.guardian_entries[i].expected_action == 0)
+      shadow_set_guardian_action(&shadow.guardian_entries[i],
+                                 CHECKHEAP_GUARDIAN_DROP);
+}
+
 static void shadow_reset(void) {
   size_t i;
 
@@ -1142,10 +1507,17 @@ static void shadow_reset(void) {
       free(shadow.segments[i].bits);
   for (i = 0; i < shadow.segment_capacity; i += 1)
     if (shadow.segments[i].segment != SHADOW_EMPTY_SEGMENT)
+      free(shadow.segments[i].initial_bits);
+  for (i = 0; i < shadow.segment_capacity; i += 1)
+    if (shadow.segments[i].segment != SHADOW_EMPTY_SEGMENT)
       free(shadow.segments[i].official_bits);
   free(shadow.segments);
   free(shadow.work);
   free(shadow.ephemerons);
+  free(shadow.weak_entries);
+  free(shadow.guardian_entries);
+  free(shadow.guardian_slots);
+  free(shadow.ftype_counters);
   memset(&shadow, 0, sizeof(shadow));
 }
 
@@ -1172,7 +1544,8 @@ static void shadow_seed_checked_pointer(ptr *pp, ptr p, uptr seg, ISPC s) {
   }
 }
 
-void S_checkheap_begin_mark_check(IGEN mcg, ptr count_roots_ls) {
+void S_checkheap_begin_mark_check(IGEN mcg, IGEN min_tg, IGEN max_tg,
+                                  ptr count_roots_ls) {
   IGEN g;
   ISPC s;
   uptr i;
@@ -1183,6 +1556,8 @@ void S_checkheap_begin_mark_check(IGEN mcg, ptr count_roots_ls) {
 
   shadow.phase = SHADOW_PHASE_PREPARING;
   shadow.maximum_collected_generation = mcg;
+  shadow.minimum_target_generation = min_tg;
+  shadow.maximum_target_generation = max_tg;
 
   for (g = 0; g <= mcg; INCRGEN(g))
     for (s = 0; s <= max_real_space; s += 1) {
@@ -1223,8 +1598,24 @@ void S_checkheap_begin_mark_check(IGEN mcg, ptr count_roots_ls) {
 }
 
 void S_checkheap_finish_mark_check(void) {
+  size_t i;
+
   if (shadow.phase != SHADOW_PHASE_PREPARING) return;
   shadow_drain_expected();
+
+  for (i = 0; i < shadow.segment_capacity; i += 1) {
+    shadow_segment *ss = &shadow.segments[i];
+    if (ss->segment != SHADOW_EMPTY_SEGMENT
+        && ss->generation <= shadow.maximum_collected_generation) {
+      ss->initial_bits = (unsigned char *)malloc(segment_bitmap_bytes);
+      if (ss->initial_bits == NULL)
+        S_error_abort("check_heap: cannot allocate initial-mark bitmap");
+      memcpy(ss->initial_bits, ss->bits, segment_bitmap_bytes);
+    }
+  }
+
+  shadow_snapshot_guardians();
+  shadow_compute_guardians();
   shadow.phase = SHADOW_PHASE_COLLECTING;
 }
 
@@ -1247,23 +1638,26 @@ void S_checkheap_note_reached(ptr p) {
                                   (ptr)old, (ptr)(old | mask)));
 }
 
-void S_checkheap_verify_mark_check(void) {
+static void shadow_compare_official(const char *stage,
+                                    IBOOL use_initial_bits) {
   size_t i;
 
-  if (shadow.phase != SHADOW_PHASE_COLLECTING) return;
   for (i = 0; i < shadow.segment_capacity; i += 1) {
     shadow_segment *ss = &shadow.segments[i];
+    unsigned char *expected_bits =
+      use_initial_bits ? ss->initial_bits : ss->bits;
     uptr byte;
     IBOOL described_segment = 0;
     if (ss->segment == SHADOW_EMPTY_SEGMENT
-        || ss->generation > shadow.maximum_collected_generation)
+        || ss->generation > shadow.maximum_collected_generation
+        || expected_bits == NULL)
       continue;
     for (byte = 0; byte < segment_bitmap_bytes; byte += 1) {
       uptr word = byte / sizeof(uptr);
       uptr shift = (byte % sizeof(uptr)) * 8;
       unsigned int official = (unsigned int)
         ((ss->official_bits[word] >> shift) & 0xff);
-      unsigned int expected = ss->bits[byte];
+      unsigned int expected = expected_bits[byte];
       unsigned int missing = expected & ~official;
       unsigned int extra = official & ~expected;
       unsigned int bit_index;
@@ -1276,7 +1670,8 @@ void S_checkheap_verify_mark_check(void) {
         if (missing & bit) {
           S_checkheap_errors += 1;
           fprintf(stderr,
-                  "!!! checkmark found reachable object omitted by collector at %p\n",
+                  "!!! %s checkmark found reachable object omitted by collector at %p\n",
+                  stage,
                   TO_VOIDP(build_ptr(ss->segment,
                     ((byte << 3) + bit_index) << log2_ptr_bytes)));
         }
@@ -1286,13 +1681,152 @@ void S_checkheap_verify_mark_check(void) {
         if (extra & bit) {
           S_checkheap_errors += 1;
           fprintf(stderr,
-                  "!!! checkmark found unreachable object retained by collector at %p\n",
+                  "!!! %s checkmark found unreachable object retained by collector at %p\n",
+                  stage,
                   TO_VOIDP(build_ptr(ss->segment,
                     ((byte << 3) + bit_index) << log2_ptr_bytes)));
         }
       }
     }
   }
+}
+
+void S_checkheap_verify_mark_check(void) {
+  if (shadow.phase != SHADOW_PHASE_COLLECTING) return;
+  shadow_compare_official("initial", 1);
+}
+
+void S_checkheap_note_guardian(ptr entry, int action) {
+  shadow_guardian_entry *g;
+
+  if (shadow.phase != SHADOW_PHASE_COLLECTING) return;
+  g = shadow_find_guardian(entry);
+  if (g == NULL) {
+    S_checkheap_errors += 1;
+    fprintf(stderr,
+            "!!! guardian oracle observed an uninventoried entry at %p\n",
+            TO_VOIDP(entry));
+    return;
+  }
+  if (g->observed_action != 0) {
+    S_checkheap_errors += 1;
+    fprintf(stderr,
+            "!!! guardian oracle observed entry %p more than once\n",
+            TO_VOIDP(entry));
+    return;
+  }
+  g->observed_action = action;
+  if (g->expected_action != action) {
+    S_checkheap_errors += 1;
+    fprintf(stderr,
+            "!!! guardian oracle expected action %d but observed %d for entry %p\n",
+            g->expected_action, action, TO_VOIDP(entry));
+  }
+}
+
+static IBOOL shadow_relocated_container(ptr source, ptr *destination) {
+  seginfo *si;
+
+  if (FIXMEDIATE(source)
+      || (si = MaybeSegInfo(ptr_get_segment(source))) == NULL
+      || si->generation > shadow.maximum_collected_generation) {
+    *destination = source;
+    return 1;
+  }
+  if (si->marked_mask != NULL
+      && (si->marked_mask[segment_bitmap_byte(source)]
+          & segment_bitmap_bit(source))) {
+    *destination = source;
+    return 1;
+  }
+  if (FWDMARKER(source) == forward_marker) {
+    *destination = FWDADDRESS(source);
+    return 1;
+  }
+  return 0;
+}
+
+static void shadow_verify_weak_entries(void) {
+  size_t i;
+
+  for (i = 0; i < shadow.weak_count; i += 1) {
+    shadow_weak_entry *entry = &shadow.weak_entries[i];
+    ptr pair;
+    IBOOL expected_live = shadow_value_live(entry->value);
+    if (!shadow_relocated_container(entry->pair, &pair)) {
+      S_checkheap_errors += 1;
+      fprintf(stderr,
+              "!!! weak oracle lost reachable weak pair %p\n",
+              TO_VOIDP(entry->pair));
+    } else if ((expected_live && Scar(pair) == Sbwp_object)
+               || (!expected_live && Scar(pair) != Sbwp_object)) {
+      S_checkheap_errors += 1;
+      fprintf(stderr,
+              "!!! weak oracle expected %s value for pair %p"
+              " (source value %p, current value %p)\n",
+              expected_live ? "a live" : "a cleared",
+              TO_VOIDP(entry->pair), TO_VOIDP(entry->value),
+              TO_VOIDP(Scar(pair)));
+    }
+  }
+}
+
+static void shadow_verify_ephemerons(void) {
+  size_t i;
+
+  for (i = 0; i < shadow.ephemeron_count; i += 1) {
+    shadow_ephemeron_entry *entry = &shadow.ephemerons[i];
+    ptr ephemeron;
+    if (!shadow_expected_marked(entry->object)) continue;
+    if (!shadow_relocated_container(entry->object, &ephemeron)) {
+      S_checkheap_errors += 1;
+      fprintf(stderr,
+              "!!! ephemeron oracle lost reachable ephemeron %p\n",
+              TO_VOIDP(entry->object));
+    } else if (entry->activated) {
+      if (Scar(ephemeron) == Sbwp_object
+          || Scdr(ephemeron) == Sbwp_object) {
+        S_checkheap_errors += 1;
+        fprintf(stderr,
+                "!!! ephemeron oracle cleared live ephemeron %p\n",
+                TO_VOIDP(entry->object));
+      }
+    } else if (Scar(ephemeron) != Sbwp_object
+               || Scdr(ephemeron) != Sbwp_object) {
+      S_checkheap_errors += 1;
+      fprintf(stderr,
+              "!!! ephemeron oracle retained dead ephemeron fields at %p\n",
+              TO_VOIDP(entry->object));
+    }
+  }
+}
+
+void S_checkheap_verify_finalization_check(seginfo *oldspacesegments) {
+  seginfo *si;
+  size_t i;
+
+  if (shadow.phase != SHADOW_PHASE_COLLECTING) return;
+
+  for (si = oldspacesegments; si != NULL; si = si->next) {
+    ptr entry;
+    for (entry = si->trigger_guardians; entry != 0;
+         entry = GUARDIANNEXT(entry))
+      S_checkheap_note_guardian(entry, CHECKHEAP_GUARDIAN_DROP);
+  }
+
+  for (i = 0; i < shadow.guardian_count; i += 1) {
+    shadow_guardian_entry *g = &shadow.guardian_entries[i];
+    if (g->observed_action == 0) {
+      S_checkheap_errors += 1;
+      fprintf(stderr,
+              "!!! guardian oracle did not observe expected action %d for entry %p\n",
+              g->expected_action, TO_VOIDP(g->entry));
+    }
+  }
+
+  shadow_compare_official("finalization", 0);
+  shadow_verify_weak_entries();
+  shadow_verify_ephemerons();
   shadow_reset();
 }
 

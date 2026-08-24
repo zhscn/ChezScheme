@@ -184,10 +184,17 @@ extern ptr S_locked_objects(void);
 extern ptr S_unregister_guardian(ptr tconc);
 extern void S_compact_heap(void);
 extern void S_check_heap(IBOOL aftergc, IGEN target_gen);
-extern void S_checkheap_begin_mark_check(IGEN target_gen, ptr count_roots_ls);
+extern void S_checkheap_begin_mark_check(IGEN max_cg, IGEN min_tg,
+                                         IGEN max_tg, ptr count_roots_ls);
 extern void S_checkheap_finish_mark_check(void);
 extern void S_checkheap_note_reached(ptr p);
 extern void S_checkheap_verify_mark_check(void);
+extern void S_checkheap_note_guardian(ptr entry, int action);
+extern void S_checkheap_verify_finalization_check(seginfo *oldspacesegments);
+
+#define CHECKHEAP_GUARDIAN_HOLD 1
+#define CHECKHEAP_GUARDIAN_FINAL 2
+#define CHECKHEAP_GUARDIAN_DROP 3
 
 /* gc-011.c */
 extern void S_gc_011(ptr tc);
