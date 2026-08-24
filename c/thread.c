@@ -130,6 +130,13 @@ ptr S_create_thread_object(const char *who, ptr p_tc) {
   CACHEDFRAME(tc) = Sfalse;
   CURRENTNATIVEFIBER(tc) = Sfalse;
   FIBERSWITCHPROHIBITEDDEPTH(tc) = FIX(0);
+#ifdef tc_native_fiber_transition_disp
+  /* Bootstrap thread-context ABIs may omit trailing extension fields. */
+  NATIVEFIBERTRANSITION(tc) = Sfalse;
+  NATIVEFIBERPREEMPTACTIVE(tc) = Sfalse;
+  NATIVEFIBERPREEMPTTARGET(tc) = Sfalse;
+  NATIVEFIBERPREEMPTPAYLOAD(tc) = Sfalse;
+#endif
   STACKLINK(tc) = SYMVAL(S_G.null_continuation_id);
   STACKCACHE(tc) = Snil;
 

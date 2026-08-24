@@ -1033,8 +1033,7 @@
                  (and (#3%$native-fiber-try-claim! scheduler)
                       (let ([transfer
                              (#3%$native-fiber-switch task scheduler 'yielded)])
-                        (and (eq? (car transfer) scheduler)
-                             (eq? (cdr transfer) 'resumed)
+                        (and (eq? transfer 'resumed)
                              'result))))
                (lambda (fiber outcome)
                  (and (#3%$native-fiber-try-claim! scheduler)
@@ -1043,13 +1042,11 @@
            #t)
          (#3%$native-fiber-try-claim! task)
          (let ([first (#3%$native-fiber-switch scheduler task 'started)])
-           (and (eq? (car first) task)
-                (eq? (cdr first) 'yielded)))
+           (eq? first 'yielded))
          (eq? (#3%$native-fiber-state task) 'parked)
          (#3%$native-fiber-try-claim! task)
          (let ([second (#3%$native-fiber-switch scheduler task 'resumed)])
-           (and (eq? (car second) task)
-                (equal? (cdr second) '(return . result))))
+           (equal? second '(return . result)))
          (eq? (#3%$native-fiber-state scheduler) 'running)
          (eq? (#3%$native-fiber-state task) 'finished)
          (not (#3%$native-fiber-try-claim! task)))))
@@ -1082,16 +1079,44 @@
     (let loop ([i 0] [transfer (#3%$native-fiber-switch scheduler task 'start)])
       (cond
         [(fx< i rounds)
-         (and (eq? (car transfer) task)
-              (fx= (cdr transfer) i)
+         (and (fx= transfer i)
               (#3%$native-fiber-try-claim! task)
               (loop (fx+ i 1)
                     (#3%$native-fiber-switch scheduler task i)))]
         [else
-         (and (eq? (car transfer) task)
-              (equal? (cdr transfer) (cons 'return (fx+ depth 7)))
+         (and (equal? transfer (cons 'return (fx+ depth 7)))
               (eq? (#3%$native-fiber-state task) 'finished)
               (eq? (#3%$native-fiber-state scheduler) 'running))]))))
+
+(mat native-fiber-interrupt-state-boundary
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [task #f]
+         [blocked? #f])
+    (set! task
+      (#3%$native-fiber-create
+        (lambda () 'done)
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-finish fiber scheduler outcome))
+        #b100))
+    (#3%$native-fiber-try-claim! task)
+    (dynamic-wind
+      disable-interrupts
+      (lambda ()
+        (set! blocked?
+          (guard (condition [else #t])
+            (#3%$native-fiber-switch scheduler task 'invalid)
+            #f)))
+      enable-interrupts)
+    (and blocked?
+         (fx= (#3%$tc-field 'disable-count (#3%$tc)) 0)
+         (eq? (#3%$current-native-fiber) scheduler)
+         (eq? (#3%$native-fiber-state scheduler) 'running)
+         (eq? (#3%$native-fiber-state task) 'claimed)
+         (equal? (#3%$native-fiber-switch scheduler task 'start)
+                 '(return . done))
+         (eq? (#3%$native-fiber-state task) 'finished))))
 
 (mat native-fiber-descriptor-reuse
   (let* ([scheduler
@@ -1117,17 +1142,16 @@
       (let* ([transfer
               (#3%$native-fiber-switch scheduler task 'resume)]
              [cache (#3%$tc-field 'cached-frame (#3%$tc))])
-        (and (eq? (car transfer) task)
-             cache
+        (and cache
              (or (not cached-descriptor)
                  (eq? cache cached-descriptor))
              (begin
                (unless cached-descriptor
                  (set! cached-descriptor cache))
                (if (fx= remaining 0)
-                   (and (equal? (cdr transfer) '(return . done))
+                   (and (equal? transfer '(return . done))
                         (eq? (#3%$native-fiber-state task) 'finished))
-                   (and (fx= (cdr transfer) remaining)
+                   (and (fx= transfer remaining)
                         (loop (fx- remaining 1))))))))))
 
 (mat native-fiber-collector-stack
@@ -1174,9 +1198,8 @@
                  [transfer (#3%$native-fiber-switch scheduler task 'start)])
         (cond
           [(fx< i rounds)
-           (let ([marker (cdr transfer)])
-             (and (eq? (car transfer) task)
-                  (vector? marker)
+           (let ([marker transfer])
+             (and (vector? marker)
                   (fx= (vector-ref marker 0) i)
                   (or (not (fx= i 0)) (fxpositive? (compute-size task)))
                   (begin (collect (collect-maximum-generation)) #t)
@@ -1184,8 +1207,7 @@
                   (loop (fx+ i 1)
                         (#3%$native-fiber-switch scheduler task i))))]
           [else
-           (and (eq? (car transfer) task)
-                (equal? (cdr transfer)
+           (and (equal? transfer
                   (cons 'return (fx+ depth (fxquotient (fx* rounds (fx- rounds 1)) 2))))
                 (eq? (#3%$native-fiber-state task) 'finished)
                 (eq? (#3%$native-fiber-state scheduler) 'running))])))))
@@ -1223,7 +1245,7 @@
                                   (current-continuation-marks)
                                   'native-fiber-boundary
                                   #f))))
-                    (if (eq? (cdr transfer) 'cancel)
+                    (if (eq? transfer 'cancel)
                         (raise cancel-condition)
                         (error 'native-fiber-dynamic-unwind
                           "unexpected resume payload"))))
@@ -1242,16 +1264,14 @@
              (lambda ()
                (with-continuation-mark 'native-fiber-boundary 'scheduler
                  (#3%$native-fiber-switch scheduler task 'start))))])
-      (and (eq? (car first) task)
-           (eq? (cdr first) 'ready)
+      (and (eq? first 'ready)
            (equal? log '(inner-in outer-in))
            (#3%$native-fiber-try-claim! task)
            (let ([finished
                   (with-continuation-mark 'native-fiber-boundary 'scheduler
                     (#3%$native-fiber-switch scheduler task 'cancel))])
-             (and (eq? (car finished) task)
-                  (eq? (cadr finished) 'exception)
-                  (eq? (cddr finished) cancel-condition)
+             (and (eq? (car finished) 'exception)
+                  (eq? (cdr finished) cancel-condition)
                   (equal? log '(outer-out inner-out inner-in outer-in))
                   marks-ok?
                   (not scheduler-handler-ran?)
@@ -1272,7 +1292,7 @@
       (#3%$native-fiber-try-claim! scheduler)
       (let ([transfer (#3%$native-fiber-switch task scheduler payload)])
         (set! marks-ok? (and marks-ok? (task-marks-ok?)))
-        (cdr transfer)))
+        transfer))
     (set! task
       (#3%$native-fiber-create
         (lambda ()
@@ -1310,8 +1330,7 @@
              (with-continuation-mark 'native-fiber-scheduler 'scheduler
                (#3%$native-fiber-switch scheduler task 'resume))])
         (if (pair? expected)
-            (and (eq? (car transfer) task)
-                 (eq? (cdr transfer) (car expected))
+            (and (eq? transfer (car expected))
                  (eq? (continuation-marks-first
                         (current-continuation-marks)
                         'native-fiber-scheduler
@@ -1320,8 +1339,7 @@
                  (begin (collect) #t)
                  (#3%$native-fiber-try-claim! task)
                  (loop (cdr expected)))
-            (and (eq? (car transfer) task)
-                 (equal? (cdr transfer) '(return . #t))
+            (and (equal? transfer '(return . #t))
                  marks-ok?
                  (eq? (#3%$native-fiber-state task) 'finished)))))))
 

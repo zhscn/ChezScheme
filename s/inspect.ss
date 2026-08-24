@@ -2663,6 +2663,15 @@
                        [size (align (fx+ (constant header-size-stencil-vector) (fx* ($stencil-vector-length x) (constant ptr-bytes))))
                          (fx+ size (compute-size ($stencil-vector-ref x i)))])
                     ((fx= i n) size)))]
+               [($native-fiber? x)
+                ;; A native fiber owns a linear VM stack. Generic continuation
+                ;; inspection promotes and splits one-shot continuations, so
+                ;; the execution context is intentionally outside the heap
+                ;; graph exposed by `compute-size`, like a Go g stack or an
+                ;; OCaml domain stack. The opaque record itself and its type
+                ;; descriptor remain measurable.
+                (let ([rtd ($record-type-descriptor x)])
+                  (fx+ (align (rtd-size rtd)) (compute-size rtd)))]
                [($record? x)
                 (let ([rtd ($record-type-descriptor x)])
                   (let ([flds (rtd-flds rtd)])

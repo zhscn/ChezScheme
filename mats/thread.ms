@@ -1696,23 +1696,26 @@
 (mat native-fiber-parallel-collector
   (let* ([n 4]
          [m (make-mutex)]
-         [c (make-condition)]
+         [ready-condition (make-condition)]
+         [resume-condition (make-condition)]
          [ready 0]
          [resume? #f]
          [tasks (make-vector n #f)]
          [announced (make-vector n #f)]
+         [disable-counts (make-vector n #f)]
          [results (make-vector n #f)])
+    (define (announce-locked i)
+      (unless (vector-ref announced i)
+        (vector-set! announced i #t)
+        (set! ready (fx+ ready 1))
+        (condition-signal ready-condition)))
+    (define (announce i)
+      (with-mutex m (announce-locked i)))
     (define (worker i)
-      (define (announce)
-        (with-mutex m
-          (unless (vector-ref announced i)
-            (vector-set! announced i #t)
-            (set! ready (fx+ ready 1))
-            (condition-broadcast c))))
       (guard (condition
                [else
                 (vector-set! results i condition)
-                (announce)])
+                (announce i)])
         (let ([scheduler (#3%$native-fiber-adopt 0)]
               [task #f])
           (set! task
@@ -1732,21 +1735,20 @@
           (#3%$native-fiber-try-claim! task)
           (let ([yielded (#3%$native-fiber-switch scheduler task 'start)])
             (vector-set! tasks i task)
-            (announce)
             (with-mutex m
+              ;; Publish readiness while holding the same mutex that
+              ;; condition-wait releases. The main thread cannot collect
+              ;; until this worker has actually entered the wait protocol.
+              (vector-set! disable-counts i
+                (#3%$tc-field 'disable-count (#3%$tc)))
+              (announce-locked i)
               (let wait ()
                 (unless resume?
-                  (condition-wait c m)
+                  (condition-wait resume-condition m)
                   (wait))))
-            (and (eq? (car yielded) task)
-                 (fx= (cdr yielded) i)
-                 (#3%$native-fiber-try-claim! task)
-                 (let ([finished
-                        (#3%$native-fiber-switch scheduler task 'resume)])
-                   (vector-set! results i
-                     (and (eq? (car finished) task)
-                          (equal? (cdr finished) (cons 'return (fx+ 3000 i)))
-                          (eq? (#3%$native-fiber-state task) 'finished)))))))))
+            (vector-set! results i
+              (and (fx= yielded i)
+                   (eq? (#3%$native-fiber-state task) 'parked)))))))
     (let ([threads
            (let loop ([i 0])
              (if (fx= i n)
@@ -1756,15 +1758,91 @@
       (with-mutex m
         (let wait ()
           (unless (fx= ready n)
-            (condition-wait c m)
+            (condition-wait ready-condition m)
             (wait))))
+      (unless (andmap (lambda (count) (fx= count 0))
+                      (vector->list disable-counts))
+        (error 'native-fiber-parallel-collector
+          "unbalanced interrupt-disable counts" disable-counts))
+      ;; Rendezvous with every active runtime thread before inspecting the
+      ;; parked native-fiber stacks in the root set.
       (parameterize ([#%$enable-check-heap #t])
-        (collect (collect-maximum-generation)))
+        (collect-rendezvous))
       (with-mutex m
         (set! resume? #t)
-        (condition-broadcast c))
+        (condition-broadcast resume-condition))
       (for-each thread-join threads)
-      (andmap (lambda (result) (eq? result #t)) (vector->list results)))))
+      (and (andmap (lambda (result) (eq? result #t))
+                   (vector->list results))
+           (andmap (lambda (task)
+                     (eq? (#3%$native-fiber-state task) 'parked))
+                   (vector->list tasks))))))
+
+(mat native-fiber-switch-collector-race
+  (let* ([worker-count 3]
+         [rounds 500]
+         [m (make-mutex)]
+         [done 0]
+         [results (make-vector worker-count #f)])
+    (define (worker i)
+      (guard (condition
+               [else
+                (vector-set! results i condition)
+                (with-mutex m (set! done (fx+ done 1)))])
+        (let ([scheduler (#3%$native-fiber-adopt 0)]
+              [task #f])
+          (set! task
+            (#3%$native-fiber-create
+              (lambda ()
+                (let loop ([n 0])
+                  (if (fx= n rounds)
+                      n
+                      (let ([marker (vector i n (make-list 16 n))])
+                        (#3%$native-fiber-try-claim! scheduler)
+                        (let ([resume
+                               (#3%$native-fiber-switch task scheduler marker)])
+                          (unless (fx= resume n)
+                            (error 'native-fiber-switch-collector-race
+                              "unexpected resume value" resume))
+                          (loop (fx+ n 1)))))))
+              (lambda (fiber outcome)
+                (#3%$native-fiber-try-claim! scheduler)
+                (#3%$native-fiber-finish fiber scheduler outcome))
+              #b100))
+          (#3%$native-fiber-try-claim! task)
+          (let loop ([n 0]
+                     [transfer
+                      (#3%$native-fiber-switch scheduler task 'start)])
+            (if (fx= n rounds)
+                (vector-set! results i
+                  (and (equal? transfer (cons 'return rounds))
+                       (eq? (#3%$native-fiber-state task) 'finished)
+                       (fx= (#3%$tc-field 'disable-count (#3%$tc)) 0)))
+                (begin
+                  (unless (and (vector? transfer)
+                               (fx= (vector-ref transfer 0) i)
+                               (fx= (vector-ref transfer 1) n)
+                               (fx= (car (vector-ref transfer 2)) n))
+                    (error 'native-fiber-switch-collector-race
+                      "corrupt parked stack payload" transfer))
+                  (#3%$native-fiber-try-claim! task)
+                  (loop (fx+ n 1)
+                    (#3%$native-fiber-switch scheduler task n)))))
+          (with-mutex m (set! done (fx+ done 1))))))
+    (let ([threads
+           (let loop ([i 0])
+             (if (fx= i worker-count)
+                 '()
+                 (cons (fork-thread (lambda () (worker i)))
+                       (loop (fx+ i 1)))))])
+      (parameterize ([#%$enable-check-heap #t])
+        (let collect-loop ()
+          (unless (with-mutex m (fx= done worker-count))
+            (collect-rendezvous)
+            (collect-loop))))
+      (for-each thread-join threads)
+      (andmap (lambda (result) (eq? result #t))
+        (vector->list results)))))
 
 (mat native-fiber-cross-thread-migration
   (let* ([main-scheduler
@@ -1788,14 +1866,14 @@
       (#3%$native-fiber-try-claim! current-scheduler)
       (let ([transfer
              (#3%$native-fiber-switch task current-scheduler payload)])
-        (set! current-scheduler (car transfer))
-        (cdr transfer)))
+        transfer))
     (define (resume-on-new-thread payload)
       (let ([result #f])
         (thread-join
           (fork-thread
             (lambda ()
               (let ([scheduler (#3%$native-fiber-adopt 0)])
+                (set! current-scheduler scheduler)
                 (set! result
                   (and (#3%$native-fiber-try-claim! task)
                        (with-continuation-mark 'native-fiber-worker scheduler
@@ -1834,23 +1912,20 @@
         #b100))
     (#3%$native-fiber-try-claim! task)
     (let ([first (#3%$native-fiber-switch main-scheduler task 'start)])
-      (and (eq? (car first) task)
-           (eq? (cdr first) 'first)
+      (and (eq? first 'first)
            (not (#3%$native-fiber-owner task))
            (equal? wind-log '(in))
            (begin
              (collect (collect-maximum-generation))
              #t)
            (let ([second (resume-on-new-thread 'resume-1)])
-             (and (eq? (car second) task)
-                  (eq? (cdr second) 'second)
+             (and (eq? second 'second)
                   (not (#3%$native-fiber-owner task))))
            (begin
              (collect (collect-maximum-generation))
              #t)
            (let ([finished (resume-on-new-thread 'resume-2)])
-             (and (eq? (car finished) task)
-                  (equal? (cdr finished) (cons 'return (fx+ 3000 1)))))
+             (equal? finished (cons 'return (fx+ 3000 1))))
            (eq? (#3%$native-fiber-state task) 'finished)
            marks-ok?
            (equal? wind-log '(out in))
@@ -1865,15 +1940,14 @@
          [n 32])
     (define (yield value)
       (#3%$native-fiber-try-claim! current-scheduler)
-      (let ([transfer
-             (#3%$native-fiber-switch task current-scheduler value)])
-        (set! current-scheduler (car transfer))))
+      (#3%$native-fiber-switch task current-scheduler value))
     (define (resume-on-new-thread value)
       (let ([result #f])
         (thread-join
           (fork-thread
             (lambda ()
               (let ([worker (#3%$native-fiber-adopt 0)])
+                (set! current-scheduler worker)
                 (set! result
                   (and (#3%$native-fiber-try-claim! task)
                        (#3%$native-fiber-switch worker task value)))))))
@@ -1895,22 +1969,19 @@
         #b100))
     (#3%$native-fiber-try-claim! task)
     (let ([first (#3%$native-fiber-switch scheduler task 'start)])
-      (and (eq? (car first) task)
-           (fx= (cdr first) 0)
+      (and (fx= first 0)
            (let loop ([i 1])
              (cond
                [(fx= i n)
                 (let ([finished (resume-on-new-thread 'resume)])
-                  (and (eq? (car finished) task)
-                       (equal? (cdr finished)
+                  (and (equal? finished
                          (cons 'return (fx+ 2000 n)))
                        (eq? (#3%$native-fiber-state task) 'finished)))]
                [else
                 (when (fx= (fxlogand i 7) 0)
                   (collect (collect-maximum-generation)))
                 (let ([yielded (resume-on-new-thread 'resume)])
-                  (and (eq? (car yielded) task)
-                       (fx= (cdr yielded) i)
+                  (and (fx= yielded i)
                        (not (#3%$native-fiber-owner task))
                        (loop (fx+ i 1))))]))))))
 
@@ -1930,18 +2001,15 @@
       (#3%$native-fiber-create
         (lambda ()
           (#3%$native-fiber-try-claim! current-scheduler)
-          (let ([transfer
-                 (#3%$native-fiber-switch task current-scheduler 'parked)])
-            (set! current-scheduler (car transfer))
-            'winner))
+          (#3%$native-fiber-switch task current-scheduler 'parked)
+          'winner)
         (lambda (fiber outcome)
           (#3%$native-fiber-try-claim! current-scheduler)
           (#3%$native-fiber-finish fiber current-scheduler outcome))
         #b100))
     (#3%$native-fiber-try-claim! task)
     (let ([parked (#3%$native-fiber-switch main-scheduler task 'start)])
-      (and (eq? (car parked) task)
-           (eq? (cdr parked) 'parked)
+      (and (eq? parked 'parked)
            (let ([threads
                   (let loop ([i 0])
                     (if (fx= i n)
@@ -1958,13 +2026,13 @@
                                       (condition-wait c m)
                                       (wait))))
                                 (when (#3%$native-fiber-try-claim! task)
+                                  (set! current-scheduler scheduler)
                                   (vector-set! won i #t)
                                   (let ([finished
                                          (#3%$native-fiber-switch
                                            scheduler task 'resume)])
                                     (vector-set! valid i
-                                      (and (eq? (car finished) task)
-                                           (equal? (cdr finished)
+                                      (and (equal? finished
                                              '(return . winner)))))))))
                           (loop (fx+ i 1)))))])
              (with-mutex m
@@ -2001,14 +2069,12 @@
           (lambda ()
             (#3%$native-fiber-adopt 0)
             (set! foreign-claim (#3%$native-fiber-try-claim! task)))))
-      (and (eq? (car first) task)
-           (eq? (cdr first) 'parked)
+      (and (eq? first 'parked)
            (not foreign-claim)
            (fx= (#3%$native-fiber-owner task) (get-thread-id))
            (#3%$native-fiber-try-claim! task)
            (let ([finished (#3%$native-fiber-switch scheduler task 'resume)])
-             (and (eq? (car finished) task)
-                  (equal? (cdr finished) '(return . done))))
+             (equal? finished '(return . done)))
            (eq? (#3%$native-fiber-state task) 'finished)))))
 
 (mat native-fiber-pin-transition
@@ -2028,18 +2094,14 @@
               (#3%$native-fiber-pin! task)
               #f))
           (#3%$native-fiber-try-claim! current-scheduler)
-          (let ([transfer
-                 (#3%$native-fiber-switch task current-scheduler 'pinned)])
-            (set! current-scheduler (car transfer)))
+          (#3%$native-fiber-switch task current-scheduler 'pinned)
           (#3%$native-fiber-unpin! task)
           (set! duplicate-unpin-error?
             (guard (c [else #t])
               (#3%$native-fiber-unpin! task)
               #f))
           (#3%$native-fiber-try-claim! current-scheduler)
-          (let ([transfer
-                 (#3%$native-fiber-switch task current-scheduler 'migratable)])
-            (set! current-scheduler (car transfer)))
+          (#3%$native-fiber-switch task current-scheduler 'migratable)
           'done)
         (lambda (fiber outcome)
           (#3%$native-fiber-try-claim! current-scheduler)
@@ -2052,16 +2114,14 @@
           (lambda ()
             (#3%$native-fiber-adopt 0)
             (set! foreign-claim (#3%$native-fiber-try-claim! task)))))
-      (and (eq? (car pinned) task)
-           (eq? (cdr pinned) 'pinned)
+      (and (eq? pinned 'pinned)
            (not foreign-claim)
            duplicate-pin-error?
            (fx= (#3%$native-fiber-flags task) #b001)
            (#3%$native-fiber-try-claim! task)
            (let ([migratable
                   (#3%$native-fiber-switch scheduler task 'resume)])
-             (and (eq? (car migratable) task)
-                  (eq? (cdr migratable) 'migratable)))
+             (eq? migratable 'migratable))
            (not (#3%$native-fiber-owner task))
            duplicate-unpin-error?
            (fx= (#3%$native-fiber-flags task) #b100)
@@ -2070,11 +2130,11 @@
                (fork-thread
                  (lambda ()
                    (let ([worker (#3%$native-fiber-adopt 0)])
+                     (set! current-scheduler worker)
                      (set! finished
                        (and (#3%$native-fiber-try-claim! task)
                             (#3%$native-fiber-switch worker task 'resume)))))))
-             (and (eq? (car finished) task)
-                  (equal? (cdr finished) '(return . done))))
+             (equal? finished '(return . done)))
            (eq? (#3%$native-fiber-state task) 'finished)))))
 
 (mat native-fiber-foreign-callback-boundary
@@ -2128,8 +2188,7 @@
         #b001))
     (#3%$native-fiber-try-claim! task)
     (let ([yielded (#3%$native-fiber-switch scheduler task 'start)])
-      (and (eq? (car yielded) task)
-           (fx= (cdr yielded) 42)
+      (and (fx= yielded 42)
            blocked?
            (fx= callback-depth 1)
            (fx= nested-callback-depth 2)
@@ -2137,8 +2196,7 @@
            (eq? (#3%$native-fiber-state task) 'parked)
            (#3%$native-fiber-try-claim! task)
            (let ([finished (#3%$native-fiber-switch scheduler task 'resume)])
-             (and (eq? (car finished) task)
-                  (equal? (cdr finished) '(return . done))))
+             (equal? finished '(return . done)))
            (eq? (#3%$native-fiber-state task) 'finished)))))
 
 (mat native-fiber-adopt-foreign-callback-boundary
@@ -2218,18 +2276,22 @@
            engine-blocked?
            adopt-blocked?
            (let ([finished (#3%$native-fiber-switch scheduler task 'start)])
-             (and (eq? (car finished) task)
-                  (equal? (cdr finished) '(return . done))))
+             (equal? finished '(return . done)))
            task-blocked?
            (eq? (#3%$native-fiber-state task) 'finished)))))
 
 (mat native-fiber-safe-point-preemption
   (let* ([scheduler
           (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [current-scheduler scheduler]
          [task #f]
          [progress #f]
          [preempt-progress #f]
          [handler-count 0]
+         [handler-returned? #f]
+         [nested-deferred? #f]
+         [handler-thread #f]
+         [resume-thread #f]
          [saved-handler (timer-interrupt-handler)])
     (set! task
       (#3%$native-fiber-create
@@ -2239,6 +2301,81 @@
             (set! progress i)
             (unless (fx= i 0)
               (loop (fx- i 1))))
+          (set! resume-thread (get-thread-id))
+          'completed)
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! current-scheduler)
+          (#3%$native-fiber-finish fiber current-scheduler outcome))
+        #b100))
+    (dynamic-wind
+      (lambda ()
+        (timer-interrupt-handler
+          (lambda ()
+            (set! handler-count (fx+ handler-count 1))
+            (set! handler-thread (get-thread-id))
+            (set! preempt-progress progress)
+            (if (#3%$native-fiber-preempt scheduler 'preempted)
+                (begin
+                  (set! nested-deferred?
+                    (#3%$call-with-native-fiber-preemption-window
+                      (lambda ()
+                        (and (not (#3%$native-fiber-preempt
+                                    scheduler 'duplicate))
+                             (not (#3%$native-fiber-service-preemption))))))
+                  (set! handler-returned? #t))
+                (set-timer 1)))))
+      (lambda ()
+        (#3%$native-fiber-try-claim! task)
+        (let ([preempted (#3%$native-fiber-switch scheduler task 'start)])
+          (and (eq? preempted 'preempted)
+               handler-returned?
+               nested-deferred?
+               (fixnum? preempt-progress)
+               (fx> preempt-progress 0)
+               (fx< preempt-progress 1000000)
+               (fx= handler-count 1)
+               (fx= handler-thread (get-thread-id))
+               (let ([worker-result #f])
+                 (thread-join
+                   (fork-thread
+                     (lambda ()
+                       (let ([worker (#3%$native-fiber-adopt 0)])
+                         (set! current-scheduler worker)
+                         (set! worker-result
+                           (and (#3%$native-fiber-try-claim! task)
+                                (equal?
+                                  (#3%$native-fiber-switch worker task 'resume)
+                                  '(return . completed))
+                                (fx= resume-thread (get-thread-id))))))))
+                 worker-result)
+               (not (fx= resume-thread handler-thread))
+               (eq? (#3%$native-fiber-state task) 'finished))))
+      (lambda ()
+        (set-timer 0)
+        (timer-interrupt-handler saved-handler)))))
+
+(mat native-fiber-preemption-handler-unwind
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [task #f]
+         [requested? #f]
+         [caught? #f]
+         [request-cleared? #f]
+         [saved-handler (timer-interrupt-handler)])
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (guard (condition
+                   [else
+                    (set! caught? #t)])
+            (set-timer 1000)
+            (let loop ([i 1000000])
+              (unless (fx= i 0)
+                (loop (fx- i 1)))))
+          (set! request-cleared?
+            (and (not (#3%$native-fiber-preempt-active))
+                 (not (#3%$native-fiber-preempt-target))
+                 (not (#3%$native-fiber-preempt-payload))))
           'completed)
         (lambda (fiber outcome)
           (#3%$native-fiber-try-claim! scheduler)
@@ -2248,25 +2385,18 @@
       (lambda ()
         (timer-interrupt-handler
           (lambda ()
-            (set! handler-count (fx+ handler-count 1))
-            (set! preempt-progress progress)
-            (unless (#3%$native-fiber-preempt scheduler 'preempted)
-              (set-timer 1)))))
+            (set! requested?
+              (#3%$native-fiber-preempt scheduler 'must-not-be-delivered))
+            (error 'native-fiber-preemption-handler-unwind
+              "timer handler unwind"))))
       (lambda ()
         (#3%$native-fiber-try-claim! task)
-        (let ([preempted (#3%$native-fiber-switch scheduler task 'start)])
-          (and (eq? (car preempted) task)
-               (eq? (cdr preempted) 'preempted)
-               (fixnum? preempt-progress)
-               (fx> preempt-progress 0)
-               (fx< preempt-progress 1000000)
-               (fx= handler-count 1)
-               (#3%$native-fiber-try-claim! task)
-               (let ([finished
-                      (#3%$native-fiber-switch scheduler task 'resume)])
-                 (and (eq? (car finished) task)
-                      (equal? (cdr finished) '(return . completed))))
-               (eq? (#3%$native-fiber-state task) 'finished))))
+        (and (equal? (#3%$native-fiber-switch scheduler task 'start)
+                     '(return . completed))
+             requested?
+             caught?
+             request-cleared?
+             (eq? (#3%$native-fiber-state task) 'finished)))
       (lambda ()
         (set-timer 0)
         (timer-interrupt-handler saved-handler)))))
@@ -2302,8 +2432,7 @@
         #b001))
     (#3%$native-fiber-try-claim! task)
     (let ([finished (#3%$native-fiber-switch scheduler task 'start)])
-      (and (eq? (car finished) task)
-           (equal? (cdr finished) '(return . #t))
+      (and (equal? finished '(return . #t))
            (fx= handlers-ran 0)
            (eq? (#3%$native-fiber-state task) 'finished)))))
 

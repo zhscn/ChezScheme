@@ -1589,6 +1589,12 @@
    [ptr handler-stack]
    [ptr entry]
    [ptr on-return]
+   [ptr starter]
+   [ptr incoming-source]
+   [ptr incoming-payload]
+   [ptr switch-control]
+   [ptr commit-control]
+   [ptr cache-context]
    [ptr flags]
    [ptr id]))
 
@@ -1679,7 +1685,14 @@
    ;; VM-extension fields remain at the end because existing thread-context
    ;; displacements are part of the boot-image ABI.
    [ptr current-native-fiber]
-   [ptr fiber-switch-prohibited-depth]))
+   [ptr fiber-switch-prohibited-depth]
+   ;; Native-fiber transition and deferred-preemption state is worker-local.
+   ;; These fields keep partially prepared transfers rooted while ensuring that
+   ;; timer-handler frames have unwound before a migratable fiber is parked.
+   [ptr native-fiber-transition]
+   [ptr native-fiber-preempt-active]
+   [ptr native-fiber-preempt-target]
+   [ptr native-fiber-preempt-payload]))
 
 (define tc-field-list
   (let f ([ls (oblist)] [params '()])

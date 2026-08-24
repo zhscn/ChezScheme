@@ -72,12 +72,8 @@
                       (let loop ([transfers 0])
                         (unless (#3%$native-fiber-try-claim! task)
                           (error 'native-fiber-benchmark "cannot claim task"))
-                        (let ([transfer
-                               (#3%$native-fiber-switch
-                                 scheduler task 'resume)])
-                          (unless (eq? (car transfer) task)
-                            (error 'native-fiber-benchmark
-                              "unexpected voluntary transfer" transfer))
+                        (begin
+                          (#3%$native-fiber-switch scheduler task 'resume)
                           (when observe-cache?
                             (let ([current-cache
                                    (#3%$tc-field 'cached-frame (#3%$tc))])
@@ -156,7 +152,7 @@
     (set! task
       (#3%$native-fiber-create
         (lambda ()
-          (set-timer 1)
+          (set-timer 1000)
           (let loop ([value 0])
             (if (= preemptions count)
                 value
@@ -167,11 +163,11 @@
       (lambda ()
         (timer-interrupt-handler
           (lambda ()
-            (set! preemptions (+ preemptions 1))
             (let ([transfer
                    (#3%$native-fiber-preempt scheduler 'preempted)])
-              (when (< preemptions count)
-                (set-timer 1))
+              (if transfer
+                  (set! preemptions (+ preemptions 1))
+                  (set-timer 1000))
               transfer))))
       (lambda ()
         (let-values ([(elapsed transfers)
@@ -181,15 +177,15 @@
                             (unless (#3%$native-fiber-try-claim! task)
                               (error 'native-fiber-benchmark
                                 "cannot claim preempted task"))
-                            (let ([transfer
-                                   (#3%$native-fiber-switch
-                                     scheduler task 'resume)])
-                              (unless (eq? (car transfer) task)
-                                (error 'native-fiber-benchmark
-                                  "unexpected preemptive transfer" transfer))
+                            (begin
+                              (#3%$native-fiber-switch scheduler task 'resume)
                               (if (eq? (#3%$native-fiber-state task) 'finished)
                                   (+ transfers 2)
-                                  (loop (+ transfers 2)))))))])
+                                  (begin
+                                    ;; Arm the next quantum from the scheduler,
+                                    ;; after the preceding handler has unwound.
+                                    (set-timer 1000)
+                                    (loop (+ transfers 2))))))))])
           (values elapsed transfers preemptions)))
       (lambda ()
         (set-timer 0)
@@ -199,6 +195,10 @@
   (collect)
   (let-values ([(elapsed transfers preemptions)
                 (run-preemptive preemption-count)])
+    (unless (and (= preemptions preemption-count)
+                 (= transfers (* 2 (+ preemptions 1))))
+      (error 'native-fiber-benchmark
+        "preemption accounting mismatch" preemptions transfers))
     (pretty-print
       `(preemptive-switch
          (preemptions ,preemptions)

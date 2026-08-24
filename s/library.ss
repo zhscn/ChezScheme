@@ -1195,13 +1195,13 @@
     ($oops #f "variable ~:s is not bound" x))
   (#3%$top-level-value x))
 
-(define-library-entry (event)
+(define ($process-event)
   (define (timer)
     (if (eq? ($tc-field 'timer-ticks ($tc)) 0)
         (let ([handler (timer-interrupt-handler)])
           ($tc-field 'timer-ticks ($tc) #f)
           (signal)
-          (handler))
+          ($call-with-native-fiber-preemption-window handler))
         (signal)))
   (define (signal)
     (let ([x ($tc-field 'signal-interrupt-pending ($tc))])
@@ -1240,6 +1240,10 @@
         ($tc-field 'something-pending ($tc) #f)
         (timer))
       ($set-timer (constant default-timer-ticks))))
+
+(define-library-entry (event)
+  ($process-event)
+  ($native-fiber-service-preemption))
 
 (define-library-entry (virtual-register idx)
   ($oops 'virtual-register "invalid index ~s" idx))

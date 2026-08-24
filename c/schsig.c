@@ -532,6 +532,11 @@ void S_handle_event_detour() {
     ptr resume_args = Snil;
     iptr argcnt, stack_avail, i;
 
+#ifdef tc_native_fiber_transition_disp
+    if (NATIVEFIBERTRANSITION(tc) == Strue)
+      S_error_abort("native-fiber transition invariant violated");
+#endif
+
     argcnt = (iptr)AC0(tc);
     stack_avail = (((uptr)ESP(tc) - (uptr)SFP(tc)) >> log2_ptr_bytes) - 1;
 

@@ -1832,6 +1832,26 @@
     [() ($fiber-switch-prohibited-depth)]
     [(depth) ($fiber-switch-prohibited-depth depth)]))
 
+(define-who $native-fiber-transition
+  (case-lambda
+    [() ($native-fiber-transition)]
+    [(value) ($native-fiber-transition value)]))
+
+(define-who $native-fiber-preempt-active
+  (case-lambda
+    [() ($native-fiber-preempt-active)]
+    [(value) ($native-fiber-preempt-active value)]))
+
+(define-who $native-fiber-preempt-target
+  (case-lambda
+    [() ($native-fiber-preempt-target)]
+    [(value) ($native-fiber-preempt-target value)]))
+
+(define-who $native-fiber-preempt-payload
+  (case-lambda
+    [() ($native-fiber-preempt-payload)]
+    [(value) ($native-fiber-preempt-payload value)]))
+
 (define $call-with-native-fiber-switch-prohibited)
 (set! $call-with-native-fiber-switch-prohibited
   (lambda (thunk)
@@ -1853,6 +1873,35 @@
               "native-fiber switch prohibition depth underflow"))
           ($fiber-switch-prohibited-depth (fx- depth 1)))))))
 
+(define $call-with-native-fiber-preemption-window)
+(set! $call-with-native-fiber-preemption-window
+  (lambda (thunk)
+    (unless (procedure? thunk)
+      ($oops '$call-with-native-fiber-preemption-window
+        "~s is not a procedure" thunk))
+    (if ($native-fiber-preempt-active)
+        ;; A long-running timer handler can itself reach an event safe point.
+        ;; The outer window remains responsible for request cleanup and the
+        ;; event epilogue defers service until every handler frame has unwound.
+        (thunk)
+        (begin
+          (when ($native-fiber-preempt-target)
+            ($oops '$call-with-native-fiber-preemption-window
+              "stale native-fiber preemption request"))
+          (let ([completed? #f])
+            (dynamic-wind
+              (lambda () ($native-fiber-preempt-active #t))
+              (lambda ()
+                (call-with-values thunk
+                  (lambda results
+                    (set! completed? #t)
+                    (apply values results))))
+              (lambda ()
+                ($native-fiber-preempt-active #f)
+                (unless completed?
+                  ($native-fiber-preempt-target #f)
+                  ($native-fiber-preempt-payload #f)))))))))
+
 ;; A native fiber is a linear VM execution context.  Its control field is the
 ;; only field read or written concurrently; all other mutable fields are owned
 ;; by the worker that has successfully claimed the fiber.
@@ -1865,6 +1914,7 @@
 (define $native-fiber-create)
 (define $native-fiber-try-claim!)
 (define $native-fiber-preempt)
+(define $native-fiber-service-preemption)
 (define $native-fiber-switch)
 (define $native-fiber-finish)
 (define $native-fiber-pin!)
@@ -1876,8 +1926,8 @@
   (lambda (link)
     ($native-fiber-make-context link)))
 (define $native-fiber-switch-entry
-  (lambda (request)
-    ($native-fiber-switch-entry request)))
+  (lambda (target)
+    ($native-fiber-switch-entry target)))
 (let ()
 (define-record-type (native-fiber-record make-native-fiber-record native-fiber-record?)
   (fields
@@ -1886,9 +1936,15 @@
     (mutable handler-stack native-fiber-handler-stack native-fiber-handler-stack-set!)
     (mutable entry native-fiber-entry native-fiber-entry-set!)
     (mutable on-return native-fiber-on-return native-fiber-on-return-set!)
+    (mutable starter native-fiber-starter native-fiber-starter-set!)
+    (mutable incoming-source native-fiber-incoming-source native-fiber-incoming-source-set!)
+    (mutable incoming-payload native-fiber-incoming-payload native-fiber-incoming-payload-set!)
+    (mutable switch-control native-fiber-switch-control native-fiber-switch-control-set!)
+    (mutable commit-control native-fiber-commit-control native-fiber-commit-control-set!)
+    (mutable cache-context native-fiber-cache-context native-fiber-cache-context-set!)
     (mutable flags native-fiber-flags native-fiber-flags-set!)
     (immutable id native-fiber-id))
-  (nongenerative #{native-fiber vm-native-fiber-1})
+  (nongenerative #{native-fiber vm-native-fiber-3})
   (sealed #t)
   (opaque #t))
 
@@ -1919,14 +1975,25 @@
   (lambda (control)
     (fxsrl control (constant native-fiber-state-bits))))
 
+(define native-fiber-read-control
+  (lambda (fiber)
+    ;; The control word is published by the target-side receive path.
+    ;; Keep every observation behind one acquire operation instead of relying
+    ;; on ordinary record reads.
+    (let ([control (native-fiber-control fiber)])
+      (memory-order-acquire)
+      control)))
+
 (define native-fiber-current-owner)
 (define native-fiber-valid-flags?)
 (define native-fiber-task-flags?)
 (define native-fiber-check-transfer)
-(define native-fiber-commit-transfer!)
+(define native-fiber-receive)
 (define native-fiber-exchange)
 (define native-fiber-start)
 (define native-fiber-check-running!)
+(define native-fiber-check-stable!)
+(define native-fiber-context-valid?)
 
 (set! $native-fiber?
   (lambda (x)
@@ -1936,7 +2003,7 @@
   (lambda (fiber)
     (unless ($native-fiber? fiber)
       ($oops '$native-fiber-state "~s is not a native fiber" fiber))
-    (case (native-fiber-control-state (native-fiber-control fiber))
+    (case (native-fiber-control-state (native-fiber-read-control fiber))
       [(0) 'new]
       [(1) 'claimed]
       [(2) 'running]
@@ -1950,13 +2017,14 @@
   (lambda (fiber)
     (unless ($native-fiber? fiber)
       ($oops '$native-fiber-owner "~s is not a native fiber" fiber))
-    (let ([owner (native-fiber-control-owner (native-fiber-control fiber))])
+    (let ([owner (native-fiber-control-owner (native-fiber-read-control fiber))])
       (and (fx> owner 0) (fx- owner 1)))))
 
 (set! $native-fiber-flags
   (lambda (fiber)
     (unless ($native-fiber? fiber)
       ($oops '$native-fiber-flags "~s is not a native fiber" fiber))
+    (native-fiber-read-control fiber)
     (native-fiber-flags fiber)))
 
 (set! $native-fiber-id
@@ -1983,11 +2051,13 @@
                       owner)]
            [fiber (make-native-fiber-record
                     control #f #f #f #f
+                    #f #f #f #f #f #f
                     (fxlogor flags
                       (constant native-fiber-flag-pinned)
                       (constant native-fiber-flag-scheduler))
                     (native-fiber-allocate-id))])
       ($current-native-fiber fiber)
+      (native-fiber-check-stable! '$native-fiber-adopt fiber)
       fiber)))
 
 (set! native-fiber-current-owner
@@ -1998,7 +2068,7 @@
   (lambda (who fiber)
     (unless ($native-fiber? fiber)
       ($oops who "~s is not a native fiber" fiber))
-    (let ([control (native-fiber-control fiber)]
+    (let ([control (native-fiber-read-control fiber)]
           [owner (native-fiber-current-owner)])
       (unless (and (eq? fiber ($current-native-fiber))
                    (fx= (native-fiber-control-state control)
@@ -2022,6 +2092,95 @@
            (or (and pinned? (not migratable?))
                (and migratable? (not pinned?)))))))
 
+(set! native-fiber-context-valid?
+  (lambda (context)
+    (and context
+         ($continuation? context)
+         (let ([length ($continuation-stack-length context)]
+               [clength ($continuation-stack-clength context)])
+           (and (fixnum? length)
+                (fixnum? clength)
+                (fx>= length 0)
+                (fx>= clength 0)
+                (fx<= clength length)))
+         ($continuation? ($continuation-link context))
+         (list? ($continuation-winders context))
+         (let ([attachments ($continuation-attachments context)])
+           (or (not attachments) (list? attachments))))))
+
+(set! native-fiber-check-stable!
+  (lambda (who fiber)
+    ;; This checker runs only outside the noninterruptible exchange. It makes
+    ;; the lifecycle/stack-root agreement explicit in the same way that Go's
+    ;; g-status checks and OCaml's stack_info assertions guard their switch
+    ;; paths.
+    (unless ($native-fiber? fiber)
+      ($oops who "~s is not a native fiber" fiber))
+    (let* ([control (native-fiber-read-control fiber)]
+           [state (native-fiber-control-state control)]
+           [owner (native-fiber-control-owner control)]
+           [flags (native-fiber-flags fiber)]
+           [context (native-fiber-context fiber)]
+           [scheduler?
+            (not (fx= (fxlogand flags (constant native-fiber-flag-scheduler)) 0))]
+           [pinned?
+            (not (fx= (fxlogand flags (constant native-fiber-flag-pinned)) 0))]
+           [migratable?
+            (not (fx= (fxlogand flags (constant native-fiber-flag-migratable)) 0))])
+      (unless (and (native-fiber-valid-flags? flags)
+                   (if scheduler?
+                       (and pinned? (not migratable?))
+                       (or (and pinned? (not migratable?))
+                           (and migratable? (not pinned?)))))
+        ($oops who "native fiber ~s has invalid flags ~s"
+          (native-fiber-id fiber) flags))
+      (unless (and (not (native-fiber-incoming-source fiber))
+                   (not (native-fiber-incoming-payload fiber))
+                   (not (native-fiber-switch-control fiber))
+                   (not (native-fiber-commit-control fiber))
+                   (not (native-fiber-cache-context fiber)))
+        ($oops who "native fiber ~s retains transition state"
+          (native-fiber-id fiber)))
+      (case state
+        [(0) ; new
+         (unless (and (fx= owner 0)
+                      (native-fiber-context-valid? context)
+                      (not (native-fiber-handler-stack fiber))
+                      (procedure? (native-fiber-entry fiber))
+                      (procedure? (native-fiber-on-return fiber))
+                      (procedure? (native-fiber-starter fiber)))
+           ($oops who "new native fiber ~s has inconsistent roots"
+             (native-fiber-id fiber)))]
+        [(1) ; claimed
+         (unless (and (fx> owner 0)
+                      (native-fiber-context-valid? context))
+           ($oops who "claimed native fiber ~s has inconsistent ownership or context"
+             (native-fiber-id fiber)))]
+        [(2) ; running
+         (unless (and (fx> owner 0)
+                      (not context)
+                      (not (native-fiber-handler-stack fiber))
+                      (not (native-fiber-starter fiber)))
+           ($oops who "running native fiber ~s has parked state"
+             (native-fiber-id fiber)))]
+        [(4) ; parked
+         (unless (and (native-fiber-context-valid? context)
+                      (if pinned? (fx> owner 0) (fx= owner 0)))
+           ($oops who "parked native fiber ~s has inconsistent ownership or context"
+             (native-fiber-id fiber)))]
+        [(6) ; finished
+         (unless (and (fx= owner 0)
+                      (not context)
+                      (not (native-fiber-handler-stack fiber))
+                      (not (native-fiber-entry fiber))
+                      (not (native-fiber-on-return fiber))
+                      (not (native-fiber-starter fiber)))
+           ($oops who "finished native fiber ~s retains execution state"
+             (native-fiber-id fiber)))]
+        [else
+         ($oops who "native fiber ~s is externally visible in transient state ~s"
+           (native-fiber-id fiber) state)]))))
+
 (set! $native-fiber-create
   (lambda (entry on-return flags)
     (unless (procedure? entry)
@@ -2030,10 +2189,15 @@
       ($oops '$native-fiber-create "~s is not a procedure" on-return))
     (unless (native-fiber-task-flags? flags)
       ($oops '$native-fiber-create "invalid native-fiber task flags ~s" flags))
-    (make-native-fiber-record
-      (native-fiber-pack-control (constant native-fiber-state-new) 0)
-      (#3%$native-fiber-make-context $null-continuation)
-      #f entry on-return flags (native-fiber-allocate-id))))
+    (let ([fiber
+           (make-native-fiber-record
+             (native-fiber-pack-control (constant native-fiber-state-new) 0)
+             (#3%$native-fiber-make-context $null-continuation)
+             #f entry on-return (lambda () (native-fiber-start))
+             #f #f #f #f #f
+             flags (native-fiber-allocate-id))])
+      (native-fiber-check-stable! '$native-fiber-create fiber)
+      fiber)))
 
 (set! $native-fiber-try-claim!
   (lambda (fiber)
@@ -2041,7 +2205,7 @@
       ($oops '$native-fiber-try-claim! "~s is not a native fiber" fiber))
     (let ([owner (native-fiber-current-owner)])
       (let loop ()
-        (let* ([old (native-fiber-control fiber)]
+        (let* ([old (native-fiber-read-control fiber)]
                [state (native-fiber-control-state old)]
                [old-owner (native-fiber-control-owner old)])
           (cond
@@ -2057,7 +2221,9 @@
                               (constant native-fiber-state-claimed)
                               owner)])
                    (if ($record-cas! fiber 0 old new)
-                       #t
+                       (begin
+                         (native-fiber-check-stable! '$native-fiber-try-claim! fiber)
+                         #t)
                        (loop))))]
             [else #f]))))))
 
@@ -2082,6 +2248,7 @@
         (fxlogand (native-fiber-flags fiber)
           (fxlognot (constant native-fiber-flag-migratable)))
         (constant native-fiber-flag-pinned)))
+    (native-fiber-check-stable! '$native-fiber-pin! fiber)
     (void)))
 
 (set! $native-fiber-unpin!
@@ -2105,6 +2272,7 @@
         (fxlogand (native-fiber-flags fiber)
           (fxlognot (constant native-fiber-flag-pinned)))
         (constant native-fiber-flag-migratable)))
+    (native-fiber-check-stable! '$native-fiber-unpin! fiber)
     (void)))
 
 (set! native-fiber-check-transfer
@@ -2116,9 +2284,15 @@
         (native-fiber-id current)))
     (when (native-fiber-switch-prohibited?)
       ($oops who "native-fiber switching is prohibited in this runtime region"))
+    (when ($native-fiber-transition)
+      ($oops who "a native-fiber transition is already active"))
+    (unless (fx= (#3%$tc-field 'disable-count (#3%$tc)) 0)
+      ($oops who "native-fiber switching requires interrupts to be enabled"))
+    (native-fiber-check-stable! who current)
+    (native-fiber-check-stable! who target)
     (let ([owner (native-fiber-current-owner)]
-          [current-control (native-fiber-control current)]
-          [target-control (native-fiber-control target)])
+          [current-control (native-fiber-read-control current)]
+          [target-control (native-fiber-read-control target)])
       (unless (and (fx= (native-fiber-control-state current-control)
                         (constant native-fiber-state-running))
                    (fx= (native-fiber-control-owner current-control) owner))
@@ -2131,67 +2305,60 @@
           (native-fiber-id target)))
       owner)))
 
-(set! native-fiber-commit-transfer!
-  (lambda (transfer)
-    (unless (and (pair? transfer) ($native-fiber? (car transfer)))
-      ($oops '$native-fiber-switch "invalid native-fiber transfer ~s" transfer))
-    (let* ([source (car transfer)]
-           [old (native-fiber-control source)]
-           [state (native-fiber-control-state old)])
-      (cond
-        [(fx= state (constant native-fiber-state-parking))
-         (let ([owner (if (fx= (fxlogand (native-fiber-flags source)
-                                          (constant native-fiber-flag-migratable))
-                              0)
-                          (native-fiber-control-owner old)
-                          0)])
-           (unless ($record-cas! source 0 old
-                     (native-fiber-pack-control (constant native-fiber-state-parked) owner))
-             ($oops '$native-fiber-switch "fiber ~s changed state while parking"
-               (native-fiber-id source))))]
-        [(fx= state (constant native-fiber-state-finishing))
-         (unless ($record-cas! source 0 old
-                   (native-fiber-pack-control (constant native-fiber-state-finished) 0))
-           ($oops '$native-fiber-switch "fiber ~s changed state while finishing"
-             (native-fiber-id source)))]
-        [else
-         ($oops '$native-fiber-switch "fiber ~s is not awaiting transfer commit"
-           (native-fiber-id source))]))
-    transfer))
-
 (set! native-fiber-exchange
   (lambda (who current target payload finish?)
     (let* ([owner (native-fiber-check-transfer who current target)]
-           [transfer (cons current payload)]
-           [starter (and (native-fiber-entry target)
-                         (lambda () (native-fiber-start transfer)))]
-           [request (make-vector 8 #f)]
-           ;; Allocate the descriptor last.  No allocating Scheme operation is
-           ;; performed after it is attached to the running fiber.
-           [source-context (and (not finish?) (#3%$native-fiber-allocate-descriptor))])
-      (vector-set! request 0 current)
-      (vector-set! request 1 target)
-      (vector-set! request 2 source-context)
-      (vector-set! request 3 transfer)
-      (vector-set! request 4
-        (native-fiber-pack-control
-          (if finish?
-              (constant native-fiber-state-finishing)
-              (constant native-fiber-state-parking))
-          owner))
-      (vector-set! request 5
-        (native-fiber-pack-control (constant native-fiber-state-running) owner))
-      (vector-set! request 6
-        starter)
-      ;; This check follows the last possible allocation.  A collection clears
-      ;; CACHEDFRAME, so only a descriptor still in generation zero may enter
-      ;; the cache during the nonallocating exchange.
-      (vector-set! request 7
-        (fx= (#3%$generation (native-fiber-context target)) 0))
+           ;; Allocate the descriptor after all checks. The remaining bindings
+           ;; and operations before the raw switch are nonallocating.
+           [source-context (and (not finish?) (#3%$native-fiber-allocate-descriptor))]
+           [source-switch-control
+            (native-fiber-pack-control
+              (if finish?
+                  (constant native-fiber-state-finishing)
+                  (constant native-fiber-state-parking))
+              owner)]
+           [source-commit-control
+            (native-fiber-pack-control
+              (if finish?
+                  (constant native-fiber-state-finished)
+                  (constant native-fiber-state-parked))
+              (if (or finish?
+                      (not (fx= (fxlogand (native-fiber-flags current)
+                                          (constant native-fiber-flag-migratable))
+                                0)))
+                  0
+                  owner))]
+           [target-switch-control
+            (native-fiber-pack-control
+              (constant native-fiber-state-running) owner)]
+           [cache-context?
+            (fx= (#3%$generation (native-fiber-context target)) 0)])
+      ;; The target-side return path balances this call. No Scheme event may
+      ;; observe the transition fields between here and the hand-coded entry.
+      (disable-interrupts)
+      ($native-fiber-transition #t)
       (native-fiber-context-set! current source-context)
       (native-fiber-handler-stack-set! current
         (and (not finish?) ($current-handler-stack)))
-      (native-fiber-commit-transfer! (#3%$native-fiber-switch-entry request)))))
+      (native-fiber-switch-control-set! current source-switch-control)
+      (native-fiber-commit-control-set! current source-commit-control)
+      (native-fiber-switch-control-set! target target-switch-control)
+      (native-fiber-incoming-source-set! target current)
+      (native-fiber-incoming-payload-set! target payload)
+      ;; A collection clears CACHEDFRAME, so only a descriptor still in
+      ;; generation zero may enter the cache during the nonallocating exchange.
+      (native-fiber-cache-context-set! target cache-context?)
+      (#3%$native-fiber-switch-entry target)
+      (let ([payload (native-fiber-receive)])
+        (enable-interrupts)
+        (native-fiber-check-stable! who ($current-native-fiber))
+        payload))))
+
+(set! native-fiber-receive
+  (lambda ()
+    ;; The VM epilogue is a closed, nonallocating, noninterruptible entry. It
+    ;; validates both transient controls before publishing the source.
+    (#3%$native-fiber-switch-entry #f)))
 
 (set! $native-fiber-switch
   (lambda (current target payload)
@@ -2207,19 +2374,57 @@
       ($oops '$native-fiber-preempt
         "native fiber ~s is not a scheduler fiber"
         (native-fiber-id target)))
+    (unless ($native-fiber-preempt-active)
+      ($oops '$native-fiber-preempt
+        "native-fiber preemption can be requested only from the timer handler"))
     (let ([current ($current-native-fiber)])
       (cond
+        [($native-fiber-preempt-target) #f]
         [(or (not current)
              (eq? current target)
              (not (fx= (fxlogand (native-fiber-flags current)
                                   (constant native-fiber-flag-scheduler))
                         0))
-             (native-fiber-switch-prohibited?))
+             (native-fiber-switch-prohibited?)
+             ($native-fiber-transition)
+             (not (fx= (#3%$tc-field 'disable-count (#3%$tc)) 0)))
          #f]
-        [($native-fiber-try-claim! target)
-         (native-fiber-exchange '$native-fiber-preempt
-           current target payload #f)]
-        [else #f]))))
+        [else
+         ;; The timer path must remain nonallocating and bounded. Stable-state
+         ;; validation and claiming happen in the event epilogue after all
+         ;; timer-handler frames have unwound.
+         (let ([control (native-fiber-read-control target)]
+               [owner (native-fiber-current-owner)])
+           (if (and (fx= (native-fiber-control-state control)
+                         (constant native-fiber-state-parked))
+                    (fx= (native-fiber-control-owner control) owner))
+               (begin
+                 ($native-fiber-preempt-payload payload)
+                 ;; Publish the target last. The event epilogue treats a
+                 ;; nonfalse target as the request's commit record.
+                 ($native-fiber-preempt-target target)
+                 #t)
+               #f))]))))
+
+(set! $native-fiber-service-preemption
+  (lambda ()
+    (let ([target ($native-fiber-preempt-target)])
+      (cond
+        [(not target) #f]
+        [($native-fiber-preempt-active) #f]
+        [else
+         (let ([payload ($native-fiber-preempt-payload)]
+               [current ($current-native-fiber)])
+           ;; Consume the worker-local request before entering the closed
+           ;; transition. A resumed task must not observe or replay it.
+           ($native-fiber-preempt-target #f)
+           ($native-fiber-preempt-payload #f)
+           (unless (and current
+                        ($native-fiber-try-claim! target))
+             ($oops '$native-fiber-service-preemption
+               "native-fiber preemption target is no longer claimable"))
+           (native-fiber-exchange '$native-fiber-service-preemption
+             current target payload #f))]))))
 
 (set! $native-fiber-finish
   (lambda (current target outcome)
@@ -2227,8 +2432,12 @@
     ($oops '$native-fiber-finish "a finished native fiber resumed")))
 
 (set! native-fiber-start
-  (lambda (transfer)
-    (native-fiber-commit-transfer! transfer)
+  (lambda ()
+    ;; A first entry has no suspended switch wrapper in which to balance the
+    ;; source's disable-interrupts call.
+    (native-fiber-receive)
+    (enable-interrupts)
+    (native-fiber-check-stable! '$native-fiber-start ($current-native-fiber))
     (let* ([fiber ($current-native-fiber)]
            [entry (native-fiber-entry fiber)]
            [on-return (native-fiber-on-return fiber)])
@@ -2242,6 +2451,7 @@
                (cons 'return (entry)))])
         (on-return fiber outcome))
       ($oops '$native-fiber-start "native-fiber termination procedure returned"))))
+
 )
 
 (define lock-object
@@ -2315,36 +2525,43 @@
   (set! $event-and-resume
         (case-lambda
          [(proc)
-          ($event)
+          ($process-event)
           (inc)
+          ($native-fiber-service-preemption)
           (proc)]
          [(proc arg)
-          ($event)
+          ($process-event)
           (inc)
+          ($native-fiber-service-preemption)
           (proc arg)]
          [(proc arg1 arg2)
-          ($event)
+          ($process-event)
           (inc)
+          ($native-fiber-service-preemption)
           (proc arg1 arg2)]
          [(proc arg1 arg2 arg3)
-          ($event)
+          ($process-event)
           (inc)
+          ($native-fiber-service-preemption)
           (proc arg1 arg2 arg3)]
          [(proc arg1 arg2 arg3 arg4)
-          ($event)
+          ($process-event)
           (inc)
+          ($native-fiber-service-preemption)
           (proc arg1 arg2 arg3 arg4)]
          ;; Cases above should cover `event-resume-max-preferred-arg-cnt`,
          ;; including `proc` in th count
          [(proc . args)
-          ($event)
+          ($process-event)
           (inc)
+          ($native-fiber-service-preemption)
           (apply proc args)]))
 
   (set! $event-and-resume*
         (lambda (proc+args)
-          ($event)
+          ($process-event)
           (inc)
+          ($native-fiber-service-preemption)
           (apply (car proc+args) (cdr proc+args)))))
 
 (define $tc (lambda () ($tc)))
