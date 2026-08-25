@@ -26,6 +26,24 @@ static void check_locked_object(ptr p, IBOOL locked, IGEN g, IBOOL aftergc, IGEN
 
 static IBOOL checkheap_noisy;
 
+#define CHECKHEAP_TEST_MARK_OMIT 1
+#define CHECKHEAP_TEST_MARK_EXTRA 2
+
+/* This target is deliberately not registered as a GC root: the extra-mark
+ * test needs to retain the source address without making the object live. */
+static ptr S_checkheap_test_mark_target;
+static iptr S_checkheap_test_mark_action;
+
+void S_checkheap_test_mark_fault(ptr target, iptr action) {
+  if (FIXMEDIATE(target)
+      || MaybeSegInfo(ptr_get_segment(target)) == NULL
+      || (action != CHECKHEAP_TEST_MARK_OMIT
+          && action != CHECKHEAP_TEST_MARK_EXTRA))
+    S_error_abort("checkheap mark fault is invalid");
+  S_checkheap_test_mark_target = target;
+  S_checkheap_test_mark_action = action;
+}
+
 /* GC phase coverage is dormant outside explicitly armed runtime tests. The
  * phase mask contains no Scheme pointers and is protected independently of
  * collector locks so a test can observe collections performed by another
@@ -110,6 +128,8 @@ void S_gc_init(void) {
   ATOMIC_STORE_IBOOL(&S_checkheap, 0); /* 0 for disabled, 1 for enabled */
   S_checkheap_errors = 0; /* count of errors detected by checkheap */
   checkheap_noisy = 0; /* 0 for error output only; 1 for more noisy output */
+  S_checkheap_test_mark_target = (ptr)0;
+  S_checkheap_test_mark_action = 0;
   S_G.prcgeneration = static_generation;
 
   if (ATOMIC_LOAD_IBOOL(&S_checkheap)) {
@@ -1818,9 +1838,9 @@ static void check_continuation_layout(ptr p) {
                        p, base, span);
 }
 
-/* A full-collection check uses storage that is independent of the collector's
- * mark masks. Object layout is shared with the collector, while roots,
- * worklist state, and visited bits are reconstructed here. */
+/* The reachability check uses storage that is independent of the collector's
+ * mark masks and remembered sets. Object layout is shared with the collector,
+ * while roots, worklist state, and visited bits are reconstructed here. */
 typedef struct {
   uptr segment;
   IGEN generation;
@@ -2100,12 +2120,12 @@ static void shadow_weak_pair(ptr p) {
 }
 
 static IBOOL shadow_ephemeron_key_live(ptr key) {
-  seginfo *si;
+  shadow_segment *ss;
 
   if (key == Sbwp_object) return 0;
-  if (FIXMEDIATE(key)
-      || (si = MaybeSegInfo(ptr_get_segment(key))) == NULL
-      || si->generation > shadow.maximum_collected_generation)
+  if (FIXMEDIATE(key)) return 1;
+  ss = shadow_find_segment(ptr_get_segment(key), 0);
+  if (ss == NULL || ss->generation > shadow.maximum_collected_generation)
     return 1;
   return shadow_expected_marked(key);
 }
@@ -2267,12 +2287,12 @@ static void shadow_add_guardian(ptr entry, IBOOL eligible) {
 }
 
 static IBOOL shadow_value_live(ptr p) {
-  seginfo *si;
+  shadow_segment *ss;
 
   if (p == Sbwp_object) return 0;
-  if (FIXMEDIATE(p)
-      || (si = MaybeSegInfo(ptr_get_segment(p))) == NULL
-      || si->generation > shadow.maximum_collected_generation)
+  if (FIXMEDIATE(p)) return 1;
+  ss = shadow_find_segment(ptr_get_segment(p), 0);
+  if (ss == NULL || ss->generation > shadow.maximum_collected_generation)
     return 1;
   return shadow_expected_marked(p);
 }
@@ -2463,17 +2483,20 @@ static void shadow_seed_checked_pointer(ptr *pp, ptr p, uptr seg, ISPC s) {
 
   if (shadow.phase != SHADOW_PHASE_PREPARING
       || (si = MaybeSegInfo(seg)) == NULL
-      || si->generation != static_generation)
+      || si->generation <= shadow.maximum_collected_generation)
     return;
 
   if (s == space_weakpair) {
     uptr word = ((uptr)TO_PTR(pp) - (uptr)build_ptr(seg, 0)) / sizeof(ptr);
-    if ((word & 1) != 0) shadow_expected_pointer(p);
+    if ((word & 1) == 0)
+      shadow_expected_pointer(TYPE(TO_PTR(pp), type_pair));
+    else
+      shadow_expected_pointer(p);
   } else if (s == space_ephemeron) {
     uptr offset = ((uptr)TO_PTR(pp) - (uptr)build_ptr(seg, 0))
                 % size_ephemeron;
     if (offset == 0)
-      shadow_ephemeron(TYPE(TO_PTR(pp), type_pair));
+      shadow_expected_pointer(TYPE(TO_PTR(pp), type_pair));
   } else {
     shadow_expected_pointer(p);
   }
@@ -2487,13 +2510,18 @@ void S_checkheap_begin_mark_check(IGEN mcg, IGEN min_tg, IGEN max_tg,
   ptr ls;
 
   shadow_reset();
-  if (mcg < S_G.max_nonstatic_generation) return;
-
   shadow.phase = SHADOW_PHASE_PREPARING;
   native_fiber_census.active = 1;
   shadow.maximum_collected_generation = mcg;
   shadow.minimum_target_generation = min_tg;
   shadow.maximum_target_generation = max_tg;
+
+  if (S_checkheap_test_mark_action != 0) {
+    seginfo *si = MaybeSegInfo(
+      ptr_get_segment(S_checkheap_test_mark_target));
+    if (si == NULL || si->generation > mcg)
+      S_error_abort("checkheap mark fault target is not collected");
+  }
 
   for (g = 0; g <= mcg; INCRGEN(g))
     for (s = 0; s <= max_real_space; s += 1) {
@@ -2563,6 +2591,9 @@ void S_checkheap_note_reached(ptr p) {
   uptr byte, word, shift, mask, old;
 
   if (shadow.phase != SHADOW_PHASE_COLLECTING) return;
+  if (S_checkheap_test_mark_action == CHECKHEAP_TEST_MARK_OMIT
+      && p == S_checkheap_test_mark_target)
+    return;
   ss = shadow_find_segment(ptr_get_segment(p), 0);
   if (ss == NULL || ss->official_bits == NULL)
     S_error_abort("check_heap: collector reached an uninventoried segment");
@@ -2631,6 +2662,20 @@ static void shadow_compare_official(const char *stage,
 }
 
 void S_checkheap_verify_mark_check(void) {
+  if (shadow.phase == SHADOW_PHASE_COLLECTING
+      && S_checkheap_test_mark_action == CHECKHEAP_TEST_MARK_EXTRA) {
+    ptr p = S_checkheap_test_mark_target;
+    shadow_segment *ss = shadow_find_segment(ptr_get_segment(p), 0);
+    uptr byte, word, shift;
+    if (ss == NULL || ss->official_bits == NULL)
+      S_error_abort("checkheap extra-mark fault target is uninventoried");
+    byte = segment_bitmap_byte(p);
+    word = byte / sizeof(uptr);
+    shift = (byte % sizeof(uptr)) * 8;
+    ss->official_bits[word] |= ((uptr)segment_bitmap_bit(p)) << shift;
+  }
+  S_checkheap_test_mark_target = (ptr)0;
+  S_checkheap_test_mark_action = 0;
   if (shadow.phase != SHADOW_PHASE_COLLECTING) return;
   shadow_compare_official("initial", 1);
 }
@@ -2665,13 +2710,19 @@ void S_checkheap_note_guardian(ptr entry, int action) {
 
 static IBOOL shadow_relocated_container(ptr source, ptr *destination) {
   seginfo *si;
+  shadow_segment *ss;
 
-  if (FIXMEDIATE(source)
-      || (si = MaybeSegInfo(ptr_get_segment(source))) == NULL
-      || si->generation > shadow.maximum_collected_generation) {
+  if (FIXMEDIATE(source)) {
     *destination = source;
     return 1;
   }
+  ss = shadow_find_segment(ptr_get_segment(source), 0);
+  if (ss == NULL || ss->generation > shadow.maximum_collected_generation) {
+    *destination = source;
+    return 1;
+  }
+  si = MaybeSegInfo(ptr_get_segment(source));
+  if (si == NULL) return 0;
   if (si->marked_mask != NULL
       && (si->marked_mask[segment_bitmap_byte(source)]
           & segment_bitmap_bit(source))) {

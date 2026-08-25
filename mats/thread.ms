@@ -2049,6 +2049,54 @@
 (mat native-fiber-gc-phase-fault-injection
   (andmap native-fiber-gc-phase-death-test '(0 1 2 3 4)))
 
+(define (checkheap-mark-death-test action expected)
+  (define (slurp port)
+    (let loop ([chars '()])
+      (let ([char (read-char port)])
+        (if (eof-object? char)
+            (list->string (reverse chars))
+            (loop (cons char chars))))))
+  (let-values ([(to-stdin from-stdout from-stderr pid)
+                (open-process-ports
+                  (format "~a -q" (native-fiber-test-scheme-command))
+                  (buffer-mode block)
+                  (native-transcoder))])
+    (for-each
+      (lambda (form) (pretty-print form to-stdin))
+      `((define enable-check
+          (foreign-procedure "(cs)enable_check_heap" (boolean) void))
+        (define arm
+          (foreign-procedure "(cs)checkheap_test_mark_fault"
+            (scheme-object iptr) void))
+        (define root #f)
+        (enable-check #t)
+        ,(case action
+           [(1)
+            '(begin
+               (set! root (vector (list 'reachable)))
+               (arm (vector-ref root 0) 1))]
+           [(2)
+            '(let ([unreachable (list 'unreachable)])
+               (arm unreachable 2))])
+        (collect 0)
+        (keep-live root)
+        (display "checkheap-mark-death-test-survived")))
+    (close-port to-stdin)
+    (let ([stdout (slurp from-stdout)]
+          [stderr (slurp from-stderr)])
+      (close-port from-stdout)
+      (close-port from-stderr)
+      (and (not (native-fiber-string-contains? stdout
+                  "checkheap-mark-death-test-survived"))
+           (native-fiber-string-contains? stderr expected)
+           #t))))
+
+(mat checkheap-bidirectional-mark-faults
+  (checkheap-mark-death-test
+    1 "checkmark found reachable object omitted")
+  (checkheap-mark-death-test
+    2 "checkmark found unreachable object retained"))
+
 (define (native-fiber-census-death-test corruption)
   (define (slurp port)
     (let loop ([chars '()])

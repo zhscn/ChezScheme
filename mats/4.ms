@@ -5109,6 +5109,66 @@
              (begin (foreign-free addr) #t)))))
   )
 
+(mat partial-gc-reachability-check
+  ;; Uncollected ordinary objects are roots for their young strong fields,
+  ;; while old weak containers retain their weak semantics.
+  (parameterize ([#%$enable-check-heap #t]
+                 [collect-maximum-generation
+                  (max (collect-maximum-generation) 2)])
+    (with-interrupts-disabled
+      (let ([sources (vector #f #f #f #f #f #f)]
+            [live-weak (weak-cons #f #f)]
+            [dead-weak (weak-cons #f #f)]
+            [live-ephemeron (ephemeron-cons #f #f)]
+            [dead-ephemeron (ephemeron-cons #f #f)])
+        (vector-set! sources 2 live-weak)
+        (vector-set! sources 3 dead-weak)
+        (vector-set! sources 4 live-ephemeron)
+        (vector-set! sources 5 dead-ephemeron)
+        (collect 0 1 1)
+        (let ([strong (list 'strong)]
+              [live-key (gensym)]
+              [dead-weak-key (gensym)]
+              [dead-ephemeron-key (gensym)])
+          (vector-set! sources 0 strong)
+          (vector-set! sources 1 live-key)
+          (set-car! live-weak live-key)
+          (set-cdr! live-weak (list 'weak-cdr))
+          (set-car! dead-weak dead-weak-key)
+          (set-car! live-ephemeron live-key)
+          (set-cdr! live-ephemeron (list 'ephemeron-value))
+          (set-car! dead-ephemeron dead-ephemeron-key)
+          (set-cdr! dead-ephemeron (list 'dead-value))
+          (set! strong #f)
+          (set! live-key #f)
+          (set! dead-weak-key #f)
+          (set! dead-ephemeron-key #f)
+          (collect 0)
+          (and (equal? (vector-ref sources 0) '(strong))
+               (eq? (car live-weak) (vector-ref sources 1))
+               (equal? (cdr live-weak) '(weak-cdr))
+               (bwp-object? (car dead-weak))
+               (eq? (car live-ephemeron) (vector-ref sources 1))
+               (equal? (cdr live-ephemeron) '(ephemeron-value))
+               (bwp-object? (car dead-ephemeron))
+               (bwp-object? (cdr dead-ephemeron)))))))
+
+  ;; A guardian with an old tconc still finalizes a young unreachable object
+  ;; during a generation-zero collection.
+  (parameterize ([#%$enable-check-heap #t]
+                 [collect-maximum-generation
+                  (max (collect-maximum-generation) 2)])
+    (with-interrupts-disabled
+      (let ([guardian (make-guardian)])
+        (collect 0 1 1)
+        (let ([object (gensym)])
+          (guardian object)
+          (set! object #f)
+          (collect 0)
+          (and (symbol? (guardian))
+               (not (guardian)))))))
+  )
+
 (mat rebuilt-remembered-set
   (parameterize ([#%$enable-check-heap #t])
     (with-interrupts-disabled
