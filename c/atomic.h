@@ -50,7 +50,7 @@
 #elif defined(__riscv)
 # define STORE_FENCE()   __asm__ __volatile__ ("fence w,rw" : : : "memory")
 # define ACQUIRE_FENCE() __asm__ __volatile__ ("fence r,rw" : : : "memory")
-# define RELEASE_FENCE() __asm__ __volatile__ ("fence rw,r" : : : "memory")
+# define RELEASE_FENCE() __asm__ __volatile__ ("fence rw,w" : : : "memory")
 #elif defined(__loongarch64)
 # define STORE_FENCE()   __asm__ __volatile__ ("dbar 0" : : : "memory")
 # define ACQUIRE_FENCE() STORE_FENCE()
