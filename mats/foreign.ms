@@ -3253,7 +3253,7 @@
 
   ;; regression test related to saving registers that hold allocated
   ;; callable argument
-  (let* ([call-with-many-args (foreign-procedure "call_with_many_args" (void*) boolean)]
+  (let* ([call-with-many-args (foreign-procedure "call_with_many_args" (void*) void)]
          [result #f]
          [cb (foreign-callable
               (lambda (i s1 s2 s3 s4 i2 s6 s7 i3)

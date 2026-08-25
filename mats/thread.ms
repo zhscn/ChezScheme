@@ -3429,7 +3429,7 @@
           (foreign-procedure
             "call_df" (ptr double-float int int) double-float)]
          [call-many
-          (foreign-procedure "call_with_many_args" (void*) boolean)]
+          (foreign-procedure "call_with_many_args" (void*) void)]
          [task #f]
          [callback-depths '()]
          [many-ok? #t])
@@ -3487,8 +3487,9 @@
               (and (= (call-i64 i64-callback 1099511627776 7 23)
                       1099511627811)
                    (= (call-df df-callback 73.25 7 23) 108.25)
-                   (call-many (foreign-callable-entry-point many-callback))
-                   many-ok?))
+                   (begin
+                     (call-many (foreign-callable-entry-point many-callback))
+                     many-ok?)))
             (and (check-abi)
                  (eq? (yield 'ffi-parked) 'ffi-resume)
                  (check-abi)
