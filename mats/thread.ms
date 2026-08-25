@@ -2522,6 +2522,163 @@
                   (andmap values (vector->list valid))
                   (eq? (#3%$native-fiber-state task) 'finished)))))))
 
+(mat native-fiber-publication-litmus
+  (let* ([main-scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [current-scheduler main-scheduler]
+         [task #f]
+         [publication #f]
+         [rounds 2000]
+         [worker-count 4]
+         [failure #f]
+         [owners '()]
+         [lock (make-mutex)])
+    (define (make-publication i)
+      (vector i (make-vector 64 i) (fxlogxor i #x5a5a5a)))
+    (define (valid-publication? value)
+      (and (vector? value)
+           (fx= (vector-length value) 3)
+           (let ([i (vector-ref value 0)]
+                 [body (vector-ref value 1)])
+             (and (fixnum? i)
+                  (vector? body)
+                  (fx= (vector-length body) 64)
+                  (let loop ([j 0])
+                    (or (fx= j 64)
+                        (and (fx= (vector-ref body j) i)
+                             (loop (fx+ j 1)))))
+                  (fx= (vector-ref value 2) (fxlogxor i #x5a5a5a))))))
+    (define (yield-publication i)
+      (set! publication (make-publication i))
+      (#3%$native-fiber-try-claim! current-scheduler)
+      (let ([ack (#3%$native-fiber-switch
+                   task current-scheduler publication)])
+        (unless (fx= ack i)
+          (error 'native-fiber-publication-litmus
+            "resume acknowledgement was not published" i ack))))
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (do ([i 0 (fx+ i 1)])
+              ((fx= i rounds) 'done)
+            (yield-publication i)))
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! current-scheduler)
+          (#3%$native-fiber-finish fiber current-scheduler outcome))
+        #b100))
+    (#3%$native-fiber-try-claim! task)
+    (let ([first (#3%$native-fiber-switch main-scheduler task 'start)])
+      (unless (and (eq? first publication) (valid-publication? first))
+        (set! failure 'initial-publication)))
+    (let ([workers
+           (map
+             (lambda (worker-index)
+               (fork-thread
+                 (lambda ()
+                   (let ([scheduler (#3%$native-fiber-adopt 0)])
+                     (let loop ()
+                       (cond
+                         [(eq? (#3%$native-fiber-state task) 'finished)
+                          (void)]
+                         [(#3%$native-fiber-try-claim! task)
+                          ;; The successful claim is the only synchronization
+                          ;; before these ordinary reads.
+                          (let ([seen publication])
+                            (unless (valid-publication? seen)
+                              (with-mutex lock
+                                (unless failure
+                                  (set! failure
+                                    (list 'torn-publication worker-index)))))
+                            (set! current-scheduler scheduler)
+                            (let ([outcome
+                                   (#3%$native-fiber-switch scheduler task
+                                     (if (valid-publication? seen)
+                                         (vector-ref seen 0)
+                                         -1))])
+                              (with-mutex lock
+                                (set! owners
+                                  (cons (get-thread-id) owners)))
+                              (unless (or (and (pair? outcome)
+                                               (eq? (car outcome) 'return))
+                                          (valid-publication? outcome))
+                                (with-mutex lock
+                                  (unless failure
+                                    (set! failure
+                                      (list 'payload-publication
+                                            worker-index)))))
+                              ;; Give another thief a chance to perform the
+                              ;; next acquire instead of repeatedly winning on
+                              ;; one native worker.
+                              (sleep (make-time 'time-duration 1000 0))
+                              (loop)))]
+                         [else
+                          (sleep (make-time 'time-duration 1000 0))
+                          (loop)]))))))
+             (iota worker-count))])
+      (for-each thread-join workers)
+      (and (not failure)
+           (eq? (#3%$native-fiber-state task) 'finished)
+           (fx= (vector-ref publication 0) (fx- rounds 1))
+           ;; Multiple workers must participate, otherwise the loop does not
+           ;; exercise cross-thread publication.
+           (let unique ([owner* owners] [seen '()])
+             (if (null? owner*)
+                 (fx> (length seen) 1)
+                 (unique (cdr owner*)
+                   (if (memv (car owner*) seen)
+                       seen
+                       (cons (car owner*) seen)))))))))
+
+(mat native-fiber-release-claim-litmus
+  (let* ([task
+          (#3%$native-fiber-create
+            (lambda () 'unused)
+            (lambda args (error 'native-fiber-release-claim-litmus
+                           "unreachable termination"))
+            #b100)]
+         [lock (make-mutex)]
+         [condition (make-condition)]
+         [first-claimed? #f]
+         [publication #f]
+         [observed #f])
+    (let ([first
+           (fork-thread
+             (lambda ()
+               (#3%$native-fiber-adopt 0)
+               (unless (#3%$native-fiber-try-claim! task)
+                 (error 'native-fiber-release-claim-litmus
+                   "first claim failed"))
+               (with-mutex lock
+                 (set! first-claimed? #t)
+                 (condition-broadcast condition))
+               ;; This write is after the mutex publication. The second
+               ;; worker can observe it only through release-claim/claim.
+               (set! publication
+                 (vector #x12345678 (make-vector 64 'published)))
+               (#3%$native-fiber-release-claim! task)))]
+          [second
+           (fork-thread
+             (lambda ()
+               (#3%$native-fiber-adopt 0)
+               (with-mutex lock
+                 (let wait ()
+                   (unless first-claimed?
+                     (condition-wait condition lock)
+                     (wait))))
+               (let claim ()
+                 (unless (#3%$native-fiber-try-claim! task)
+                   (sleep (make-time 'time-duration 1000 0))
+                   (claim)))
+               (set! observed
+                 (and (vector? publication)
+                      (fx= (vector-ref publication 0) #x12345678)
+                      (andmap (lambda (x) (eq? x 'published))
+                        (vector->list (vector-ref publication 1)))))
+               (#3%$native-fiber-release-claim! task)))])
+      (thread-join first)
+      (thread-join second)
+      (and observed (eq? (#3%$native-fiber-state task) 'new)))))
+
 (mat native-fiber-pinned-owner
   (let* ([scheduler
           (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
