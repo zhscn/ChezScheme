@@ -2088,7 +2088,40 @@
              (#3%$native-fiber-create values values #b100))
            (set! fiber-b
              (#3%$native-fiber-create values values #b100))
-           (#3%$record-set! fiber-b 1 (#3%$record-ref fiber-a 1))])
+           (#3%$record-set! fiber-b 1 (#3%$record-ref fiber-a 1))]
+          [(bad-flags)
+           (set! fiber-a
+             (#3%$native-fiber-create values values #b100))
+           (#3%$record-set! fiber-a 11 #b101)]
+          [(stable-scratch)
+           (set! fiber-a
+             (#3%$native-fiber-create values values #b100))
+           (#3%$record-set! fiber-a 7 (vector 'retained))]
+          [(invalid-owner)
+           (set! fiber-a
+             (#3%$native-fiber-create values values #b100))
+           (#3%$record-set! fiber-a 0 (fxlogor 4 (fxsll 999 3)))]
+          [(scheduler-new)
+           (set! fiber-a
+             (#3%$native-fiber-create values values #b100))
+           (#3%$record-set! fiber-a 11 #b011)]
+          [(mixed-claim-roots)
+           (set! fiber-a
+             (#3%$native-fiber-create values values #b100))
+           (#3%$native-fiber-try-claim! fiber-a)
+           (#3%$record-set! fiber-a 3 #f)]
+          [(finished-roots)
+           (set! fiber-a
+             (#3%$native-fiber-create values values #b100))
+           (#3%$record-set! fiber-a 0 6)]
+          [(pinned-cycle)
+           (set! fiber-a
+             (#3%$native-fiber-create values values #b001))
+           (#3%$native-fiber-try-claim! fiber-a)
+           (#3%$record-set! fiber-a 13 fiber-a)]
+          [(stale-preempt-payload)
+           (#3%$tc-field 'native-fiber-preempt-payload
+             (#3%$tc) 'stale)])
         (enable-check #t)
         (collect (collect-maximum-generation))
         (display "native-fiber-census-death-test-survived")))
@@ -2106,7 +2139,9 @@
 (mat native-fiber-global-census-invariants
   (andmap native-fiber-census-death-test
     '(missing-current missing-claim bad-claim-rollback
-      missing-pinned aliased-context)))
+      missing-pinned aliased-context bad-flags stable-scratch
+      invalid-owner scheduler-new mixed-claim-roots finished-roots
+      pinned-cycle stale-preempt-payload)))
 
 (mat native-fiber-concurrent-gc-handshake
   (andmap
