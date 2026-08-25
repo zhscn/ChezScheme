@@ -771,12 +771,14 @@ void S_handle_event_detour() {
                    : RECORDINSTIT(target, native_fiber_incoming_source_index);
 
         /* A migratable target may have been release-published by a different
-           worker and claimed by Scheme-generated atomic code. Tell TSan about
-           that acquire edge before inspecting its ordinary transaction
-           fields; production builds compile this annotation away. */
-        if (phase == FIX(1))
+           worker and claimed by Scheme-generated atomic code. Complete that
+           acquire before inspecting its ordinary transaction fields. The
+           TSan annotation describes the same edge to the race detector. */
+        if (phase == FIX(1)) {
+          ACQUIRE_FENCE();
           THREAD_SANITIZER_ACQUIRE(
             &RECORDINSTIT(target, native_fiber_control_index));
+        }
 
         if (native_fiber_test_activep(tc, source, target))
           action = native_fiber_test_hook(phase == FIX(1) ? 1 : 3);
@@ -791,11 +793,12 @@ void S_handle_event_detour() {
           control = RECORDINSTIT(source, native_fiber_switch_control_index);
           field = &RECORDINSTIT(source, native_fiber_control_index);
           old_control = *field;
-          /* The CAS is the release publication. Mark the destination card
-             first so a younger control remains visible to a generational
-             collection as soon as another worker can observe it. */
+          /* Mark the destination card and complete ordinary transaction
+             writes before atomically release-publishing the control word. */
           S_dirty_mark(field, control);
           if (action == 1) *field = control;
+          RELEASE_FENCE();
+          THREAD_SANITIZER_RELEASE(field);
           if (!COMPARE_AND_SWAP_PTR(field, TO_VOIDP(old_control),
                                     TO_VOIDP(control)))
             S_error_abort("native-fiber source publication raced");
@@ -804,6 +807,8 @@ void S_handle_event_detour() {
           field = &RECORDINSTIT(target, native_fiber_control_index);
           old_control = *field;
           S_dirty_mark(field, control);
+          RELEASE_FENCE();
+          THREAD_SANITIZER_RELEASE(field);
           if (!COMPARE_AND_SWAP_PTR(field, TO_VOIDP(old_control),
                                     TO_VOIDP(control)))
             S_error_abort("native-fiber target publication raced");
@@ -833,6 +838,7 @@ void S_handle_event_detour() {
           old_control = *field;
           S_dirty_mark(field, control);
           if (action == 2) *field = control;
+          RELEASE_FENCE();
           THREAD_SANITIZER_RELEASE(field);
           if (!COMPARE_AND_SWAP_PTR(field, TO_VOIDP(old_control),
                                     TO_VOIDP(control)))

@@ -2702,6 +2702,9 @@
     (let ([old ($native-fiber-claimed-control)]
           [claimed (native-fiber-read-control fiber)])
       (disable-interrupts)
+      ;; Publish every ordinary write performed while this worker owned the
+      ;; claim before another worker can acquire the restored stable state.
+      (memory-order-release)
       (unless ($record-cas! fiber 0 claimed old)
         (native-fiber-invariant-failure))
       ($native-fiber-claimed #f)
@@ -2975,6 +2978,7 @@
           [old ($native-fiber-claimed-control)])
       (when claimed
         (disable-interrupts)
+        (memory-order-release)
         (unless (and old
                      ($record-cas! claimed 0
                        (native-fiber-read-control claimed) old))
@@ -3020,6 +3024,7 @@
             (native-fiber-commit-control-set! fiber #f)
             (native-fiber-cache-context-set! fiber #f)
             (native-fiber-pinned-next-set! fiber #f)
+            (memory-order-release)
             (unless ($record-cas! fiber 0 finishing finished)
               (native-fiber-invariant-failure))
             (retire)))))
@@ -3039,6 +3044,7 @@
                          (constant native-fiber-state-running))
                     (fx= (native-fiber-control-owner control)
                          (native-fiber-current-owner))
+                    (begin (memory-order-release) #t)
                     ($record-cas! current 0 control finished))
             (native-fiber-invariant-failure))
           ($current-native-fiber #f)

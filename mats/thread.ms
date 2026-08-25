@@ -2613,8 +2613,12 @@
          [current-scheduler main-scheduler]
          [task #f]
          [publication #f]
-         [rounds 2000]
-         [worker-count 4]
+         [rounds
+          (native-fiber-stress-integer
+            "CHEZ_NATIVE_FIBER_PUBLICATION_ROUNDS" 2000 1)]
+         [worker-count
+          (native-fiber-stress-integer
+            "CHEZ_NATIVE_FIBER_PUBLICATION_WORKERS" 4 2)]
          [failure #f]
          [owners '()]
          [lock (make-mutex)])
@@ -2714,7 +2718,7 @@
                        seen
                        (cons (car owner*) seen)))))))))
 
-(mat native-fiber-release-claim-litmus
+(define (native-fiber-release-claim-litmus-once)
   (let* ([task
           (#3%$native-fiber-create
             (lambda () 'unused)
@@ -2763,6 +2767,15 @@
       (thread-join first)
       (thread-join second)
       (and observed (eq? (#3%$native-fiber-state task) 'new)))))
+
+(mat native-fiber-release-claim-litmus
+  (let ([rounds
+         (native-fiber-stress-integer
+           "CHEZ_NATIVE_FIBER_CLAIM_PUBLICATION_ROUNDS" 64 1)])
+    (let loop ([round 0])
+      (or (fx= round rounds)
+          (and (native-fiber-release-claim-litmus-once)
+               (loop (fx+ round 1)))))))
 
 (mat native-fiber-pinned-owner
   (let* ([scheduler

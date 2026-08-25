@@ -1,6 +1,7 @@
-/* `STORE_FENCE` is used by the storage-management system, but
+/* `STORE_FENCE` is used by the storage-management system.
    `ACQUIRE_FENCE`, `RELEASE_FENCE`, and `COMPARE_AND_SWAP_PTR`
-   are used only by the pb interpreter.
+   are also used by runtime publication protocols, including native-fiber
+   ownership transfer, and by the pb interpreter.
 
    It's always ok to map `ACQUIRE_FENCE` and `RELEASE_FENCE` to
    `STORE_FENCE`. For portability, we mainly rely on a
@@ -11,7 +12,9 @@
    below, then the only advantage over using `__sync_synchronize` is
    to support environments with different or very old compilers.
 
-   For `COMPARE_AND_SWAP_PTR`, we similarlly rely on a GCC/Clang
+   `COMPARE_AND_SWAP_PTR` supplies atomicity. Callers that require a
+   particular memory order use the acquire and release fences explicitly.
+   For `COMPARE_AND_SWAP_PTR`, we similarly rely on a GCC/Clang
    `__sync_bool_compare_and_swap` intrinsic. Some inline-assembly
    versions are here --- but, again, the only advantage of those is to
    support environments with different or very old compilers. */

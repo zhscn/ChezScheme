@@ -3339,13 +3339,13 @@
     (define-inline 2 memory-order-acquire
       [() (if-feature pthreads
             (constant-case architecture
-	          [(arm32 arm64 riscv64 loongarch64 pb) (%seq ,(%inline acquire-fence) (quote ,(void)))]
+             [(arm32 arm64 riscv64 loongarch64 ppc32 pb) (%seq ,(%inline acquire-fence) (quote ,(void)))]
               [else `(quote ,(void))])
             `(quote ,(void)))])
     (define-inline 2 memory-order-release
       [() (if-feature pthreads
             (constant-case architecture
-	          [(arm32 arm64 riscv64 loongarch64 pb) (%seq ,(%inline release-fence) (quote ,(void)))]
+             [(arm32 arm64 riscv64 loongarch64 ppc32 pb) (%seq ,(%inline release-fence) (quote ,(void)))]
               [else `(quote ,(void))])
             `(quote ,(void)))])
     (let ()
