@@ -67,6 +67,58 @@
 # define RELEASE_FENCE() do { } while (0)
 #endif
 
+/* Some collector metadata and heap words are deliberately observed while an
+   owning collector thread updates them. The accesses are word- or byte-sized
+   and aligned; these helpers express that protocol to the C memory model
+   without imposing stronger ordering than the collector requires. */
+#if !defined(PTHREADS)
+# define ATOMIC_LOAD_POINTER_ACQUIRE(a) (*(a))
+# define ATOMIC_STORE_POINTER_RELEASE(a, v) (*(a) = (v))
+# define ATOMIC_LOAD_IPTR_ACQUIRE(a) (*(a))
+# define ATOMIC_LOAD_OCTET_RELAXED(a) (*(a))
+# define ATOMIC_OR_OCTET_RELAXED(a, v) (*(a) |= (v))
+#elif defined(_MSC_VER)
+# define ATOMIC_LOAD_POINTER_ACQUIRE(a) \
+    _InterlockedCompareExchangePointer((void *volatile *)(a), NULL, NULL)
+# define ATOMIC_STORE_POINTER_RELEASE(a, v) \
+    ((void)_InterlockedExchangePointer((void *volatile *)(a), (void *)(v)))
+# if ptr_bits == 64
+#  define ATOMIC_LOAD_IPTR_ACQUIRE(a) \
+     ((iptr)_InterlockedCompareExchange64((volatile __int64 *)(a), 0, 0))
+# else
+#  define ATOMIC_LOAD_IPTR_ACQUIRE(a) \
+     ((iptr)_InterlockedCompareExchange((volatile long *)(a), 0, 0))
+# endif
+# define ATOMIC_LOAD_OCTET_RELAXED(a) \
+    ((octet)_InterlockedCompareExchange8((volatile char *)(a), 0, 0))
+# define ATOMIC_OR_OCTET_RELAXED(a, v) \
+    ((void)_InterlockedOr8((volatile char *)(a), (char)(v)))
+#elif (__GNUC__ >= 5) || C_COMPILER_HAS_BUILTIN(__atomic_load_n)
+# define ATOMIC_LOAD_POINTER_ACQUIRE(a) __atomic_load_n((a), __ATOMIC_ACQUIRE)
+# define ATOMIC_STORE_POINTER_RELEASE(a, v) \
+    __atomic_store_n((a), (v), __ATOMIC_RELEASE)
+# define ATOMIC_LOAD_IPTR_ACQUIRE(a) __atomic_load_n((a), __ATOMIC_ACQUIRE)
+# define ATOMIC_LOAD_OCTET_RELAXED(a) __atomic_load_n((a), __ATOMIC_RELAXED)
+# define ATOMIC_OR_OCTET_RELAXED(a, v) \
+    ((void)__atomic_fetch_or((a), (v), __ATOMIC_RELAXED))
+#elif C_COMPILER_HAS_BUILTIN(__sync_val_compare_and_swap)
+# define ATOMIC_LOAD_POINTER_ACQUIRE(a) __sync_val_compare_and_swap((a), 0, 0)
+# define ATOMIC_STORE_POINTER_RELEASE(a, v) \
+    ((void)__sync_lock_test_and_set((a), (v)))
+# define ATOMIC_LOAD_IPTR_ACQUIRE(a) __sync_val_compare_and_swap((a), 0, 0)
+# define ATOMIC_LOAD_OCTET_RELAXED(a) __sync_val_compare_and_swap((a), 0, 0)
+# define ATOMIC_OR_OCTET_RELAXED(a, v) ((void)__sync_fetch_and_or((a), (v)))
+#else
+# define ATOMIC_LOAD_POINTER_ACQUIRE(a) (*(void * volatile *)(a))
+# define ATOMIC_STORE_POINTER_RELEASE(a, v) (*(void * volatile *)(a) = (v))
+# define ATOMIC_LOAD_IPTR_ACQUIRE(a) (*(volatile iptr *)(a))
+# define ATOMIC_LOAD_OCTET_RELAXED(a) (*(volatile octet *)(a))
+# define ATOMIC_OR_OCTET_RELAXED(a, v) (*(volatile octet *)(a) |= (v))
+#endif
+
+#define GC_ATOMIC_CODE_TYPE(code) ATOMIC_LOAD_IPTR_ACQUIRE(&CODETYPE(code))
+#define GC_CODE_TYPE(code) CODETYPE(code)
+
 /* Process-wide runtime switches can be observed by mutator and collector
    threads without taking a runtime lock. Keep those accesses visible to the
    C memory model and to thread sanitizers. */

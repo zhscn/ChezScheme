@@ -464,7 +464,7 @@ static IGEN copy(thread_gc *tgc, ptr p, seginfo *si, ptr *dest)
             ISPC p_spc = space_impure;
             {
               ptr cdr_p = Scdr(p);
-              if ((cdr_p != p) && (((TYPEBITS(cdr_p)) == type_pair) && (((ptr_get_segment(cdr_p)) == (ptr_get_segment(p))) && (((FWDMARKER(cdr_p)) != forward_marker) && (!(si -> marked_mask))))))
+              if ((cdr_p != p) && (((TYPEBITS(cdr_p)) == type_pair) && (((ptr_get_segment(cdr_p)) == (ptr_get_segment(p))) && (((GC_FORWARD_MARKER(cdr_p)) != forward_marker) && (!(si -> marked_mask))))))
               {
                 uptr p_sz = 2 * (size_pair);
                 find_gc_room(tgc, p_spc, tg, type_pair, p_sz, new_p);
@@ -475,7 +475,7 @@ static IGEN copy(thread_gc *tgc, ptr p, seginfo *si, ptr *dest)
                   INITCAR(new_cdr_p) = INITCAR(cdr_p);
                   INITCDR(new_cdr_p) = INITCDR(cdr_p);
                   S_checkheap_note_reached(cdr_p);
-                  FWDMARKER(cdr_p) = forward_marker;
+                  GC_SET_FORWARD_MARKER(cdr_p);
                   FWDADDRESS(cdr_p) = new_cdr_p;
                   ADD_BACKREFERENCE_FROM(new_cdr_p, new_p, tg);
                   S_G.countof[tg][countof_pair] += 2;
@@ -509,7 +509,7 @@ static IGEN copy(thread_gc *tgc, ptr p, seginfo *si, ptr *dest)
             ISPC p_spc = space_weakpair;
             {
               ptr cdr_p = Scdr(p);
-              if ((cdr_p != p) && (((TYPEBITS(cdr_p)) == type_pair) && (((ptr_get_segment(cdr_p)) == (ptr_get_segment(p))) && (((FWDMARKER(cdr_p)) != forward_marker) && (!(si -> marked_mask))))))
+              if ((cdr_p != p) && (((TYPEBITS(cdr_p)) == type_pair) && (((ptr_get_segment(cdr_p)) == (ptr_get_segment(p))) && (((GC_FORWARD_MARKER(cdr_p)) != forward_marker) && (!(si -> marked_mask))))))
               {
                 uptr p_sz = 2 * (size_pair);
                 find_gc_room(tgc, p_spc, tg, type_pair, p_sz, new_p);
@@ -520,7 +520,7 @@ static IGEN copy(thread_gc *tgc, ptr p, seginfo *si, ptr *dest)
                   INITCAR(new_cdr_p) = INITCAR(cdr_p);
                   INITCDR(new_cdr_p) = INITCDR(cdr_p);
                   S_checkheap_note_reached(cdr_p);
-                  FWDMARKER(cdr_p) = forward_marker;
+                  GC_SET_FORWARD_MARKER(cdr_p);
                   FWDADDRESS(cdr_p) = new_cdr_p;
                   ADD_BACKREFERENCE_FROM(new_cdr_p, new_p, tg);
                   S_G.countof[tg][countof_weakpair] += 2;
@@ -546,7 +546,7 @@ static IGEN copy(thread_gc *tgc, ptr p, seginfo *si, ptr *dest)
       {
         ptr code = CLOSCODE(p);
         relocate_pure(&code);
-        if ((CODETYPE(code)) & (code_flag_continuation << code_flags_offset))
+        if ((GC_CODE_TYPE(code)) & (code_flag_continuation << code_flags_offset))
         {
           ISPC p_spc = ((is_counting_root(si, p))
                         ? space_count_pure
@@ -587,7 +587,7 @@ static IGEN copy(thread_gc *tgc, ptr p, seginfo *si, ptr *dest)
                         ? space_count_impure
                         : (BACKREFERENCES_ENABLED
                            ? space_closure
-                           : (((CODETYPE(code)) & (code_flag_mutable_closure << code_flags_offset))
+                           : (((GC_CODE_TYPE(code)) & (code_flag_mutable_closure << code_flags_offset))
                               ? space_impure
                               : space_pure)));
           {
@@ -644,7 +644,7 @@ static IGEN copy(thread_gc *tgc, ptr p, seginfo *si, ptr *dest)
     }
     tgc->sweep_change = SWEEP_CHANGE_PROGRESS;
     FWDADDRESS(p) = new_p;
-    FWDMARKER(p) = forward_marker;
+    GC_SET_FORWARD_MARKER(p);
     ADD_BACKREFERENCE(p, tg);
     *dest = new_p;
     return tg;
@@ -890,7 +890,7 @@ static void sweep(thread_gc *tgc, ptr p, IGEN from_g)
                       }
                     }
                   }
-                  if ((from_g == static_generation) && ((!S_G.retain_static_relocation) && (0 == ((CODETYPE(p)) & (code_flag_template << code_flags_offset)))))
+                  if ((from_g == static_generation) && ((!S_G.retain_static_relocation) && (0 == ((GC_CODE_TYPE(p)) & (code_flag_template << code_flags_offset)))))
                   {
                     CODERELOC(p) = (ptr)0;
                   }
@@ -1154,7 +1154,7 @@ static void sweep(thread_gc *tgc, ptr p, IGEN from_g)
     {
       ptr code = CLOSCODE(p);
       relocate_pure(&code);
-      if ((CODETYPE(code)) & (code_flag_continuation << code_flags_offset))
+      if ((GC_CODE_TYPE(code)) & (code_flag_continuation << code_flags_offset))
       {
         SETCLOSCODE(p, code);
         relocate_pure(&CONTWINDERS(p));
@@ -1298,7 +1298,7 @@ static void sweep(thread_gc *tgc, ptr p, IGEN from_g)
       else
       {
         uptr len = CODEFREE(code);
-        if ((CODETYPE(code)) & (code_flag_mutable_closure << code_flags_offset))
+        if ((GC_CODE_TYPE(code)) & (code_flag_mutable_closure << code_flags_offset))
         {
           SETCLOSCODE(p, code);
           {
@@ -1785,7 +1785,7 @@ static void sweep_object_in_old(thread_gc *tgc, ptr p)
     {
       ptr code = CLOSCODE(p);
       relocate_pure(&code);
-      if ((CODETYPE(code)) & (code_flag_continuation << code_flags_offset))
+      if ((GC_CODE_TYPE(code)) & (code_flag_continuation << code_flags_offset))
       {
         SETCLOSCODE(p, code);
         relocate_pure(&CONTWINDERS(p));
@@ -1912,7 +1912,7 @@ static void sweep_object_in_old(thread_gc *tgc, ptr p)
       else
       {
         uptr len = CODEFREE(code);
-        if ((CODETYPE(code)) & (code_flag_mutable_closure << code_flags_offset))
+        if ((GC_CODE_TYPE(code)) & (code_flag_mutable_closure << code_flags_offset))
         {
           SETCLOSCODE(p, code);
           {
@@ -2181,7 +2181,7 @@ static IGEN sweep_dirty_object(thread_gc *tgc, ptr p, IGEN youngest)
       ptr code = CLOSCODE(p);
       {
         uptr len = CODEFREE(code);
-        if ((CODETYPE(code)) & (code_flag_mutable_closure << code_flags_offset))
+        if ((GC_CODE_TYPE(code)) & (code_flag_mutable_closure << code_flags_offset))
         {
           {
             uptr idx, p_len = len;
@@ -2876,7 +2876,7 @@ static void sweep_code_object(thread_gc *tgc, ptr p, IGEN from_g)
                   }
                 }
               }
-              if ((from_g == static_generation) && ((!S_G.retain_static_relocation) && (0 == ((CODETYPE(p)) & (code_flag_template << code_flags_offset)))))
+              if ((from_g == static_generation) && ((!S_G.retain_static_relocation) && (0 == ((GC_CODE_TYPE(p)) & (code_flag_template << code_flags_offset)))))
               {
                 CODERELOC(p) = (ptr)0;
               }
@@ -3102,7 +3102,7 @@ static uptr size_object(ptr p)
   else if (t == type_closure)
   {
     ptr code = CLOSCODE(p);
-    if ((CODETYPE(code)) & (code_flag_continuation << code_flags_offset))
+    if ((GC_CODE_TYPE(code)) & (code_flag_continuation << code_flags_offset))
     {
       uptr p_sz = size_continuation;
       return p_sz;
@@ -3168,7 +3168,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
                     uptr offset = 0;
                     while (offset < p_sz) {
                       ptr mark_p = (ptr)((uptr)p + offset);
-                      si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+                      GC_MARK_BIT(si, mark_p);
                       offset += byte_alignment;
                     }
                   }
@@ -3182,7 +3182,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
                     if (!mark_si->marked_mask) {
                       init_mask(tgc, mark_si->marked_mask, mark_si->generation, 0);
                     }
-                    mark_si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+                    GC_MARK_BIT(mark_si, mark_p);
                     mark_si->marked_count += byte_alignment;
                     offset += byte_alignment;
                   }
@@ -3252,7 +3252,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
                 uptr offset = 0;
                 while (offset < p_sz) {
                   ptr mark_p = (ptr)((uptr)p + offset);
-                  si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+                  GC_MARK_BIT(si, mark_p);
                   offset += byte_alignment;
                 }
               }
@@ -3266,7 +3266,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
                 if (!mark_si->marked_mask) {
                   init_mask(tgc, mark_si->marked_mask, mark_si->generation, 0);
                 }
-                mark_si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+                GC_MARK_BIT(mark_si, mark_p);
                 mark_si->marked_count += byte_alignment;
                 offset += byte_alignment;
               }
@@ -3287,7 +3287,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
             uptr offset = 0;
             while (offset < p_sz) {
               ptr mark_p = (ptr)((uptr)p + offset);
-              si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+              GC_MARK_BIT(si, mark_p);
               offset += byte_alignment;
             }
           }
@@ -3301,7 +3301,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
         uptr sz = size_string((Sstring_length(p)));
         {
           uptr p_sz = sz;
-          si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+          GC_MARK_BIT(si, p);
           {
             uptr addr = (uptr)UNTYPE(p, type_typed_object);
             uptr seg = addr_get_segment(addr);
@@ -3339,7 +3339,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
         uptr sz = size_fxvector((Sfxvector_length(p)));
         {
           uptr p_sz = sz;
-          si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+          GC_MARK_BIT(si, p);
           {
             uptr addr = (uptr)UNTYPE(p, type_typed_object);
             uptr seg = addr_get_segment(addr);
@@ -3377,7 +3377,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
         uptr sz = size_flvector((Sflvector_length(p)));
         {
           uptr p_sz = sz;
-          si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+          GC_MARK_BIT(si, p);
           {
             uptr addr = (uptr)UNTYPE(p, type_typed_object);
             uptr seg = addr_get_segment(addr);
@@ -3428,7 +3428,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
                     uptr offset = 0;
                     while (offset < p_sz) {
                       ptr mark_p = (ptr)((uptr)p + offset);
-                      si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+                      GC_MARK_BIT(si, mark_p);
                       offset += byte_alignment;
                     }
                   }
@@ -3442,7 +3442,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
                     if (!mark_si->marked_mask) {
                       init_mask(tgc, mark_si->marked_mask, mark_si->generation, 0);
                     }
-                    mark_si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+                    GC_MARK_BIT(mark_si, mark_p);
                     mark_si->marked_count += byte_alignment;
                     offset += byte_alignment;
                   }
@@ -3458,7 +3458,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
             uptr sz = size_bytevector((Sbytevector_length(p)));
             {
               uptr p_sz = sz;
-              si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+              GC_MARK_BIT(si, p);
               {
                 uptr addr = (uptr)UNTYPE(p, type_typed_object);
                 uptr seg = addr_get_segment(addr);
@@ -3499,9 +3499,9 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
         si->marked_count += p_sz;
         {
           ptr mark_p = p;
-          si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+          GC_MARK_BIT(si, mark_p);
           mark_p = (ptr)((uptr)mark_p + byte_alignment);
-          si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+          GC_MARK_BIT(si, mark_p);
         }
         push_sweep(p);
         {
@@ -3521,7 +3521,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
       else if (TYPEP(tf, mask_box, type_box))
       {
         uptr p_sz = size_box;
-        si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+        GC_MARK_BIT(si, p);
         si->marked_count += p_sz;
         push_sweep(p);
         S_G.countof[TARGET_GENERATION(si)][countof_box] += 1;
@@ -3534,9 +3534,9 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
         si->marked_count += p_sz;
         {
           ptr mark_p = p;
-          si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+          GC_MARK_BIT(si, mark_p);
           mark_p = (ptr)((uptr)mark_p + byte_alignment);
-          si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+          GC_MARK_BIT(si, mark_p);
         }
         push_sweep(p);
         S_G.countof[TARGET_GENERATION(si)][countof_ratnum] += 1;
@@ -3549,9 +3549,9 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
         si->marked_count += p_sz;
         {
           ptr mark_p = p;
-          si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+          GC_MARK_BIT(si, mark_p);
           mark_p = (ptr)((uptr)mark_p + byte_alignment);
-          si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+          GC_MARK_BIT(si, mark_p);
         }
         push_sweep(p);
         S_G.countof[TARGET_GENERATION(si)][countof_exactnum] += 1;
@@ -3559,7 +3559,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
       else if ((iptr)tf == type_inexactnum)
       {
         uptr p_sz = size_inexactnum;
-        si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+        GC_MARK_BIT(si, p);
         si->marked_count += p_sz;
         S_G.countof[TARGET_GENERATION(si)][countof_inexactnum] += 1;
       }
@@ -3568,7 +3568,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
         uptr sz = size_bignum((BIGLEN(p)));
         {
           uptr p_sz = sz;
-          si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+          GC_MARK_BIT(si, p);
           {
             uptr addr = (uptr)UNTYPE(p, type_typed_object);
             uptr seg = addr_get_segment(addr);
@@ -3604,7 +3604,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
       else if (TYPEP(tf, mask_port, type_port))
       {
         uptr p_sz = size_port;
-        si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+        GC_MARK_BIT(si, p);
         si->marked_count += p_sz;
         push_sweep(p);
         S_G.countof[TARGET_GENERATION(si)][countof_port] += 1;
@@ -3614,7 +3614,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
         uptr len = CODELEN(p);
         {
           uptr p_sz = size_code(len);
-          si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+          GC_MARK_BIT(si, p);
           {
             uptr addr = (uptr)UNTYPE(p, type_typed_object);
             uptr seg = addr_get_segment(addr);
@@ -3651,7 +3651,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
       else if ((iptr)tf == type_thread)
       {
         uptr p_sz = size_thread;
-        si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+        GC_MARK_BIT(si, p);
         si->marked_count += p_sz;
         push_sweep(p);
         S_G.countof[TARGET_GENERATION(si)][countof_thread] += 1;
@@ -3659,14 +3659,14 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
       else if ((iptr)tf == type_rtd_counts)
       {
         uptr p_sz = size_rtd_counts;
-        si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+        GC_MARK_BIT(si, p);
         si->marked_count += p_sz;
         S_G.countof[TARGET_GENERATION(si)][countof_rtd_counts] += 1;
       }
       else if ((iptr)tf == type_phantom)
       {
         uptr p_sz = size_phantom;
-        si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+        GC_MARK_BIT(si, p);
         si->marked_count += p_sz;
         S_G.countof[TARGET_GENERATION(si)][countof_phantom] += 1;
         GC_MUTEX_ACQUIRE();
@@ -3685,7 +3685,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
         if (p_at_spc < space_weakpair)
         {
           uptr p_sz = size_pair;
-          si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+          GC_MARK_BIT(si, p);
           si->marked_count += p_sz;
           push_sweep(p);
           S_G.countof[TARGET_GENERATION(si)][countof_pair] += 1;
@@ -3694,14 +3694,14 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
         {
           uptr p_sz = size_ephemeron;
           add_ephemeron_to_pending(tgc, p);
-          si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+          GC_MARK_BIT(si, p);
           si->marked_count += p_sz;
           S_G.countof[TARGET_GENERATION(si)][countof_ephemeron] += 1;
         }
         else if (p_at_spc == space_weakpair)
         {
           uptr p_sz = size_pair;
-          si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+          GC_MARK_BIT(si, p);
           si->marked_count += p_sz;
           push_sweep(p);
           S_G.countof[TARGET_GENERATION(si)][countof_weakpair] += 1;
@@ -3716,7 +3716,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
     {
       ptr code = CLOSCODE(p);
       relocate_pure(&code);
-      if ((CODETYPE(code)) & (code_flag_continuation << code_flags_offset))
+      if ((GC_CODE_TYPE(code)) & (code_flag_continuation << code_flags_offset))
       {
         uptr p_sz = size_continuation;
         if ((CONTLENGTH(p)) == opportunistic_1_shot_flag)
@@ -3729,7 +3729,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
         else
         {
         }
-        si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+        GC_MARK_BIT(si, p);
         si->marked_count += p_sz;
         if (!is_counting_root(si, p))
         {
@@ -3746,7 +3746,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
             ISPC p_at_spc = si->space;
             if (p_at_spc == space_pure)
             {
-              si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+              GC_MARK_BIT(si, p);
               {
                 uptr addr = (uptr)UNTYPE(p, type_closure);
                 uptr seg = addr_get_segment(addr);
@@ -3793,7 +3793,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
                     uptr offset = 0;
                     while (offset < p_sz) {
                       ptr mark_p = (ptr)((uptr)p + offset);
-                      si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+                      GC_MARK_BIT(si, mark_p);
                       offset += byte_alignment;
                     }
                   }
@@ -3807,7 +3807,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
                     if (!mark_si->marked_mask) {
                       init_mask(tgc, mark_si->marked_mask, mark_si->generation, 0);
                     }
-                    mark_si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);
+                    GC_MARK_BIT(mark_si, mark_p);
                     mark_si->marked_count += byte_alignment;
                     offset += byte_alignment;
                   }
@@ -3829,7 +3829,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
     else if (t == type_symbol)
     {
       uptr p_sz = size_symbol;
-      si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+      GC_MARK_BIT(si, p);
       si->marked_count += p_sz;
       push_sweep(p);
       S_G.countof[TARGET_GENERATION(si)][countof_symbol] += 1;
@@ -3837,7 +3837,7 @@ static IGEN mark_object(thread_gc *tgc, ptr p, seginfo *si)
     else if (t == type_flonum)
     {
       uptr p_sz = size_flonum;
-      si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+      GC_MARK_BIT(si, p);
       si->marked_count += p_sz;
       S_G.countof[TARGET_GENERATION(si)][countof_flonum] += 1;
     }
@@ -4107,7 +4107,7 @@ static IBOOL object_directly_refers_to_self(ptr p)
     {
       ptr code = CLOSCODE(p);
       if (p == code) return 1;
-      if ((CODETYPE(code)) & (code_flag_continuation << code_flags_offset))
+      if ((GC_CODE_TYPE(code)) & (code_flag_continuation << code_flags_offset))
       {
       }
       else
@@ -4142,7 +4142,7 @@ static void mark_untyped_data_object(thread_gc *tgc, ptr p, uptr p_sz, seginfo *
   if (!si->marked_mask) {
     init_mask(tgc, si->marked_mask, si->generation, 0);
   }
-  si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);
+  GC_MARK_BIT(si, p);
   {
     uptr addr = (uptr)p;
     uptr seg = addr_get_segment(addr);
@@ -4905,7 +4905,7 @@ static void measure(thread_gc *tgc, ptr p)
       if (!FIXMEDIATE(r_p))
         push_measure(tgc, r_p);
     }
-    if ((CODETYPE(code)) & (code_flag_continuation << code_flags_offset))
+    if ((GC_CODE_TYPE(code)) & (code_flag_continuation << code_flags_offset))
     {
       uptr p_sz = size_continuation;
       measure_total += p_sz;

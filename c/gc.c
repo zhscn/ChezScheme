@@ -501,16 +501,54 @@ uptr list_length(ptr ls) {
 }
 #endif
 
+#ifdef ENABLE_PARALLEL
+# define GC_PUBLISH_MASK(dest, mask)                                   \
+    ATOMIC_STORE_POINTER_RELEASE(&(dest), (mask))
+#else
+# define GC_PUBLISH_MASK(dest, mask) do {                              \
+    STORE_FENCE();                                                      \
+    (dest) = (mask);                                                    \
+  } while (0)
+#endif
+
 #define init_mask(tgc, dest, tg, init) do {                             \
     octet *MASK;                                                        \
     find_gc_room_voidp(tgc, space_data, tg, ptr_align(segment_bitmap_bytes), MASK); \
     memset(MASK, init, segment_bitmap_bytes);                           \
-    STORE_FENCE();                                                      \
-    dest = MASK;                                                        \
+    GC_PUBLISH_MASK(dest, MASK);                                        \
     tgc->bitmask_overhead[tg] += ptr_align(segment_bitmap_bytes);       \
   } while (0)
 
-#define marked(si, p) (si->marked_mask && (si->marked_mask[segment_bitmap_byte(p)] & segment_bitmap_bit(p)))
+#ifdef ENABLE_PARALLEL
+FORCEINLINE int gc_marked(seginfo *si, ptr p) {
+  octet *mask = (octet *)ATOMIC_LOAD_POINTER_ACQUIRE(&si->marked_mask);
+  return mask != NULL
+      && (ATOMIC_LOAD_OCTET_RELAXED(&mask[segment_bitmap_byte(p)])
+          & segment_bitmap_bit(p));
+}
+
+#define marked(si, p) gc_marked(si, p)
+#define GC_MARK_BIT(si, p)                                             \
+  ATOMIC_OR_OCTET_RELAXED(                                             \
+    &(si)->marked_mask[segment_bitmap_byte(p)], segment_bitmap_bit(p))
+
+#define GC_FORWARD_MARKER(p)                                          \
+  ((ptr)ATOMIC_LOAD_POINTER_ACQUIRE(&FWDMARKER(p)))
+#define GC_SET_FORWARD_MARKER(p)                                      \
+  ATOMIC_STORE_POINTER_RELEASE(&FWDMARKER(p), forward_marker)
+
+# undef GC_CODE_TYPE
+# define GC_CODE_TYPE(code) GC_ATOMIC_CODE_TYPE(code)
+#else
+# define marked(si, p)                                                 \
+    ((si)->marked_mask                                                 \
+     && ((si)->marked_mask[segment_bitmap_byte(p)]                    \
+         & segment_bitmap_bit(p)))
+# define GC_MARK_BIT(si, p)                                           \
+    ((si)->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p))
+# define GC_FORWARD_MARKER(p) FWDMARKER(p)
+# define GC_SET_FORWARD_MARKER(p) (FWDMARKER(p) = forward_marker)
+#endif
 
 #ifdef NO_NEWSPACE_MARKS
 # define new_marked(si, p) 0
@@ -545,10 +583,10 @@ static int flonum_is_forwarded_p(ptr p, seginfo *si) {
 
 # define FLONUM_FWDADDRESS(p) *(ptr*)TO_VOIDP(UNTYPE(p, type_flonum))
 
-# define FORWARDEDP(p, si) ((TYPEBITS(p) == type_flonum) ? flonum_is_forwarded_p(p, si) : (FWDMARKER(p) == forward_marker))
+# define FORWARDEDP(p, si) ((TYPEBITS(p) == type_flonum) ? flonum_is_forwarded_p(p, si) : (GC_FORWARD_MARKER(p) == forward_marker))
 # define GET_FWDADDRESS(p) ((TYPEBITS(p) == type_flonum) ? FLONUM_FWDADDRESS(p) : FWDADDRESS(p))
 #else
-# define FORWARDEDP(p, si) (FWDMARKER(p) == forward_marker && TYPEBITS(p) != type_flonum)
+# define FORWARDEDP(p, si) (GC_FORWARD_MARKER(p) == forward_marker && TYPEBITS(p) != type_flonum)
 # define GET_FWDADDRESS(p) FWDADDRESS(p)
 #endif
 
@@ -590,7 +628,7 @@ static int flonum_is_forwarded_p(ptr p, seginfo *si) {
 #define relocate_code(pp, si) do {              \
     if (si->old_space) {                        \
       if (SEGMENT_IS_LOCAL(si, pp)) {           \
-        if (FWDMARKER(pp) == forward_marker)    \
+        if (GC_FORWARD_MARKER(pp) == forward_marker) \
           pp = GET_FWDADDRESS(pp);              \
         else if (!new_marked(si, pp))           \
           mark_or_copy_pure(&pp, pp, si);       \
@@ -877,7 +915,7 @@ static ptr copy_stack(thread_gc *tgc, ptr old, iptr *length, iptr clength) {
           if (!t_si->old_space || new_marked(t_si, tconc)) {    \
             INITGUARDIANNEXT(ls) = final_ls;                    \
             final_ls = ls;                                      \
-          } else if (FWDMARKER(tconc) == forward_marker) {      \
+          } else if (GC_FORWARD_MARKER(tconc) == forward_marker) { \
             INITGUARDIANTCONC(ls) = FWDADDRESS(tconc);          \
             INITGUARDIANNEXT(ls) = final_ls;                    \
             final_ls = ls;                                      \
@@ -1255,7 +1293,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
       ptr thread;
 
     /* someone may have their paws on the list */
-      if (FWDMARKER(ls) == forward_marker) ls = FWDADDRESS(ls);
+      if (GC_FORWARD_MARKER(ls) == forward_marker) ls = FWDADDRESS(ls);
 
       thread = Scar(ls);
 
@@ -1303,7 +1341,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
           bpl->cdr = buckets_to_rebuild;
           buckets_to_rebuild = bpl;
         }
-        if (FWDMARKER(sym) != forward_marker &&
+        if (GC_FORWARD_MARKER(sym) != forward_marker &&
             /* coordinate with alloc.c */
             (SYMVAL(sym) != sunbound || SYMPLIST(sym) != Snil || SYMSPLIST(sym) != Snil)) {
           seginfo *sym_si = SegInfo(ptr_get_segment(sym));
@@ -1399,7 +1437,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
                 if (rep == ftype_guardian_rep) {
                   INT b; iptr *addr;
                   rep = GUARDIANOBJ(ls);
-                  if (FWDMARKER(rep) == forward_marker) rep = FWDADDRESS(rep);
+                  if (GC_FORWARD_MARKER(rep) == forward_marker) rep = FWDADDRESS(rep);
                 /* Caution: Building in assumption about shape of an ftype pointer */
                   addr = TO_VOIDP(RECORDINSTIT(rep, 0));
                   LOCKED_DECR(addr, b);
@@ -1489,7 +1527,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
               t_si = SegInfo(ptr_get_segment(tconc));
               
               if (t_si->old_space && !new_marked(t_si, tconc)) {
-                if (FWDMARKER(tconc) == forward_marker)
+                if (GC_FORWARD_MARKER(tconc) == forward_marker)
                   tconc = FWDADDRESS(tconc);
                 else {
                   INITGUARDIANPENDING(ls) = FIX(GUARDIAN_PENDING_HOLD);
@@ -1569,7 +1607,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
             for ( ; ls != Snil; ls = next) {
                 tconc = GUARDIANTCONC(ls); next = GUARDIANNEXT(ls);
 
-                if (FWDMARKER(tconc) == forward_marker) {
+                if (GC_FORWARD_MARKER(tconc) == forward_marker) {
                     INITGUARDIANTCONC(ls) = FWDADDRESS(tconc);
                     INITGUARDIANNEXT(ls) = final_ls;
                     final_ls = ls;
@@ -1620,7 +1658,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
           bnext = TO_VOIDP((uptr)TO_PTR(b->next) - 1);
           sym = b->sym;
           si = SegInfo(ptr_get_segment(sym));
-          if (new_marked(si, sym) || (FWDMARKER(sym) == forward_marker && ((sym = FWDADDRESS(sym)) || 1))) {
+          if (new_marked(si, sym) || (GC_FORWARD_MARKER(sym) == forward_marker && ((sym = FWDADDRESS(sym)) || 1))) {
             IGEN g = si->generation;
             find_gc_room_voidp(tgc, space_data, g, ptr_align(sizeof(bucket)), b);
 #ifdef ENABLE_OBJECT_COUNTS
@@ -1660,7 +1698,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
 #ifdef ENABLE_OBJECT_COUNTS
             S_G.countof[newg][countof_pair] += 1;
 #endif
-          } else if (FWDMARKER(p) == forward_marker) {
+          } else if (GC_FORWARD_MARKER(p) == forward_marker) {
             p = FWDADDRESS(p);
             newg = GENERATION(p);
             S_G.rtds_with_counts[newg] = S_cons_in(tc, space_impure, newg, p, S_G.rtds_with_counts[newg]);
@@ -2518,7 +2556,7 @@ static uptr sweep_dirty_segments(thread_gc *tgc, seginfo **dirty_segments) {
                     /* now sweep */
                     while ((ptr *)TO_VOIDP(UNTYPE(p, type_typed_object)) < ppend) {
                       /* quit on end of segment */
-                      if (FWDMARKER(p) == forward_marker) break;
+                      if (GC_FORWARD_MARKER(p) == forward_marker) break;
 
                       youngest = sweep_dirty_record(tgc, p, youngest);
                       p = (ptr)((iptr)p +
@@ -2971,7 +3009,7 @@ void copy_and_clear_list_bits(thread_gc *tgc, seginfo *oldspacesegments) {
                 int bits = si->list_bits[i] & (list_bits_mask << bitpos);
                 if (bits != 0) {
                   ptr p = build_ptr(si->number, ((i << (log2_ptr_bytes+3)) + (bitpos << log2_ptr_bytes)));
-                  if (FWDMARKER(p) == forward_marker) {
+                  if (GC_FORWARD_MARKER(p) == forward_marker) {
                     ptr new_p = FWDADDRESS(p);
                     seginfo *new_si = SegInfo(ptr_get_segment(new_p));
                     if (!new_si->list_bits)

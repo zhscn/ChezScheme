@@ -220,7 +220,7 @@
     (cond
       [(and-not-as-dirty
         (or-assume-continuation
-         (& (code-type code) (<< code-flag-continuation code-flags-offset))))
+         (& (GC_CODE_TYPE code) (<< code-flag-continuation code-flags-offset))))
        ;; continuation
        (space (cond
                 [(and-counts (is_counting_root si _)) space-count-pure]
@@ -285,7 +285,7 @@
            space-closure]
           [else
            (cond
-             [(& (code-type code) (<< code-flag-mutable-closure code-flags-offset))
+             [(& (GC_CODE_TYPE code) (<< code-flag-mutable-closure code-flags-offset))
               ;; in parallel mode, assume that code pointer is static and doesn't need to be swept
               space-impure]
              [else
@@ -307,7 +307,7 @@
           (count countof-closure)]))
        (cond
          [(and-purity-sensitive-mode
-           (& (code-type code) (<< code-flag-mutable-closure code-flags-offset)))
+           (& (GC_CODE_TYPE code) (<< code-flag-mutable-closure code-flags-offset)))
           (copy-clos-code code)
           (trace-ptrs closure-data len)]
          [(and-not-as-dirty 1)
@@ -663,7 +663,7 @@
       [(&& (!= cdr_p _)
            (&& (== (TYPEBITS cdr_p) type_pair)
                (&& (== (ptr_get_segment cdr_p) (ptr_get_segment _))
-                   (&& (!= (FWDMARKER cdr_p) forward_marker)
+                   (&& (!= (GC_FORWARD_MARKER cdr_p) forward_marker)
                        ;; Checking `marked_mask`, in
                        ;; case the cdr pair is locked
                        (! (-> si marked_mask))))))
@@ -674,7 +674,7 @@
        (set! (pair-car new_cdr_p) (pair-car cdr_p))
        (set! (pair-cdr new_cdr_p) (pair-cdr cdr_p))
        (S_checkheap_note_reached cdr_p)
-       (set! (FWDMARKER cdr_p) forward_marker)
+       (GC_SET_FORWARD_MARKER cdr_p)
        (set! (FWDADDRESS cdr_p) new_cdr_p)
        (case-flag maybe-backreferences?
         [on (ADD_BACKREFERENCE_FROM new_cdr_p new_p _tg_)]
@@ -1180,7 +1180,7 @@
       (cond
         [(&& (== from_g static_generation)
              (&& (! S_G.retain_static_relocation)
-                 (== 0 (& (code-type _) (<< code_flag_template code_flags_offset)))))
+                 (== 0 (& (GC_CODE_TYPE _) (<< code_flag_template code_flags_offset)))))
          (set! (code-reloc _) (cast ptr 0))]
         [else
          (let* ([t_si : seginfo* (SegInfo (ptr_get_segment t))])
@@ -1445,7 +1445,7 @@
             (body)
             "tgc->sweep_change = SWEEP_CHANGE_PROGRESS;"
             "FWDADDRESS(p) = new_p;"
-            "FWDMARKER(p) = forward_marker;"
+            "GC_SET_FORWARD_MARKER(p);"
             (and (lookup 'maybe-backreferences? config #f)
                  "ADD_BACKREFERENCE(p, tg);")
             "*dest = new_p;"
@@ -2240,7 +2240,7 @@
                "while (offset < p_sz) {"
                "  ptr mark_p = (ptr)((uptr)p + offset);"
                decl
-               (format "  ~a->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);" si)
+               (format "  GC_MARK_BIT(~a, mark_p);" si)
                (and count? (format "  ~a->marked_count += ~a;" si step))
                (format "  offset += ~a;" step)
                final
@@ -2258,7 +2258,7 @@
        (cond
          [one-bit?
           (code
-           "si->marked_mask[segment_bitmap_byte(p)] |= segment_bitmap_bit(p);"
+           "GC_MARK_BIT(si, p);"
            (cond
              [within-segment?
               "si->marked_count += p_sz;"]
@@ -2297,7 +2297,7 @@
                "ptr mark_p = p;"
                (let loop ([sz sz])
                  (code
-                  "si->marked_mask[segment_bitmap_byte(mark_p)] |= segment_bitmap_bit(mark_p);"
+                  "GC_MARK_BIT(si, mark_p);"
                   (let ([sz (- sz (constant byte-alignment))])
                     (if (zero? sz)
                         #f

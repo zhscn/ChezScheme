@@ -406,7 +406,7 @@ static void check_object(ptr p, uptr seg, ISPC s_in, IBOOL aftergc)
   {
     ptr code = CLOSCODE(p);
     check_pointer(&(code), 0, 0, p, seg, s_in, aftergc);
-    if ((CODETYPE(code)) & (code_flag_continuation << code_flags_offset))
+    if ((GC_CODE_TYPE(code)) & (code_flag_continuation << code_flags_offset))
     {
       check_continuation_layout(p);
       check_pointer(&(CONTWINDERS(p)), 1, 0, p, seg, s_in, aftergc);
@@ -952,7 +952,7 @@ static void shadow_object(ptr p)
   {
     ptr code = CLOSCODE(p);
     shadow_pointer(code);
-    if ((CODETYPE(code)) & (code_flag_continuation << code_flags_offset))
+    if ((GC_CODE_TYPE(code)) & (code_flag_continuation << code_flags_offset))
     {
       shadow_pointer(CONTWINDERS(p));
       shadow_pointer(CONTATTACHMENTS(p));
@@ -1497,7 +1497,7 @@ static void checkmark_object(ptr p)
   {
     ptr code = CLOSCODE(p);
     shadow_expected_pointer(code);
-    if ((CODETYPE(code)) & (code_flag_continuation << code_flags_offset))
+    if ((GC_CODE_TYPE(code)) & (code_flag_continuation << code_flags_offset))
     {
       shadow_expected_pointer(CONTWINDERS(p));
       shadow_expected_pointer(CONTATTACHMENTS(p));
@@ -1810,7 +1810,7 @@ static uptr size_object(ptr p)
   else if (t == type_closure)
   {
     ptr code = CLOSCODE(p);
-    if ((CODETYPE(code)) & (code_flag_continuation << code_flags_offset))
+    if ((GC_CODE_TYPE(code)) & (code_flag_continuation << code_flags_offset))
     {
       uptr p_sz = size_continuation;
       return p_sz;
