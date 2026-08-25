@@ -2005,6 +2005,12 @@
   (sealed #t)
   (opaque #t))
 
+(define native-fiber-rtd-registration
+  ((foreign-procedure "(cs)register_native_fiber_rtd"
+     (scheme-object scheme-object) void)
+   (record-type-descriptor native-fiber-record)
+   (#3%$native-fiber-allocate-descriptor)))
+
 (define native-fiber-next-id (box 0))
 
 (define native-fiber-switch-prohibited?

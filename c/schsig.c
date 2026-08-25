@@ -1231,6 +1231,12 @@ void S_schsig_init(void) {
         S_G.native_fiber_context_id =
           S_intern((const unsigned char *)"native-fiber-context");
 
+        S_protect(&S_G.native_fiber_context_code);
+        S_G.native_fiber_context_code = Sfalse;
+
+        S_protect(&S_G.native_fiber_rtd);
+        S_G.native_fiber_rtd = Sfalse;
+
         S_protect(&S_G.collect_request_pending_id);
         S_G.collect_request_pending_id = S_intern((const unsigned char *)"$collect-request-pending");
 

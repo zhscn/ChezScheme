@@ -1067,7 +1067,503 @@ static IBOOL continuation_objectp(ptr p) {
 
 static IBOOL native_fiber_contextp(ptr p) {
   return continuation_objectp(p)
-      && CODENAME(CLOSCODE(p)) == S_G.native_fiber_context_id;
+      && S_G.native_fiber_context_code != Sfalse
+      && CLOSCODE(p) == S_G.native_fiber_context_code;
+}
+
+#define NATIVE_FIBER_CENSUS_EMPTY ((size_t)-1)
+
+enum {
+  native_fiber_control_index = 0,
+  native_fiber_context_index = 1,
+  native_fiber_handler_stack_index = 2,
+  native_fiber_entry_index = 3,
+  native_fiber_on_return_index = 4,
+  native_fiber_starter_index = 5,
+  native_fiber_incoming_source_index = 6,
+  native_fiber_incoming_payload_index = 7,
+  native_fiber_switch_control_index = 8,
+  native_fiber_commit_control_index = 9,
+  native_fiber_cache_context_index = 10,
+  native_fiber_flags_index = 11,
+  native_fiber_id_index = 12,
+  native_fiber_pinned_next_index = 13
+};
+
+typedef struct {
+  ptr object;
+  IBOOL fiber_seen;
+  IBOOL context_seen;
+  size_t current_count;
+  size_t claimed_count;
+  size_t pinned_count;
+  size_t context_owner_count;
+  ptr current_tc;
+  ptr claimed_tc;
+  ptr pinned_tc;
+} native_fiber_census_entry;
+
+typedef struct {
+  native_fiber_census_entry *entries;
+  size_t entry_count;
+  size_t entry_capacity;
+  size_t *slots;
+  size_t slot_capacity;
+  IBOOL active;
+} native_fiber_census_state;
+
+static native_fiber_census_state native_fiber_census;
+
+static size_t native_fiber_census_hash(ptr p, size_t capacity) {
+  uptr n = (uptr)TO_PTR(p);
+  n ^= n >> 17;
+  n *= (uptr)0xed5ad4bbU;
+  n ^= n >> 11;
+  return (size_t)n & (capacity - 1);
+}
+
+static void native_fiber_census_reset(void) {
+  free(native_fiber_census.entries);
+  free(native_fiber_census.slots);
+  memset(&native_fiber_census, 0, sizeof(native_fiber_census));
+}
+
+static void native_fiber_census_rehash(size_t capacity) {
+  size_t *slots;
+  size_t i;
+
+  slots = (size_t *)malloc(capacity * sizeof(size_t));
+  if (slots == NULL)
+    S_error_abort("check_heap: cannot allocate native-fiber census index");
+  for (i = 0; i < capacity; i += 1)
+    slots[i] = NATIVE_FIBER_CENSUS_EMPTY;
+  for (i = 0; i < native_fiber_census.entry_count; i += 1) {
+    size_t at = native_fiber_census_hash(
+      native_fiber_census.entries[i].object, capacity);
+    while (slots[at] != NATIVE_FIBER_CENSUS_EMPTY)
+      at = (at + 1) & (capacity - 1);
+    slots[at] = i;
+  }
+  free(native_fiber_census.slots);
+  native_fiber_census.slots = slots;
+  native_fiber_census.slot_capacity = capacity;
+}
+
+static native_fiber_census_entry *native_fiber_census_find(ptr p,
+                                                            IBOOL create) {
+  size_t at;
+
+  if (native_fiber_census.slot_capacity == 0) {
+    if (!create) return NULL;
+    native_fiber_census_rehash(128);
+  } else if (create
+             && (native_fiber_census.entry_count + 1) * 2
+                  >= native_fiber_census.slot_capacity) {
+    native_fiber_census_rehash(native_fiber_census.slot_capacity * 2);
+  }
+
+  at = native_fiber_census_hash(p, native_fiber_census.slot_capacity);
+  while (native_fiber_census.slots[at] != NATIVE_FIBER_CENSUS_EMPTY) {
+    size_t index = native_fiber_census.slots[at];
+    if (native_fiber_census.entries[index].object == p)
+      return &native_fiber_census.entries[index];
+    at = (at + 1) & (native_fiber_census.slot_capacity - 1);
+  }
+  if (!create) return NULL;
+
+  if (native_fiber_census.entry_count
+      == native_fiber_census.entry_capacity) {
+    size_t capacity = native_fiber_census.entry_capacity == 0
+                        ? 64 : native_fiber_census.entry_capacity * 2;
+    native_fiber_census_entry *entries =
+      (native_fiber_census_entry *)realloc(
+        native_fiber_census.entries,
+        capacity * sizeof(native_fiber_census_entry));
+    if (entries == NULL)
+      S_error_abort("check_heap: cannot enlarge native-fiber census");
+    native_fiber_census.entries = entries;
+    native_fiber_census.entry_capacity = capacity;
+  }
+
+  {
+    size_t index = native_fiber_census.entry_count++;
+    native_fiber_census_entry *entry = &native_fiber_census.entries[index];
+    memset(entry, 0, sizeof(*entry));
+    entry->object = p;
+    native_fiber_census.slots[at] = index;
+    return entry;
+  }
+}
+
+static void native_fiber_census_fail(ptr object, const char *reason) {
+  native_fiber_census_entry *entry =
+    native_fiber_census_find(object, 0);
+  fprintf(stderr, "native-fiber census failure for %p: %s",
+          TO_VOIDP(object), reason);
+  if (entry != NULL && entry->fiber_seen) {
+    ptr control = RECORDINSTIT(object, native_fiber_control_index);
+    ptr flags = RECORDINSTIT(object, native_fiber_flags_index);
+    fprintf(stderr,
+            " (control=%p flags=%p context=%p current=%td claimed=%td pinned=%td)",
+            TO_VOIDP(control), TO_VOIDP(flags),
+            TO_VOIDP(RECORDINSTIT(object, native_fiber_context_index)),
+            (ptrdiff_t)entry->current_count,
+            (ptrdiff_t)entry->claimed_count,
+            (ptrdiff_t)entry->pinned_count);
+  }
+  fputc('\n', stderr);
+  S_error_abort("check_heap: native-fiber census invariant");
+}
+
+static void native_fiber_census_note(ptr p) {
+  native_fiber_census_entry *entry;
+
+  if (!native_fiber_census.active || S_G.native_fiber_rtd == Sfalse
+      || RECORDINSTTYPE(p) != S_G.native_fiber_rtd)
+    return;
+  entry = native_fiber_census_find(p, 1);
+  entry->fiber_seen = 1;
+}
+
+static void native_fiber_census_note_context(ptr p) {
+  native_fiber_census_entry *entry;
+
+  if (!native_fiber_census.active || !native_fiber_contextp(p)) return;
+  entry = native_fiber_census_find(p, 1);
+  entry->context_seen = 1;
+}
+
+void S_register_native_fiber_rtd(ptr rtd, ptr context) {
+  if (!Srecordp(rtd) || !continuation_objectp(context))
+    S_error_abort("native-fiber RTD registration is invalid");
+  if (S_G.native_fiber_rtd != Sfalse && S_G.native_fiber_rtd != rtd)
+    S_error_abort("native-fiber RTD registration changed");
+  if (S_G.native_fiber_context_code != Sfalse
+      && S_G.native_fiber_context_code != CLOSCODE(context))
+    S_error_abort("native-fiber context registration changed");
+  S_G.native_fiber_rtd = rtd;
+  S_G.native_fiber_context_code = CLOSCODE(context);
+}
+
+static native_fiber_census_entry *native_fiber_census_require(ptr p,
+                                                               const char *root) {
+  native_fiber_census_entry *entry;
+
+  if (p == Sfalse || p == Snil || FIXMEDIATE(p))
+    native_fiber_census_fail(p, root);
+  entry = native_fiber_census_find(p, 0);
+  if (entry == NULL || !entry->fiber_seen)
+    native_fiber_census_fail(p, root);
+  return entry;
+}
+
+static iptr native_fiber_census_worker_owner(ptr tc) {
+  ptr threadno = THREADNO(tc);
+  if (!Sfixnump(threadno) || UNFIX(threadno) < 0)
+    native_fiber_census_fail(CURRENTNATIVEFIBER(tc),
+                             "worker has an invalid native-thread number");
+  return UNFIX(threadno) + 1;
+}
+
+static size_t native_fiber_census_owner_count(iptr owner) {
+  ptr ls;
+  size_t count = 0;
+
+  for (ls = S_threads; ls != Snil; ls = Scdr(ls)) {
+    ptr tc = (ptr)THREADTC(Scar(ls));
+    if (native_fiber_census_worker_owner(tc) == owner) count += 1;
+  }
+  return count;
+}
+
+static void native_fiber_census_validate_record(
+  native_fiber_census_entry *entry) {
+  ptr fiber = entry->object;
+  ptr control = (ptr)ATOMIC_LOAD_IPTR_ACQUIRE(
+    (iptr *)&RECORDINSTIT(fiber, native_fiber_control_index));
+  ptr flags = RECORDINSTIT(fiber, native_fiber_flags_index);
+  ptr context = RECORDINSTIT(fiber, native_fiber_context_index);
+  ptr handler_stack = RECORDINSTIT(fiber, native_fiber_handler_stack_index);
+  ptr initial_entry = RECORDINSTIT(fiber, native_fiber_entry_index);
+  ptr on_return = RECORDINSTIT(fiber, native_fiber_on_return_index);
+  ptr starter = RECORDINSTIT(fiber, native_fiber_starter_index);
+  ptr pinned_next = RECORDINSTIT(fiber, native_fiber_pinned_next_index);
+  iptr bits, state, owner, flag_bits;
+  IBOOL schedulerp, pinnedp, migratablep;
+  IBOOL owns_context = 0;
+
+  if (!Sfixnump(control) || UNFIX(control) < 0 || !Sfixnump(flags)
+      || UNFIX(flags) < 0
+      || (UNFIX(flags) & ~native_fiber_flags_mask) != 0
+      || !Sfixnump(RECORDINSTIT(fiber, native_fiber_id_index)))
+    native_fiber_census_fail(fiber, "record metadata is malformed");
+
+  bits = UNFIX(control);
+  state = bits & native_fiber_state_mask;
+  owner = bits >> native_fiber_state_bits;
+  flag_bits = UNFIX(flags);
+  schedulerp = (flag_bits & native_fiber_flag_scheduler) != 0;
+  pinnedp = (flag_bits & native_fiber_flag_pinned) != 0;
+  migratablep = (flag_bits & native_fiber_flag_migratable) != 0;
+
+  if ((schedulerp && (!pinnedp || migratablep))
+      || (!schedulerp && (pinnedp == migratablep)))
+    native_fiber_census_fail(fiber, "flags do not select one ownership model");
+  if (schedulerp && state == native_fiber_state_new)
+    native_fiber_census_fail(fiber, "scheduler fiber has an unadopted lifecycle state");
+  if (state == native_fiber_state_parking
+      || state == native_fiber_state_finishing
+      || state > native_fiber_state_finished)
+    native_fiber_census_fail(fiber, "transient or reserved state reached a GC root snapshot");
+
+  if ((state == native_fiber_state_new && owner != 0)
+      || (state == native_fiber_state_claimed && owner == 0)
+      || (state == native_fiber_state_running && owner == 0)
+      || (state == native_fiber_state_parked
+          && ((pinnedp && owner == 0) || (migratablep && owner != 0)))
+      || (state == native_fiber_state_finished && owner != 0))
+    native_fiber_census_fail(fiber, "lifecycle state disagrees with owner");
+  if (owner != 0 && native_fiber_census_owner_count(owner) != 1)
+    native_fiber_census_fail(fiber, "owner does not identify one live worker");
+
+  if (RECORDINSTIT(fiber, native_fiber_incoming_source_index) != Sfalse
+      || RECORDINSTIT(fiber, native_fiber_incoming_payload_index) != Sfalse
+      || RECORDINSTIT(fiber, native_fiber_switch_control_index) != Sfalse
+      || RECORDINSTIT(fiber, native_fiber_commit_control_index) != Sfalse
+      || RECORDINSTIT(fiber, native_fiber_cache_context_index) != Sfalse)
+    native_fiber_census_fail(fiber, "stable record retains transition scratch");
+
+  switch (state) {
+    case native_fiber_state_new:
+      owns_context = 1;
+      if (handler_stack != Sfalse || !Sprocedurep(initial_entry)
+          || !Sprocedurep(on_return) || !Sprocedurep(starter))
+        native_fiber_census_fail(fiber, "new fiber has invalid entry roots");
+      break;
+    case native_fiber_state_claimed:
+      owns_context = 1;
+      if (!((Sprocedurep(initial_entry) && Sprocedurep(on_return)
+             && Sprocedurep(starter) && handler_stack == Sfalse)
+            || (initial_entry == Sfalse && on_return == Sfalse
+                && starter == Sfalse)))
+        native_fiber_census_fail(fiber, "claimed fiber has mixed entry roots");
+      break;
+    case native_fiber_state_running:
+      if (context != Sfalse || handler_stack != Sfalse || starter != Sfalse
+          || !((Sprocedurep(initial_entry) && Sprocedurep(on_return))
+               || (initial_entry == Sfalse && on_return == Sfalse)))
+        native_fiber_census_fail(fiber, "running fiber retains parked roots");
+      break;
+    case native_fiber_state_parked:
+      owns_context = 1;
+      if (initial_entry != Sfalse || on_return != Sfalse || starter != Sfalse)
+        native_fiber_census_fail(fiber, "parked fiber retains entry roots");
+      break;
+    case native_fiber_state_finished:
+      if (context != Sfalse || handler_stack != Sfalse
+          || initial_entry != Sfalse || on_return != Sfalse
+          || starter != Sfalse)
+        native_fiber_census_fail(fiber, "finished fiber retains execution roots");
+      break;
+    default:
+      native_fiber_census_fail(fiber, "unknown lifecycle state");
+  }
+
+  if (owns_context) {
+    native_fiber_census_entry *context_entry;
+    if (context == Sfalse || !native_fiber_contextp(context))
+      native_fiber_census_fail(fiber, "fiber does not own a private stack descriptor");
+    context_entry = native_fiber_census_find(context, 0);
+    if (context_entry == NULL || !context_entry->context_seen)
+      native_fiber_census_fail(fiber, "stack descriptor is absent from strong traversal");
+    context_entry->context_owner_count += 1;
+  }
+
+  if (schedulerp || state == native_fiber_state_new
+      || state == native_fiber_state_finished || migratablep) {
+    if (pinned_next != Sfalse)
+      native_fiber_census_fail(fiber, "fiber has an unexpected pinned-list link");
+  }
+}
+
+static void native_fiber_census_validate_workers(void) {
+  ptr ls;
+
+  for (ls = S_threads; ls != Snil; ls = Scdr(ls)) {
+    ptr tc = (ptr)THREADTC(Scar(ls));
+    iptr worker_owner = native_fiber_census_worker_owner(tc);
+    ptr current = CURRENTNATIVEFIBER(tc);
+    ptr claimed = NATIVEFIBERCLAIMED(tc);
+    ptr claimed_control = NATIVEFIBERCLAIMEDCONTROL(tc);
+    ptr node;
+
+    if (!Sfixnump(FIBERSWITCHPROHIBITEDDEPTH(tc))
+        || UNFIX(FIBERSWITCHPROHIBITEDDEPTH(tc)) < 0)
+      native_fiber_census_fail(current,
+        "worker has an invalid switch-prohibition depth");
+    if (NATIVEFIBERTRANSITION(tc) != Sfalse)
+      native_fiber_census_fail(current, "worker stopped inside a fiber transition");
+    if (NATIVEFIBERPREEMPTACTIVE(tc) != Sfalse
+        && NATIVEFIBERPREEMPTACTIVE(tc) != Strue)
+      native_fiber_census_fail(current,
+        "worker has an invalid preemption-window state");
+    if (NATIVEFIBERTESTACTIVE(tc) != Sfalse)
+      native_fiber_census_fail(current, "worker stopped inside a transition test hook");
+
+    if (current != Sfalse) {
+      native_fiber_census_entry *entry =
+        native_fiber_census_require(current,
+          "current root is not a strongly reachable native fiber");
+      ptr control = RECORDINSTIT(current, native_fiber_control_index);
+      if (!Sfixnump(control)
+          || (UNFIX(control) & native_fiber_state_mask)
+               != native_fiber_state_running
+          || (UNFIX(control) >> native_fiber_state_bits) != worker_owner)
+        native_fiber_census_fail(current, "current root disagrees with worker ownership");
+      entry->current_count += 1;
+      entry->current_tc = tc;
+    }
+
+    if (claimed == Sfalse) {
+      if (claimed_control != Sfalse)
+        native_fiber_census_fail(current, "worker retains a claim rollback without a target");
+    } else {
+      native_fiber_census_entry *entry =
+        native_fiber_census_require(claimed,
+          "claim root is not a strongly reachable native fiber");
+      ptr control = RECORDINSTIT(claimed, native_fiber_control_index);
+      ptr flags = RECORDINSTIT(claimed, native_fiber_flags_index);
+      iptr old_state, old_owner;
+      if (claimed == current || !Sfixnump(control)
+          || !Sfixnump(claimed_control)
+          || (UNFIX(control) & native_fiber_state_mask)
+               != native_fiber_state_claimed
+          || (UNFIX(control) >> native_fiber_state_bits) != worker_owner)
+        native_fiber_census_fail(claimed, "claim root disagrees with worker ownership");
+      old_state = UNFIX(claimed_control) & native_fiber_state_mask;
+      old_owner = UNFIX(claimed_control) >> native_fiber_state_bits;
+      if (old_state != native_fiber_state_new
+          && old_state != native_fiber_state_parked)
+        native_fiber_census_fail(claimed, "claim rollback state is not claimable");
+      if ((old_state == native_fiber_state_new && old_owner != 0)
+          || (old_state == native_fiber_state_parked
+              && (((UNFIX(flags) & native_fiber_flag_pinned) != 0
+                     && old_owner != worker_owner)
+                  || ((UNFIX(flags) & native_fiber_flag_migratable) != 0
+                      && old_owner != 0))))
+        native_fiber_census_fail(claimed,
+          "claim rollback control disagrees with prior ownership");
+      if ((old_state == native_fiber_state_new)
+          != Sprocedurep(RECORDINSTIT(claimed, native_fiber_entry_index)))
+        native_fiber_census_fail(claimed,
+          "claim rollback state disagrees with execution roots");
+      entry->claimed_count += 1;
+      entry->claimed_tc = tc;
+    }
+
+    node = NATIVEFIBERPINNEDHEAD(tc);
+    while (node != Sfalse && node != Snil) {
+      native_fiber_census_entry *entry =
+        native_fiber_census_require(node,
+          "pinned-list node is not a strongly reachable native fiber");
+      ptr control = RECORDINSTIT(node, native_fiber_control_index);
+      ptr flags = RECORDINSTIT(node, native_fiber_flags_index);
+      iptr state;
+      if (entry->pinned_count != 0)
+        native_fiber_census_fail(node, "pinned-list node is duplicated or cyclic");
+      if (!Sfixnump(control) || !Sfixnump(flags))
+        native_fiber_census_fail(node, "pinned-list node has malformed metadata");
+      state = UNFIX(control) & native_fiber_state_mask;
+      if ((UNFIX(flags) & native_fiber_flag_pinned) == 0
+          || (UNFIX(flags) & native_fiber_flag_scheduler) != 0
+          || (UNFIX(control) >> native_fiber_state_bits) != worker_owner
+          || (state != native_fiber_state_claimed
+              && state != native_fiber_state_running
+              && state != native_fiber_state_parked))
+        native_fiber_census_fail(node, "pinned-list membership disagrees with lifecycle");
+      entry->pinned_count = 1;
+      entry->pinned_tc = tc;
+      node = RECORDINSTIT(node, native_fiber_pinned_next_index);
+    }
+
+    if (NATIVEFIBERPREEMPTTARGET(tc) == Sfalse) {
+      if (NATIVEFIBERPREEMPTPAYLOAD(tc) != Sfalse)
+        native_fiber_census_fail(current, "preemption payload has no target");
+    } else {
+      ptr target = NATIVEFIBERPREEMPTTARGET(tc);
+      ptr target_control;
+      ptr target_flags;
+      ptr current_flags;
+      (void)native_fiber_census_require(target,
+        "preemption target is not a strongly reachable native fiber");
+      target_control = RECORDINSTIT(target, native_fiber_control_index);
+      target_flags = RECORDINSTIT(target, native_fiber_flags_index);
+      current_flags = current == Sfalse
+                        ? Sfalse
+                        : RECORDINSTIT(current, native_fiber_flags_index);
+      if (current == Sfalse || !Sfixnump(target_control)
+          || target == current || !Sfixnump(target_flags)
+          || !Sfixnump(current_flags)
+          || (UNFIX(target_flags) & (native_fiber_flag_scheduler
+                                     | native_fiber_flag_pinned))
+               != (native_fiber_flag_scheduler | native_fiber_flag_pinned)
+          || (UNFIX(current_flags) & native_fiber_flag_scheduler) != 0
+          || (UNFIX(target_control) & native_fiber_state_mask)
+               != native_fiber_state_parked
+          || (UNFIX(target_control) >> native_fiber_state_bits) != worker_owner)
+        native_fiber_census_fail(target, "preemption target disagrees with worker state");
+    }
+  }
+}
+
+static void native_fiber_census_verify(void) {
+  size_t i;
+
+  if (!native_fiber_census.active) return;
+  if (S_G.native_fiber_rtd == Sfalse) {
+    if (S_G.native_fiber_context_code != Sfalse)
+      S_error_abort("check_heap: native-fiber registration is incomplete");
+    return;
+  }
+  if (S_G.native_fiber_context_code == Sfalse)
+    S_error_abort("check_heap: native-fiber registration is incomplete");
+
+  for (i = 0; i < native_fiber_census.entry_count; i += 1)
+    if (native_fiber_census.entries[i].fiber_seen)
+      native_fiber_census_validate_record(&native_fiber_census.entries[i]);
+  native_fiber_census_validate_workers();
+
+  for (i = 0; i < native_fiber_census.entry_count; i += 1) {
+    native_fiber_census_entry *entry = &native_fiber_census.entries[i];
+    if (entry->fiber_seen) {
+      ptr control = RECORDINSTIT(entry->object, native_fiber_control_index);
+      ptr flags = RECORDINSTIT(entry->object, native_fiber_flags_index);
+      iptr state = UNFIX(control) & native_fiber_state_mask;
+      IBOOL schedulerp = (UNFIX(flags) & native_fiber_flag_scheduler) != 0;
+      IBOOL pinnedp = (UNFIX(flags) & native_fiber_flag_pinned) != 0;
+
+      if ((state == native_fiber_state_running
+             ? entry->current_count != 1 : entry->current_count != 0)
+          || (state == native_fiber_state_claimed
+                ? entry->claimed_count != 1 : entry->claimed_count != 0))
+        native_fiber_census_fail(entry->object,
+          "lifecycle state does not have exactly one corresponding worker root");
+      if (!schedulerp && pinnedp
+          && (state == native_fiber_state_claimed
+              || state == native_fiber_state_running
+              || state == native_fiber_state_parked)) {
+        if (entry->pinned_count != 1)
+          native_fiber_census_fail(entry->object,
+            "owned pinned fiber is absent from its worker registry");
+      } else if (entry->pinned_count != 0) {
+        native_fiber_census_fail(entry->object,
+          "fiber appears unexpectedly in a pinned registry");
+      }
+    }
+    if (entry->context_seen && entry->context_owner_count != 1)
+      native_fiber_census_fail(entry->object,
+        "private stack descriptor does not have exactly one fiber owner");
+  }
 }
 
 static void malformed_stack(const char *kind, ptr owner, const char *reason) {
@@ -1957,6 +2453,7 @@ static void shadow_reset(void) {
   free(shadow.guardian_slots);
   free(shadow.ftype_counters);
   memset(&shadow, 0, sizeof(shadow));
+  native_fiber_census_reset();
 }
 
 #include "heapcheck.inc"
@@ -1993,6 +2490,7 @@ void S_checkheap_begin_mark_check(IGEN mcg, IGEN min_tg, IGEN max_tg,
   if (mcg < S_G.max_nonstatic_generation) return;
 
   shadow.phase = SHADOW_PHASE_PREPARING;
+  native_fiber_census.active = 1;
   shadow.maximum_collected_generation = mcg;
   shadow.minimum_target_generation = min_tg;
   shadow.maximum_target_generation = max_tg;
@@ -2041,6 +2539,8 @@ void S_checkheap_finish_mark_check(void) {
 
   if (shadow.phase != SHADOW_PHASE_PREPARING) return;
   shadow_drain_expected();
+  native_fiber_census_verify();
+  native_fiber_census.active = 0;
 
   for (i = 0; i < shadow.segment_capacity; i += 1) {
     shadow_segment *ss = &shadow.segments[i];

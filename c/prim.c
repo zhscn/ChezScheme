@@ -201,6 +201,8 @@ void S_prim_init(void) {
     Sforeign_symbol("(cs)check_heap_enabledp", (void *)s_check_heap_enabledp);
     Sforeign_symbol("(cs)enable_check_heap", (void *)s_enable_check_heap);
     Sforeign_symbol("(cs)check_heap_errors", (void *)s_check_heap_errors);
+    Sforeign_symbol("(cs)register_native_fiber_rtd",
+                    (void *)S_register_native_fiber_rtd);
     Sforeign_symbol("(cs)gc_test_phase_reset",
                     (void *)S_gc_test_phase_reset);
     Sforeign_symbol("(cs)gc_test_phase_arm",

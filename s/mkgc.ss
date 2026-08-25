@@ -234,6 +234,7 @@
         [else
          (case-mode
           [check (check_continuation_layout _)]
+          [checkmark (native_fiber_census_note_context _)]
           [else])
          (copy-clos-code code)
          (copy-stack-length continuation-stack-length continuation-stack-clength)
@@ -350,6 +351,9 @@
       ;; space-impure-record, but by picking the target space more
       ;; carefully, we may reduce fragmentation and sweeping cost.
       (define rtd : ptr (record-type _))
+      (case-mode
+       [checkmark (native_fiber_census_note _)]
+       [else])
       (space
        (cond
          [(and-counts (is_counting_root si _))

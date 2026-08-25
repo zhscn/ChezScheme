@@ -1101,6 +1101,7 @@ static void checkmark_object(ptr p)
       shadow_expected_pointer(RECORDINSTTYPE(p));
       {
         ptr rtd = RECORDINSTTYPE(p);
+        native_fiber_census_note(p);
         {
           uptr len = UNFIX((RECORDDESCSIZE(rtd)));
           {
@@ -1499,6 +1500,7 @@ static void checkmark_object(ptr p)
     shadow_expected_pointer(code);
     if ((GC_CODE_TYPE(code)) & (code_flag_continuation << code_flags_offset))
     {
+      native_fiber_census_note_context(p);
       shadow_expected_pointer(CONTWINDERS(p));
       shadow_expected_pointer(CONTATTACHMENTS(p));
       if ((CONTLENGTH(p)) == scaled_shot_1_shot_flag)

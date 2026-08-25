@@ -2017,6 +2017,69 @@
 (mat native-fiber-gc-phase-fault-injection
   (andmap native-fiber-gc-phase-death-test '(0 1 2 3 4)))
 
+(define (native-fiber-census-death-test corruption)
+  (define (slurp port)
+    (let loop ([chars '()])
+      (let ([char (read-char port)])
+        (if (eof-object? char)
+            (list->string (reverse chars))
+            (loop (cons char chars))))))
+  (let-values ([(to-stdin from-stdout from-stderr pid)
+                (open-process-ports
+                  (format "~a -q" (patch-exec-path *scheme*))
+                  (buffer-mode block)
+                  (native-transcoder))])
+    (for-each
+      (lambda (form) (pretty-print form to-stdin))
+      `((define enable-check
+          (foreign-procedure "(cs)enable_check_heap" (boolean) void))
+        (define fiber-a #f)
+        (define fiber-b #f)
+        (case ',corruption
+          [(missing-current)
+           (set! fiber-a (#3%$native-fiber-adopt 0))
+           (#3%$current-native-fiber #f)]
+          [(missing-claim)
+           (set! fiber-a
+             (#3%$native-fiber-create values values #b100))
+           (#3%$native-fiber-try-claim! fiber-a)
+           (#3%$native-fiber-claimed #f)
+           (#3%$native-fiber-claimed-control #f)]
+          [(bad-claim-rollback)
+           (set! fiber-a
+             (#3%$native-fiber-create values values #b100))
+           (#3%$native-fiber-try-claim! fiber-a)
+           (#3%$native-fiber-claimed-control (fxsll 1 3))]
+          [(missing-pinned)
+           (set! fiber-a
+             (#3%$native-fiber-create values values #b001))
+           (#3%$native-fiber-try-claim! fiber-a)
+           (#3%$tc-field 'native-fiber-pinned-head (#3%$tc) #f)]
+          [(aliased-context)
+           (set! fiber-a
+             (#3%$native-fiber-create values values #b100))
+           (set! fiber-b
+             (#3%$native-fiber-create values values #b100))
+           (#3%$record-set! fiber-b 1 (#3%$record-ref fiber-a 1))])
+        (enable-check #t)
+        (collect (collect-maximum-generation))
+        (display "native-fiber-census-death-test-survived")))
+    (close-port to-stdin)
+    (let ([stdout (slurp from-stdout)]
+          [stderr (slurp from-stderr)])
+      (close-port from-stdout)
+      (close-port from-stderr)
+      (and (not (native-fiber-string-contains? stdout
+                  "native-fiber-census-death-test-survived"))
+           (native-fiber-string-contains? stderr
+             "native-fiber census")
+           #t))))
+
+(mat native-fiber-global-census-invariants
+  (andmap native-fiber-census-death-test
+    '(missing-current missing-claim bad-claim-rollback
+      missing-pinned aliased-context)))
+
 (mat native-fiber-concurrent-gc-handshake
   (andmap
     (lambda (generation)
@@ -3548,7 +3611,9 @@
            (eq? (#3%$native-fiber-state task) 'finished)))))
 
 (mat native-fiber-foreign-abi-migration
-  (let* ([main-scheduler
+  (begin
+    (load-thread-foreign-library!)
+    (let* ([main-scheduler
           (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
          [current-scheduler main-scheduler]
          [call-i64
@@ -3639,7 +3704,7 @@
          many-ok?
          (andmap (lambda (depth) (fx= depth 1)) callback-depths)
          (fx= (length callback-depths) 6)
-         (eq? (#3%$native-fiber-state task) 'finished))))
+         (eq? (#3%$native-fiber-state task) 'finished)))))
 
 (mat native-fiber-timer-foreign-callback-boundary
   (let* ([scheduler
