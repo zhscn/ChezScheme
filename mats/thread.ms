@@ -1744,7 +1744,13 @@
                (loop (fx+ start 1)))))))
 
 (define (native-fiber-run-hook-point point gc-generation)
-  (let ([task #f] [scheduler #f] [result #f])
+  (let ([task #f]
+        [scheduler #f]
+        [result #f]
+        [claim-lock (make-mutex)]
+        [claim-condition (make-condition)]
+        [claim-attempted? #f]
+        [claim-exit? #f])
     (parameterize
       ([collect-request-handler
         (if gc-generation
@@ -1773,13 +1779,28 @@
                   (native-fiber-test-hook-release)
                   (thread-join worker)
                   #f)
-                (let ([foreign-claim #t])
-                  (thread-join
-                    (fork-thread
-                      (lambda ()
-                        (#3%$native-fiber-adopt #b1000)
-                        (set! foreign-claim
-                          (#3%$native-fiber-try-claim! task)))))
+                (let* ([foreign-claim #t]
+                       [claim-worker
+                        (fork-thread
+                          (lambda ()
+                            (#3%$native-fiber-adopt #b1000)
+                            (set! foreign-claim
+                              (#3%$native-fiber-try-claim! task))
+                            ;; Thread teardown may rendezvous with every
+                            ;; worker. Keep this worker registered until the
+                            ;; deliberately paused transition is released.
+                            (with-mutex claim-lock
+                              (set! claim-attempted? #t)
+                              (condition-broadcast claim-condition)
+                              (let wait ()
+                                (unless claim-exit?
+                                  (condition-wait claim-condition claim-lock)
+                                  (wait))))))])
+                  (with-mutex claim-lock
+                    (let wait ()
+                      (unless claim-attempted?
+                        (condition-wait claim-condition claim-lock)
+                        (wait))))
                   (when gc-generation
                     (native-fiber-gc-test-phase-reset))
                   (let* ([collector
@@ -1801,6 +1822,10 @@
                                      (fx= gc-phase-mask
                                           native-fiber-gc-test-all-phases))))])
                     (native-fiber-test-hook-release)
+                    (with-mutex claim-lock
+                      (set! claim-exit? #t)
+                      (condition-broadcast claim-condition))
+                    (thread-join claim-worker)
                     (thread-join worker)
                     (and (not foreign-claim)
                          gc-overlap?
@@ -1811,7 +1836,10 @@
           (when gc-generation
             ;; Disarm phase recording even if collection or validation exits.
             (native-fiber-gc-test-phase-mask))
-          (native-fiber-test-hook-reset))))))
+          (native-fiber-test-hook-reset)
+          (with-mutex claim-lock
+            (set! claim-exit? #t)
+            (condition-broadcast claim-condition)))))))
 
 (define (native-fiber-run-hook-preemption point)
   (let ([task #f]

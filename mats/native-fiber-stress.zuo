@@ -1,0 +1,158 @@
+#lang zuo
+
+;; Repeatedly run the native-fiber matrix with deterministic per-run seeds.
+;; The selected workarea supplies the Scheme runtime and sanitizer settings
+;; are inherited from the invoking environment.
+
+(define default-seed 1592594996)
+(define seed-modulus 2147483647)
+
+(define (parse-positive who value)
+  (define n (string->integer value))
+  (unless (and n (> n 0))
+    (error (~a who " must be a positive integer: " value)))
+  n)
+
+(define (parse-at-least who value minimum)
+  (define n (string->integer value))
+  (unless (and n (>= n minimum))
+    (error (~a who " must be an integer of at least " minimum ": " value)))
+  n)
+
+(define (parse-seed value)
+  (define n (string->integer value))
+  (unless (and n (>= n 0))
+    (error (~a "seed must be a nonnegative integer: " value)))
+  (modulo n seed-modulus))
+
+(define (next-seed seed)
+  (modulo (+ (* seed 48271) 1) seed-modulus))
+
+(define (environment-set env key value)
+  (cons (cons key value)
+        (filter (lambda (entry) (not (equal? (car entry) key))) env)))
+
+(define (environment-set* env key+value*)
+  (if (null? key+value*)
+      env
+      (environment-set*
+       (environment-set env (caar key+value*) (cdar key+value*))
+       (cdr key+value*))))
+
+(define (replay-command workarea config seed)
+  (define main.zuo (build-path workarea "mats" "main.zuo"))
+  (~a "CHEZ_NATIVE_FIBER_STRESS_SEED=" seed
+      " CHEZ_NATIVE_FIBER_STRESS_ROUNDS="
+      (hash-ref config 'transition-rounds)
+      " CHEZ_NATIVE_FIBER_RACE_ROUNDS="
+      (hash-ref config 'race-rounds)
+      " CHEZ_NATIVE_FIBER_PUBLICATION_ROUNDS="
+      (hash-ref config 'publication-rounds)
+      " CHEZ_NATIVE_FIBER_CLAIM_PUBLICATION_ROUNDS="
+      (hash-ref config 'claim-rounds)
+      " CHEZ_NATIVE_FIBER_RACE_WORKERS="
+      (hash-ref config 'workers)
+      " CHEZ_NATIVE_FIBER_PUBLICATION_WORKERS="
+      (hash-ref config 'workers)
+      " CHEZ_MAT_NAME_PREFIX=native-fiber-"
+      " bin/zuo " (~s main.zuo) " thread.mo noisy=t"
+      (if (hash-ref config 'compiler-poison? #f)
+          (~a " cds=" seed " cdrs=" (next-seed seed))
+          "")))
+
+(define (run-stress config)
+  (define root (path->complete-path (at-source "..")))
+  (define workarea-name (hash-ref config 'workarea))
+  (define workarea (build-path root workarea-name))
+  (define main.zuo (build-path workarea "mats" "main.zuo"))
+  (define thread.mo (build-path workarea "mats" "thread.mo"))
+  (define zuo.exe (hash-ref (runtime-env) 'exe))
+  (unless (file-exists? main.zuo)
+    (error (~a "native-fiber stress workarea is not built: " workarea)))
+  (let loop ([run 0] [seed (hash-ref config 'seed)])
+    (define runs (hash-ref config 'runs))
+    (unless (and runs (= run runs))
+      (define replay (replay-command workarea-name config seed))
+      (alert (~a "native-fiber stress run " (+ run 1)
+                 (if runs (~a "/" runs) "") ", seed " seed))
+      (displayln (~a "replay: " replay))
+      ;; An individual mat target is cached by its .mo result. Removing only
+      ;; this workarea-local result makes every stress iteration execute.
+      (when (file-exists? thread.mo) (rm thread.mo))
+      (define env
+        (environment-set*
+         (hash-ref (runtime-env) 'env)
+         (list
+          (cons "CHEZ_MAT_NAME_PREFIX" "native-fiber-")
+          (cons "CHEZ_NATIVE_FIBER_STRESS_SEED" (~a seed))
+          (cons "CHEZ_NATIVE_FIBER_STRESS_ROUNDS"
+                (~a (hash-ref config 'transition-rounds)))
+          (cons "CHEZ_NATIVE_FIBER_RACE_ROUNDS"
+                (~a (hash-ref config 'race-rounds)))
+          (cons "CHEZ_NATIVE_FIBER_PUBLICATION_ROUNDS"
+                (~a (hash-ref config 'publication-rounds)))
+          (cons "CHEZ_NATIVE_FIBER_CLAIM_PUBLICATION_ROUNDS"
+                (~a (hash-ref config 'claim-rounds)))
+          (cons "CHEZ_NATIVE_FIBER_RACE_WORKERS"
+                (~a (hash-ref config 'workers)))
+          (cons "CHEZ_NATIVE_FIBER_PUBLICATION_WORKERS"
+                (~a (hash-ref config 'workers))))))
+      (define poison-args
+        (if (hash-ref config 'compiler-poison? #f)
+            (list (~a "cds=" seed) (~a "cdrs=" (next-seed seed)))
+            '()))
+      (define child
+        (process zuo.exe main.zuo
+                 (append (list "thread.mo" "noisy=t") poison-args)
+                 (hash 'dir root 'env env)))
+      (define child-process (hash-ref child 'process))
+      (process-wait child-process)
+      (unless (= (process-status child-process) 0)
+        (error (~a "native-fiber stress failed at run " (+ run 1)
+                   " with seed " seed "\nreplay: " replay)))
+      (loop (+ run 1) (next-seed seed)))))
+
+(module+ main
+  (define config
+    (command-line
+     :init (hash 'workarea "ta6le"
+                 'runs 20
+                 'seed default-seed
+                 'transition-rounds 256
+                 'race-rounds 4000
+                 'publication-rounds 10000
+                 'claim-rounds 512
+                 'workers 6
+                 'compiler-poison? #f)
+     :once-each
+     [config "--workarea" path "Use the built workarea at <path>"
+             (hash-set config 'workarea path)]
+     [config "--runs" count "Run the matrix <count> times"
+             (hash-set config 'runs (parse-positive "runs" count))]
+     [config "--forever" "Run until a matrix fails"
+             (hash-set config 'runs #f)]
+     [config "--seed" seed "Start from deterministic <seed>"
+             (hash-set config 'seed (parse-seed seed))]
+     [config "--transition-rounds" count
+             "Run <count> randomized transition scenarios per matrix"
+             (hash-set config 'transition-rounds
+                       (parse-positive "transition rounds" count))]
+     [config "--race-rounds" count
+             "Run <count> switch/collector iterations per worker"
+             (hash-set config 'race-rounds
+                       (parse-positive "race rounds" count))]
+     [config "--publication-rounds" count
+             "Run <count> publication handoffs per matrix"
+             (hash-set config 'publication-rounds
+                       (parse-positive "publication rounds" count))]
+     [config "--claim-rounds" count
+             "Run <count> release/claim publication scenarios per matrix"
+             (hash-set config 'claim-rounds
+                       (parse-positive "claim rounds" count))]
+     [config "--workers" count "Use <count> workers in concurrent tests"
+             (hash-set config 'workers
+                       (parse-at-least "workers" count 2))]
+     [config "--compiler-poison"
+             "Vary dead stack-slot and register poison seeds on every run"
+             (hash-set config 'compiler-poison? #t)]))
+  (run-stress config))
