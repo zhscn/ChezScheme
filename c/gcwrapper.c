@@ -33,6 +33,8 @@ static IBOOL checkheap_noisy;
  * test needs to retain the source address without making the object live. */
 static ptr S_checkheap_test_mark_target;
 static iptr S_checkheap_test_mark_action;
+static ptr S_checkheap_test_remembered_source;
+static iptr S_checkheap_test_remembered_index;
 
 void S_checkheap_test_mark_fault(ptr target, iptr action) {
   if (FIXMEDIATE(target)
@@ -42,6 +44,18 @@ void S_checkheap_test_mark_fault(ptr target, iptr action) {
     S_error_abort("checkheap mark fault is invalid");
   S_checkheap_test_mark_target = target;
   S_checkheap_test_mark_action = action;
+}
+
+/* The source is required to stay in an uncollected generation until the
+ * armed generation-zero collection reaches its pre-GC heap check. */
+void S_checkheap_test_remembered_fault(ptr source, iptr index) {
+  if (!Svectorp(source)
+      || index < 0
+      || index >= (iptr)Svector_length(source)
+      || S_checkheap_test_remembered_source != (ptr)0)
+    S_error_abort("checkheap remembered-set fault is invalid");
+  S_checkheap_test_remembered_source = source;
+  S_checkheap_test_remembered_index = index;
 }
 
 /* GC phase coverage is dormant outside explicitly armed runtime tests. The
@@ -591,7 +605,7 @@ void Scompact_heap(void) {
        dangling references in space_impure (generation > 0) and space_pure
        dirty-card coverage of every old-to-young pointer
        dirty-segment minima and list membership
-       a full-heap remembered-set rebuild after a full collection
+       a full-heap remembered-set rebuild at each collection boundary
 
    Some additional things it should check for but doesn't:
        dangling references in space_code and space_continuation
@@ -796,7 +810,8 @@ static void remembered_begin(IBOOL aftergc, IGEN mcg) {
   ISPC s;
 
   remembered_reset();
-  if (!aftergc || mcg < S_G.max_nonstatic_generation) return;
+  (void)aftergc;
+  (void)mcg;
   rebuilt_remembered.active = 1;
 
   for (g = 0; g <= static_generation; INCRGEN(g))
@@ -869,6 +884,26 @@ static void remembered_verify(void) {
 
   if (!rebuilt_remembered.active) return;
 
+  if (S_checkheap_test_remembered_source != (ptr)0) {
+    ptr source = S_checkheap_test_remembered_source;
+    iptr index = S_checkheap_test_remembered_index;
+    ptr *location = &INITVECTIT(source, index);
+    seginfo *source_si = MaybeSegInfo(ptr_get_segment(source));
+    seginfo *target_si = FIXMEDIATE(*location)
+                           ? NULL : MaybeSegInfo(ptr_get_segment(*location));
+    uptr card = ((uptr)TO_PTR(location) >> card_offset_bits)
+              & ((1 << segment_card_offset_bits) - 1);
+
+    S_checkheap_test_remembered_source = (ptr)0;
+    S_checkheap_test_remembered_index = 0;
+    if (source_si == NULL
+        || target_si == NULL
+        || source_si->generation == 0
+        || target_si->generation >= source_si->generation)
+      S_error_abort("checkheap remembered-set fault target is not old-to-young");
+    source_si->dirty_bytes[card] = 0xff;
+  }
+
   for (from_generation = 1;
        from_generation <= static_generation;
        from_generation = from_generation == S_G.max_nonstatic_generation
@@ -937,11 +972,12 @@ static void remembered_verify(void) {
 
       if (actual > required) {
         S_checkheap_errors += 1;
-        printf("!!! rebuilt remembered set found missing card:"
-               " generation %d space %d segment "PHtx" card %td"
-               " has %u, requires at most %u\n",
-               rs->generation, rs->space, (ptrdiff_t)rs->segment,
-               (ptrdiff_t)card, actual, required);
+        fprintf(stderr,
+                "!!! rebuilt remembered set found missing card:"
+                " generation %d space %d segment "PHtx" card %td"
+                " has %u, requires at most %u\n",
+                rs->generation, rs->space, (ptrdiff_t)rs->segment,
+                (ptrdiff_t)card, actual, required);
       }
 
       if (required < required_min) required_min = required;

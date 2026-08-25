@@ -203,6 +203,8 @@ void S_prim_init(void) {
     Sforeign_symbol("(cs)check_heap_errors", (void *)s_check_heap_errors);
     Sforeign_symbol("(cs)checkheap_test_mark_fault",
                     (void *)S_checkheap_test_mark_fault);
+    Sforeign_symbol("(cs)checkheap_test_remembered_fault",
+                    (void *)S_checkheap_test_remembered_fault);
     Sforeign_symbol("(cs)register_native_fiber_rtd",
                     (void *)S_register_native_fiber_rtd);
     Sforeign_symbol("(cs)gc_test_phase_reset",

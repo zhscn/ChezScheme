@@ -5202,8 +5202,9 @@
           (bytevector-reference-set! rbv 0 (vector-ref roots 5))
           (#%$set-top-level-value! sym (vector-ref roots 6))
 
-          ;; A full collection promotes the targets while retaining the
-          ;; old-to-young edges in each space's remembered representation.
+          ;; The collection's pre-GC heap check rebuilds the remembered set
+          ;; while these sources are old and their targets are still young.
+          ;; The collection then promotes the targets without losing fields.
           (collect (collect-maximum-generation))
           (and (eq? (vector-ref v 0) (vector-ref roots 0))
                (eq? (remembered-record-value r) (vector-ref roots 1))

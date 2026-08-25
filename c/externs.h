@@ -192,6 +192,7 @@ extern void S_checkheap_verify_mark_check(void);
 extern void S_checkheap_note_guardian(ptr entry, int action);
 extern void S_checkheap_verify_finalization_check(seginfo *oldspacesegments);
 extern void S_checkheap_test_mark_fault(ptr target, iptr action);
+extern void S_checkheap_test_remembered_fault(ptr source, iptr index);
 extern void S_register_native_fiber_rtd(ptr rtd, ptr context);
 extern void S_gc_test_phase_reset(void);
 extern void S_gc_test_phase_arm(iptr phase, iptr action);

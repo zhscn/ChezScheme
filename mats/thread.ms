@@ -2097,6 +2097,49 @@
   (checkheap-mark-death-test
     2 "checkmark found unreachable object retained"))
 
+(define (checkheap-remembered-death-test)
+  (define (slurp port)
+    (let loop ([chars '()])
+      (let ([char (read-char port)])
+        (if (eof-object? char)
+            (list->string (reverse chars))
+            (loop (cons char chars))))))
+  (let-values ([(to-stdin from-stdout from-stderr pid)
+                (open-process-ports
+                  (format "~a -q" (native-fiber-test-scheme-command))
+                  (buffer-mode block)
+                  (native-transcoder))])
+    (for-each
+      (lambda (form) (pretty-print form to-stdin))
+      `((define enable-check
+          (foreign-procedure "(cs)enable_check_heap" (boolean) void))
+        (define arm
+          (foreign-procedure "(cs)checkheap_test_remembered_fault"
+            (scheme-object iptr) void))
+        (define source (vector #f))
+        (define target #f)
+        (enable-check #t)
+        (collect 0 1 1)
+        (set! target (list 'young-target))
+        (vector-set! source 0 target)
+        (arm source 0)
+        (collect 0)
+        (keep-live source)
+        (display "checkheap-remembered-death-test-survived")))
+    (close-port to-stdin)
+    (let ([stdout (slurp from-stdout)]
+          [stderr (slurp from-stderr)])
+      (close-port from-stdout)
+      (close-port from-stderr)
+      (and (not (native-fiber-string-contains? stdout
+                  "checkheap-remembered-death-test-survived"))
+           (native-fiber-string-contains? stderr
+             "rebuilt remembered set found missing card")
+           #t))))
+
+(mat checkheap-remembered-set-fault
+  (checkheap-remembered-death-test))
+
 (define (native-fiber-census-death-test corruption)
   (define (slurp port)
     (let loop ([chars '()])
