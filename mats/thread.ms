@@ -1716,6 +1716,13 @@
   (foreign-procedure "(cs)native_fiber_test_hook_saw_exit" () iptr))
 (define native-fiber-test-hook-reset
   (foreign-procedure "(cs)native_fiber_test_hook_reset" () void))
+(define native-fiber-gc-test-phase-reset
+  (foreign-procedure "(cs)gc_test_phase_reset" () void))
+(define native-fiber-gc-test-phase-arm
+  (foreign-procedure "(cs)gc_test_phase_arm" (iptr iptr) void))
+(define native-fiber-gc-test-phase-mask
+  (foreign-procedure "(cs)gc_test_phase_mask" () iptr))
+(define native-fiber-gc-test-all-phases #b11111)
 
 (define (native-fiber-wait-for-hook point)
   (let loop ([attempts 10000])
@@ -1773,18 +1780,26 @@
                         (#3%$native-fiber-adopt #b1000)
                         (set! foreign-claim
                           (#3%$native-fiber-try-claim! task)))))
+                  (when gc-generation
+                    (native-fiber-gc-test-phase-reset))
                   (let* ([collector
                          (and gc-generation
                               (fork-thread
                                 (lambda ()
                                   (parameterize ([#%$enable-check-heap #t])
                                     (collect-rendezvous)))))]
-                         [gc-overlap?
+                         [gc-phase-mask
                           (begin
                             (when collector (thread-join collector))
+                            (and gc-generation
+                                 (native-fiber-gc-test-phase-mask)))]
+                         [gc-overlap?
+                          (begin
                             (or (not gc-generation)
                                 (and (fx= (native-fiber-test-hook-hit) point)
-                                     (fx= (native-fiber-test-hook-saw-gc) 1))))])
+                                     (fx= (native-fiber-test-hook-saw-gc) 1)
+                                     (fx= gc-phase-mask
+                                          native-fiber-gc-test-all-phases))))])
                     (native-fiber-test-hook-release)
                     (thread-join worker)
                     (and (not foreign-claim)
@@ -1792,7 +1807,11 @@
                          (equal? result '(return . done))
                          (eq? (#3%$native-fiber-state task) 'finished)
                          (eq? (#3%$native-fiber-state scheduler) 'finished)))))))
-        native-fiber-test-hook-reset))))
+        (lambda ()
+          (when gc-generation
+            ;; Disarm phase recording even if collection or validation exits.
+            (native-fiber-gc-test-phase-mask))
+          (native-fiber-test-hook-reset))))))
 
 (define (native-fiber-run-hook-preemption point)
   (let ([task #f]
@@ -1935,6 +1954,68 @@
       [(fx= maximum 0) '(0)]
       [(fx= maximum 1) '(0 1)]
       [else (list 0 (fxquotient maximum 2) maximum)])))
+
+(define (native-fiber-collect-phase-mask thunk)
+  (dynamic-wind
+    native-fiber-gc-test-phase-reset
+    (lambda ()
+      (thunk)
+      (native-fiber-gc-test-phase-mask))
+    native-fiber-gc-test-phase-mask))
+
+(mat native-fiber-gc-phase-coverage
+  (fx= (native-fiber-collect-phase-mask
+         (lambda ()
+           (parameterize ([#%$enable-check-heap #t])
+             (collect (collect-maximum-generation)))))
+       native-fiber-gc-test-all-phases)
+  (fx= (native-fiber-collect-phase-mask
+         (lambda ()
+           (parameterize ([#%$enable-check-heap #t]
+                          [enable-object-counts #t])
+             (collect (collect-maximum-generation)))))
+       native-fiber-gc-test-all-phases)
+  (fx= (native-fiber-collect-phase-mask
+         (lambda ()
+           (parameterize ([#%$enable-check-heap #t])
+             (collect 0))))
+       native-fiber-gc-test-all-phases))
+
+(define (native-fiber-gc-phase-death-test phase)
+  (define (slurp port)
+    (let loop ([chars '()])
+      (let ([char (read-char port)])
+        (if (eof-object? char)
+            (list->string (reverse chars))
+            (loop (cons char chars))))))
+  (let-values ([(to-stdin from-stdout from-stderr pid)
+                (open-process-ports
+                  (format "~a -q" (patch-exec-path *scheme*))
+                  (buffer-mode block)
+                  (native-transcoder))])
+    (for-each
+      (lambda (form) (pretty-print form to-stdin))
+      `((define enable-check
+          (foreign-procedure "(cs)enable_check_heap" (boolean) void))
+        (define arm
+          (foreign-procedure "(cs)gc_test_phase_arm" (iptr iptr) void))
+        (enable-check #t)
+        (arm ,phase 1)
+        (collect (collect-maximum-generation))
+        (display "native-fiber-gc-phase-death-test-survived")))
+    (close-port to-stdin)
+    (let ([stdout (slurp from-stdout)]
+          [stderr (slurp from-stderr)])
+      (close-port from-stdout)
+      (close-port from-stderr)
+      (and (not (native-fiber-string-contains? stdout
+                  "native-fiber-gc-phase-death-test-survived"))
+           (native-fiber-string-contains? stderr
+             "gc phase fault injected")
+           #t))))
+
+(mat native-fiber-gc-phase-fault-injection
+  (andmap native-fiber-gc-phase-death-test '(0 1 2 3 4)))
 
 (mat native-fiber-concurrent-gc-handshake
   (andmap

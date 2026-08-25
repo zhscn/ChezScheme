@@ -26,8 +26,86 @@ static void check_locked_object(ptr p, IBOOL locked, IGEN g, IBOOL aftergc, IGEN
 
 static IBOOL checkheap_noisy;
 
+/* GC phase coverage is dormant outside explicitly armed runtime tests. The
+ * phase mask contains no Scheme pointers and is protected independently of
+ * collector locks so a test can observe collections performed by another
+ * native thread. */
+static iptr S_gc_test_phase_bits;
+static iptr S_gc_test_phase_target;
+static iptr S_gc_test_phase_action;
+static IBOOL S_gc_test_phase_active;
+#ifdef PTHREADS
+static s_thread_mutex_t S_gc_test_phase_mutex;
+# define gc_test_phase_lock() \
+    ((void)s_thread_mutex_lock(&S_gc_test_phase_mutex))
+# define gc_test_phase_unlock() \
+    ((void)s_thread_mutex_unlock(&S_gc_test_phase_mutex))
+#else
+# define gc_test_phase_lock() ((void)0)
+# define gc_test_phase_unlock() ((void)0)
+#endif
+
+void S_gc_test_phase_reset(void) {
+  gc_test_phase_lock();
+  S_gc_test_phase_bits = 0;
+  S_gc_test_phase_target = -1;
+  S_gc_test_phase_action = GC_TEST_ACTION_NONE;
+  gc_test_phase_unlock();
+  ATOMIC_STORE_IBOOL(&S_gc_test_phase_active, 1);
+}
+
+void S_gc_test_phase_arm(iptr phase, iptr action) {
+  if (phase < 0 || phase >= GC_TEST_PHASE_COUNT
+      || action != GC_TEST_ACTION_ABORT)
+    S_error_abort("gc test phase arm is invalid");
+  gc_test_phase_lock();
+  S_gc_test_phase_bits = 0;
+  S_gc_test_phase_target = phase;
+  S_gc_test_phase_action = action;
+  gc_test_phase_unlock();
+  ATOMIC_STORE_IBOOL(&S_gc_test_phase_active, 1);
+}
+
+iptr S_gc_test_phase_mask(void) {
+  iptr bits;
+
+  ATOMIC_STORE_IBOOL(&S_gc_test_phase_active, 0);
+  gc_test_phase_lock();
+  bits = S_gc_test_phase_bits;
+  gc_test_phase_unlock();
+  return bits;
+}
+
+void S_gc_test_note_phase(iptr phase) {
+  iptr action = GC_TEST_ACTION_NONE;
+
+  if (!ATOMIC_LOAD_IBOOL(&S_gc_test_phase_active)) return;
+  if (phase < 0 || phase >= GC_TEST_PHASE_COUNT)
+    S_error_abort("gc test phase is invalid");
+  gc_test_phase_lock();
+  if (ATOMIC_LOAD_IBOOL(&S_gc_test_phase_active)) {
+    S_gc_test_phase_bits |= ((iptr)1 << phase);
+    if (S_gc_test_phase_target == phase) {
+      action = S_gc_test_phase_action;
+      S_gc_test_phase_target = -1;
+      S_gc_test_phase_action = GC_TEST_ACTION_NONE;
+    }
+  }
+  gc_test_phase_unlock();
+  if (action == GC_TEST_ACTION_ABORT)
+    S_error_abort("gc phase fault injected");
+}
+
 void S_gc_init(void) {
   IGEN g; INT i;
+
+#ifdef PTHREADS
+  if (S_boot_time) s_thread_mutex_init(&S_gc_test_phase_mutex);
+#endif
+  S_gc_test_phase_bits = 0;
+  S_gc_test_phase_target = -1;
+  S_gc_test_phase_action = GC_TEST_ACTION_NONE;
+  ATOMIC_STORE_IBOOL(&S_gc_test_phase_active, 0);
 
   ATOMIC_STORE_IBOOL(&S_checkheap, 0); /* 0 for disabled, 1 for enabled */
   S_checkheap_errors = 0; /* count of errors detected by checkheap */

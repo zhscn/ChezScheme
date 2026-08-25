@@ -1027,6 +1027,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
       S_check_heap(0, MAX_CG);
       S_checkheap_finish_mark_check();
     }
+    S_gc_test_note_phase(GC_TEST_PHASE_ROOT_SNAPSHOT);
 
 #ifdef DEBUG
 (void)printf("max_cg = %x;  go? ", MAX_CG); (void)fflush(stdout); (void)getc(stdin);
@@ -1375,6 +1376,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
 
     teardown_sweepers();
 
+    S_gc_test_note_phase(GC_TEST_PHASE_STRONG_CLOSURE);
     if (ATOMIC_LOAD_IBOOL(&S_checkheap)) S_checkheap_verify_mark_check();
 
     pre_finalization_size = target_generation_space_so_far(tgc);
@@ -1627,6 +1629,8 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
         }
     }
 
+    S_gc_test_note_phase(GC_TEST_PHASE_GUARDIAN_CLOSURE);
+
     S_G.bytes_finalized = target_generation_space_so_far(tgc) - pre_finalization_size;
     {
       iptr post_phantom_bytes = 0;
@@ -1645,6 +1649,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
 
     if (ATOMIC_LOAD_IBOOL(&S_checkheap))
       S_checkheap_verify_finalization_check(oldspacesegments);
+    S_gc_test_note_phase(GC_TEST_PHASE_WEAK_CLOSURE);
 
     ACCUM_REAL_TIME(collect_accum, step, start);
     REPORT_TIME(fprintf(stderr, "%d coll  +%ld ms  %ld ms  [real time]\n",
@@ -1855,6 +1860,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
     S_resize_oblist();
 
     if (ATOMIC_LOAD_IBOOL(&S_checkheap)) S_check_heap(1, MAX_CG);
+    S_gc_test_note_phase(GC_TEST_PHASE_COMMIT);
 
     /* tell profile_release_counters to look for bwp'd counters at least through max_tg */
     if (S_G.prcgeneration < MAX_TG) S_G.prcgeneration = MAX_TG;

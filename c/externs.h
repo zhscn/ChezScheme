@@ -191,6 +191,19 @@ extern void S_checkheap_note_reached(ptr p);
 extern void S_checkheap_verify_mark_check(void);
 extern void S_checkheap_note_guardian(ptr entry, int action);
 extern void S_checkheap_verify_finalization_check(seginfo *oldspacesegments);
+extern void S_gc_test_phase_reset(void);
+extern void S_gc_test_phase_arm(iptr phase, iptr action);
+extern iptr S_gc_test_phase_mask(void);
+extern void S_gc_test_note_phase(iptr phase);
+
+#define GC_TEST_PHASE_ROOT_SNAPSHOT 0
+#define GC_TEST_PHASE_STRONG_CLOSURE 1
+#define GC_TEST_PHASE_GUARDIAN_CLOSURE 2
+#define GC_TEST_PHASE_WEAK_CLOSURE 3
+#define GC_TEST_PHASE_COMMIT 4
+#define GC_TEST_PHASE_COUNT 5
+#define GC_TEST_ACTION_NONE 0
+#define GC_TEST_ACTION_ABORT 1
 
 #define CHECKHEAP_GUARDIAN_HOLD 1
 #define CHECKHEAP_GUARDIAN_FINAL 2
