@@ -2655,6 +2655,103 @@
                  '(return . done))
          (eq? (#3%$native-fiber-state task) 'finished))))
 
+(mat native-fiber-stack-map-matrix
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [task #f]
+         [current-weaks #f]
+         [current-live #f]
+         [widths '(3 17 31 32 33 63 64 65 95 96 127 128 159)]
+         [shapes
+          (map
+            (lambda (width)
+              (let* ([name* (map (lambda (i)
+                                   (string->symbol (format "stack-map-~s" i)))
+                                 (iota width))]
+                     [live?* (map (lambda (i)
+                                    (or (fx= i (fx- width 1))
+                                        (fx= (fxmod (fx+ (fx* i 17) width) 5)
+                                             0)))
+                                  (iota width))]
+                     [binding*
+                      (map (lambda (name i)
+                             `(,name (vector ',name
+                                             (make-bytevector 96
+                                               (fxlogand ,i 255)))))
+                           name* (iota width))]
+                     [live-name*
+                      (let loop ([name* name*] [live?* live?*] [out '()])
+                        (if (null? name*)
+                            (reverse out)
+                            (loop (cdr name*) (cdr live?*)
+                              (if (car live?*)
+                                  (cons (car name*) out)
+                                  out))))])
+                (eval
+                  `(lambda (suspend publish)
+                     (let* ,binding*
+                       (publish
+                         (vector ,@(map (lambda (name)
+                                         `(weak-cons ,name #f))
+                                       name*))
+                         ',(list->vector live?*))
+                       (let ([resume (suspend ,width)])
+                         (and (fx= resume ,width)
+                              (list ,@live-name*)))))
+                  (interaction-environment))))
+            widths)])
+    (define (publish weak* live*)
+      (set! current-weaks weak*)
+      (set! current-live live*))
+    (define (yield value)
+      (#3%$native-fiber-try-claim! scheduler)
+      (#3%$native-fiber-switch task scheduler value))
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (let loop ([shape* shapes] [width* widths])
+            (if (null? shape*)
+                'done
+                (let ([result ((car shape*) yield publish)])
+                  (unless (and result
+                               (fx= (length result)
+                                    (let count ([i 0] [n 0])
+                                      (if (fx= i (vector-length current-live))
+                                          n
+                                          (count (fx+ i 1)
+                                            (if (vector-ref current-live i)
+                                                (fx+ n 1)
+                                                n))))))
+                    (error 'native-fiber-stack-map-matrix
+                      "live stack roots were corrupted" (car width*)))
+                  (loop (cdr shape*) (cdr width*))))))
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-finish fiber scheduler outcome))
+        #b100))
+    (#3%$native-fiber-try-claim! task)
+    (let loop ([width* widths]
+               [transfer (#3%$native-fiber-switch scheduler task 'start)])
+      (if (null? width*)
+          (and (equal? transfer '(return . done))
+               (eq? (#3%$native-fiber-state task) 'finished))
+          (and (fx= transfer (car width*))
+               (begin
+                 (parameterize ([#%$enable-check-heap #t])
+                   (collect (collect-maximum-generation)))
+                 #t)
+               (let check ([i 0])
+                 (or (fx= i (vector-length current-live))
+                     (and (if (vector-ref current-live i)
+                              (not (bwp-object?
+                                     (car (vector-ref current-weaks i))))
+                              (bwp-object?
+                                (car (vector-ref current-weaks i))))
+                          (check (fx+ i 1)))))
+               (#3%$native-fiber-try-claim! task)
+               (loop (cdr width*)
+                 (#3%$native-fiber-switch scheduler task (car width*))))))))
+
 (mat native-fiber-stack-shape-matrix
   (let* ([scheduler
           (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]

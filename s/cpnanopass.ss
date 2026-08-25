@@ -9800,6 +9800,29 @@
                         [(eq? (uvar-type live) 'ptr) (cons-fv (uvar-location live) index*)]
                         [else index*]))
                     '() live*))))
+            (define verify-live-pointer-mask
+              (lambda (live* frame-words lpm)
+                ;; Build a slot inventory independently of build-mask so that
+                ;; every emitted bit is checked in both directions.
+                (let ([expected (make-vector frame-words #f)])
+                  (for-each
+                    (lambda (live)
+                      (let ([fv (cond
+                                  [(fv? live) live]
+                                  [(eq? (uvar-type live) 'ptr)
+                                   (uvar-location live)]
+                                  [else #f])])
+                        (when fv
+                          (let ([offset (fv-offset fv)])
+                            (safe-assert (fx<= 0 offset (fx- frame-words 1)))
+                            (unless (fx= offset 0)
+                              (vector-set! expected offset #t))))))
+                    live*)
+                  (do ([offset 1 (fx+ offset 1)])
+                      ((fx= offset frame-words))
+                    (safe-assert
+                      (eq? (vector-ref expected offset)
+                           (logbit? (fx- offset 1) lpm)))))))
             (define (process-info-newframe! info)
               (unless (info-newframe-frame-words info)
                 (let ([call-live* (info-newframe-call-live* info)])
@@ -9843,6 +9866,9 @@
                     [frame-words (info-newframe-frame-words info)]
                     [compact? (and (or as-fallthrough (not mrvl))
                                    (<= frame-words (constant compact-frame-max-words)))])
+               (verify-live-pointer-mask
+                 (append cnfv* (info-newframe-call-live* info))
+                 frame-words lpm)
                (record-inspector-info! (info-newframe-src info) (info-newframe-sexpr info) rpl (info-newframe-call-live* info) lpm)
                (with-output-language (L15b Effect)
                  (safe-assert (< -1 lpm (ash 1 (fx- (info-newframe-frame-words info) 1))))

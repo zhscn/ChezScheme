@@ -1093,6 +1093,44 @@ static iptr check_return_point(const char *kind, ptr owner, ptr ret,
   if (frame_size < 0 || (!terminal && frame_size == 0)
       || (frame_size & (ptr_bytes - 1)) != 0)
     malformed_stack(kind, owner, "invalid frame size");
+
+  {
+    uptr frame_words = (uptr)frame_size >> log2_ptr_bytes;
+    uptr root_slots = frame_words == 0 ? 0 : frame_words - 1;
+    ptr mask = ENTRYLIVEMASK(ret);
+
+    if (Sfixnump(mask)) {
+      iptr bits = UNFIX(mask);
+      if (bits < 0
+          || (root_slots < ptr_bits
+              && ((uptr)bits >> root_slots) != 0))
+        malformed_stack(kind, owner, "live mask exceeds frame bounds");
+    } else {
+      seginfo *mask_si;
+      iptr len;
+      uptr allowed_bigits;
+
+      if (FIXMEDIATE(mask)
+          || (mask_si = MaybeSegInfo(ptr_get_segment(mask))) == NULL
+          || (mask_si->space != space_pure
+              && mask_si->space != space_impure
+              && mask_si->space != space_data)
+          || !Sbignump(mask)
+          || BIGSIGN(mask))
+        malformed_stack(kind, owner, "live mask is not a nonnegative integer");
+
+      len = BIGLEN(mask);
+      if (len <= 0 || BIGIT(mask, 0) == 0)
+        malformed_stack(kind, owner, "live mask is not canonical");
+      allowed_bigits = root_slots / bigit_bits
+                     + (root_slots % bigit_bits != 0);
+      if ((uptr)len > allowed_bigits
+          || ((uptr)len == allowed_bigits
+              && root_slots % bigit_bits != 0
+              && (BIGIT(mask, 0) >> (root_slots % bigit_bits)) != 0))
+        malformed_stack(kind, owner, "live mask exceeds frame bounds");
+    }
+  }
   return frame_size;
 }
 
