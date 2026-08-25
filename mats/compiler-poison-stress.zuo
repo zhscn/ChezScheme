@@ -1,0 +1,94 @@
+#lang zuo
+
+;; Repeatedly run the complete mat suite while the compiler overwrites every
+;; dead stack slot and eligible dead register at control-flow boundaries.
+
+(define default-stack-seed 2718281)
+(define default-register-seed 1618033)
+(define seed-modulus 2147483647)
+
+(define (parse-positive who value)
+  (define n (string->integer value))
+  (unless (and n (> n 0))
+    (error (~a who " must be a positive integer: " value)))
+  n)
+
+(define (parse-seed who value)
+  (define n (string->integer value))
+  (unless (and n (>= n 0))
+    (error (~a who " must be a nonnegative integer: " value)))
+  (modulo n seed-modulus))
+
+(define (next-seed seed)
+  (modulo (+ (* seed 48271) 1) seed-modulus))
+
+(define (replay-command workarea jobs stack-seed register-seed)
+  (~a "bin/zuo "
+      (~s (build-path workarea "mats" "main.zuo"))
+      " -j " jobs " all"
+      " cds=" stack-seed
+      " cdrs=" register-seed))
+
+(define (run-stress config)
+  (define root (path->complete-path (at-source "..")))
+  (define workarea-name (hash-ref config 'workarea))
+  (define workarea (build-path root workarea-name))
+  (define main.zuo (build-path workarea "mats" "main.zuo"))
+  (define zuo.exe (hash-ref (runtime-env) 'exe))
+  (unless (file-exists? main.zuo)
+    (error (~a "compiler-poison stress workarea is not built: " workarea)))
+  (let loop ([run 0]
+             [stack-seed (hash-ref config 'stack-seed)]
+             [register-seed (hash-ref config 'register-seed)])
+    (define runs (hash-ref config 'runs))
+    (unless (and runs (= run runs))
+      (define replay
+        (replay-command workarea-name (hash-ref config 'jobs)
+                        stack-seed register-seed))
+      (alert (~a "compiler-poison stress run " (+ run 1)
+                 (if runs (~a "/" runs) "")
+                 ", stack seed " stack-seed
+                 ", register seed " register-seed))
+      (displayln (~a "replay: " replay))
+      (define child
+        (process zuo.exe main.zuo
+                 (list "-j" (~a (hash-ref config 'jobs)) "all"
+                       (~a "cds=" stack-seed)
+                       (~a "cdrs=" register-seed))
+                 (hash 'dir root)))
+      (define child-process (hash-ref child 'process))
+      (process-wait child-process)
+      (unless (= (process-status child-process) 0)
+        (error (~a "compiler-poison stress failed at run " (+ run 1)
+                   " with stack seed " stack-seed
+                   " and register seed " register-seed
+                   "\nreplay: " replay)))
+      (loop (+ run 1)
+            (next-seed stack-seed)
+            (next-seed (next-seed register-seed))))))
+
+(module+ main
+  (define config
+    (command-line
+     :init (hash 'workarea "ta6le"
+                 'runs 3
+                 'stack-seed default-stack-seed
+                 'register-seed default-register-seed
+                 'jobs 8)
+     :once-each
+     [config "--workarea" path "Use the built workarea at <path>"
+             (hash-set config 'workarea path)]
+     [config "--runs" count "Run the complete matrix <count> times"
+             (hash-set config 'runs (parse-positive "runs" count))]
+     [config "--forever" "Run until a matrix fails"
+             (hash-set config 'runs #f)]
+     [config "--stack-seed" seed "Start dead stack-slot poison at <seed>"
+             (hash-set config 'stack-seed
+                       (parse-seed "stack seed" seed))]
+     [config "--register-seed" seed
+             "Start dead register poison at <seed>"
+             (hash-set config 'register-seed
+                       (parse-seed "register seed" seed))]
+     [config "--jobs" count "Run the mat build with <count> jobs"
+             (hash-set config 'jobs (parse-positive "jobs" count))]))
+  (run-stress config))
