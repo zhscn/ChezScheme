@@ -2577,6 +2577,8 @@
 (define-symbol-flags* ([libraries] [flags system proc]) ; system parameters
   ($block-counter [flags single-valued])
   ($cafe [flags single-valued])
+  ($compile-clobber-dead [flags single-valued])
+  ($compile-clobber-dead-registers [flags single-valued])
   ($compile-profile [flags single-valued])
   ($cp0-inner-unroll-limit [sig [() -> (ufixnum)] [(ufixnum) -> (void)]] [flags true])
   ($cp0-polyvariant [sig [() -> (boolean)] [(ptr) -> (void)]] [flags unrestricted])

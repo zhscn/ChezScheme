@@ -2862,6 +2862,22 @@
                  '(return . done))
          (eq? (#3%$native-fiber-state task) 'finished))))
 
+(mat compiler-dead-location-clobbering
+  (let ([run
+         (parameterize ([#3%$compile-clobber-dead
+                         (or (#3%$compile-clobber-dead) 424242)]
+                        [#3%$compile-clobber-dead-registers
+                         (or (#3%$compile-clobber-dead-registers) 171717)])
+           (eval
+             '(lambda (limit invoke)
+                (let loop ([i 0] [sum 0])
+                  (if (fx= i limit)
+                      sum
+                      (loop (fx+ i 1)
+                        (fx+ sum (invoke i))))))
+             (interaction-environment)))])
+    (fx= (run 100 (lambda (i) (fx+ i 1))) 5050)))
+
 (mat native-fiber-stack-map-matrix
   (let* ([scheduler
           (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
@@ -2870,9 +2886,13 @@
          [current-live #f]
          [widths '(3 17 31 32 33 63 64 65 95 96 127 128 159)]
          [shapes
-          (map
-            (lambda (width)
-              (let* ([name* (map (lambda (i)
+          (parameterize ([#3%$compile-clobber-dead
+                          (or (#3%$compile-clobber-dead) 8675309)]
+                         [#3%$compile-clobber-dead-registers
+                          (or (#3%$compile-clobber-dead-registers) 314159)])
+            (map
+              (lambda (width)
+                (let* ([name* (map (lambda (i)
                                    (string->symbol (format "stack-map-~s" i)))
                                  (iota width))]
                      [live?* (map (lambda (i)
@@ -2894,19 +2914,19 @@
                               (if (car live?*)
                                   (cons (car name*) out)
                                   out))))])
-                (eval
-                  `(lambda (suspend publish)
-                     (let* ,binding*
-                       (publish
-                         (vector ,@(map (lambda (name)
-                                         `(weak-cons ,name #f))
-                                       name*))
-                         ',(list->vector live?*))
-                       (let ([resume (suspend ,width)])
-                         (and (fx= resume ,width)
-                              (list ,@live-name*)))))
-                  (interaction-environment))))
-            widths)])
+                  (eval
+                    `(lambda (suspend publish)
+                       (let* ,binding*
+                         (publish
+                           (vector ,@(map (lambda (name)
+                                           `(weak-cons ,name #f))
+                                         name*))
+                           ',(list->vector live?*))
+                         (let ([resume (suspend ,width)])
+                           (and (fx= resume ,width)
+                                (list ,@live-name*)))))
+                    (interaction-environment))))
+              widths))])
     (define (publish weak* live*)
       (set! current-weaks weak*)
       (set! current-live live*))

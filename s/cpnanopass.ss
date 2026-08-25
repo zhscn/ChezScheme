@@ -9628,6 +9628,25 @@
           (unless any? (printf " none"))
           (newline)))
 
+      (define make-next-clobber-immediate
+        (lambda (seed)
+          (and seed
+            (let ([state seed])
+              (lambda ()
+                (set! state
+                  (logand (most-positive-fixnum)
+                    (+ (* state 1103515245) 12345)))
+                (ptr->imm
+                  (case (modulo state 8)
+                    [(0) #!bwp]
+                    [(1) ($unbound-object)]
+                    [(2) #f]
+                    [(3) #t]
+                    [(4) '()]
+                    [(5) (void)]
+                    [(6) (integer->char (fx+ 32 (modulo state 95)))]
+                    [else (fx- (modulo state 8191) 4095)])))))))
+
       (module (assign-frame! assign-new-frame!)
         (define update-conflict!
           (lambda (fv spill reg-spillinfo)
@@ -9740,6 +9759,45 @@
         (define-pass assign-new-frame! : (L15a Dummy) (ir lambda-info live-size varvec reg-spillinfo block*) -> (L15b Dummy) ()
           (definitions
             (define remove-var (make-remove-var live-size reg-spillinfo))
+            (define next-stack-clobber-immediate
+              (make-next-clobber-immediate ($compile-clobber-dead)))
+            (define location-of
+              (lambda (x)
+                (cond
+                  [(or (fv? x) (reg? x)) x]
+                  [(uvar? x) (uvar-location x)]
+                  [else #f])))
+            (define live-location*
+              (lambda (live)
+                (filter values
+                  (map location-of
+                    (get-live-vars live live-size varvec)))))
+            (define clobber-effect
+              (lambda (location next-immediate live)
+                (with-output-language (L15b Effect)
+                  `(set! ,(make-live-info live) ,location
+                     (immediate ,(next-immediate))))))
+            (define clobber-dead-stack-effects
+              (lambda (info live)
+                (if (not next-stack-clobber-immediate)
+                    '()
+                    (let ([live-location* (live-location* live)])
+                      (define (location-live? location)
+                        (memq location live-location*))
+                      (let ([frame-words (info-newframe-frame-words info)])
+                        (let loop ([offset 1] [effect* '()])
+                          (if (fx= offset frame-words)
+                              (reverse effect*)
+                              (let ([fv (get-fv offset 'ptr)])
+                                (loop (fx+ offset 1)
+                                  (if (and (not (memq (fv-type fv)
+                                                  '(fp reserved)))
+                                           (not (location-live? fv)))
+                                      (cons (clobber-effect fv
+                                              next-stack-clobber-immediate
+                                              live)
+                                        effect*)
+                                      effect*))))))))))
             (define find-max-fv
               (lambda (call-live*)
                 (fold-left
@@ -9958,7 +10016,9 @@
                                  (let ([loc (uvar-location x)])
                                    ($add-move! x loc 2)
                                    (cons `(set! ,(make-live-info live) ,loc ,x) new-effect*)))
-                               (cons `(fp-offset ,(make-live-info live) ,(fx* (info-newframe-frame-words info) (constant ptr-bytes))) '())
+                               (append
+                                 (clobber-dead-stack-effects info live)
+                                 (cons `(fp-offset ,(make-live-info live) ,(fx* (info-newframe-frame-words info) (constant ptr-bytes))) '()))
                                (info-newframe-local-save* info)))))]
                       [else (sorry! who "unrecognized block ~s" block)])
                     (block-effect* block))))
@@ -10399,6 +10459,34 @@
 
         (define-pass select-instructions! : (L15c Dummy) (ir block* live-size reg-spillinfo force-overflow?) -> (L15d Dummy) ()
           (definitions
+            (define next-register-clobber-immediate
+              (make-next-clobber-immediate
+                ($compile-clobber-dead-registers)))
+            (define jump-protocol-register*
+              (reg-cons* %ac0 %cp arg-registers))
+            (define clobber-dead-register-etree
+              (lambda (live)
+                (if (not next-register-clobber-immediate)
+                    '()
+                    (fold-right
+                      (lambda (reg effect*)
+                        (if (and (eq? (reg-type reg) 'uptr)
+                                 (not (reg-callee-save? reg))
+                                 (not (memq reg jump-protocol-register*))
+                                 (not (live? live live-size reg
+                                        reg-spillinfo)))
+                            (let ([tmp (make-precolored-unspillable
+                                         (reg-name reg) reg)])
+                              (with-output-language (L15d Effect)
+                                (cons
+                                  `(set! ,(make-live-info) ,tmp
+                                     (immediate
+                                       ,(next-register-clobber-immediate)))
+                                  (cons `(set! ,(make-live-info) ,reg ,tmp)
+                                    effect*))))
+                            effect*))
+                      '()
+                      (vector->list regvec)))))
             (module (handle-jump handle-effect-inline handle-pred-inline handle-value-inline)
               (define add-var (make-add-var live-size reg-spillinfo))
               (define Triv
@@ -10445,7 +10533,14 @@
               (define-who handle-jump
                 (lambda (t live)
                   (let-values ([(etree tail) (md-handle-jump t)])
-                    (values (unwrap etree '() (Tail live tail)) tail))))
+                    (let ([tail-live (Tail live tail)])
+                      (values
+                        (unwrap
+                          (list etree
+                            (clobber-dead-register-etree tail-live))
+                          '()
+                          tail-live)
+                        tail)))))
               (define-who handle-effect-inline
                 (lambda (effect-prim info new-effect* t* live)
                   (unwrap (apply (primitive-handler effect-prim) info t*) new-effect* live)))
@@ -11406,6 +11501,22 @@
   (set! $track-dynamic-closure-counts track-dynamic-closure-counts)
 
   (set! $track-static-closure-counts track-static-closure-counts)
+
+  (set! $compile-clobber-dead
+    (make-parameter #f
+      (lambda (x)
+        (if (or (eq? x #f) (and (fixnum? x) (fx>= x 0)))
+            x
+            ($oops '$compile-clobber-dead
+              "~s is not #f or a nonnegative fixnum seed" x)))))
+
+  (set! $compile-clobber-dead-registers
+    (make-parameter #f
+      (lambda (x)
+        (if (or (eq? x #f) (and (fixnum? x) (fx>= x 0)))
+            x
+            ($oops '$compile-clobber-dead-registers
+              "~s is not #f or a nonnegative fixnum seed" x)))))
 
   (set! $optimize-closures (make-parameter #t (lambda (x) (and x #t))))
 

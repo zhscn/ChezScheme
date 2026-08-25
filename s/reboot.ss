@@ -446,6 +446,8 @@
 (define-primitive $sfd (make-parameter #f))
 (define-primitive $target-machine (make-parameter #f))
 (define-primitive $compile-profile (make-parameter #f))
+(define-primitive $compile-clobber-dead (make-parameter #f))
+(define-primitive $compile-clobber-dead-registers (make-parameter #f))
 (define-primitive $optimize-closures (make-parameter #t))
 (define-primitive $track-dynamic-closure-counts (make-parameter #f))
 

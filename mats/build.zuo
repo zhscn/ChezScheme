@@ -129,6 +129,11 @@
    ;; ecpf determines whether the compiler checks prelex flags
    'ecpf "f"
 
+   ;; cds and cdrs select deterministic dead stack-slot and register
+   ;; clobber seeds; an empty value disables the corresponding check
+   'cds ""
+   'cdrs ""
+
    ;; c determines whether mat coverage (.covout) files are created
    'c "f"))
 
@@ -385,6 +390,8 @@
       (,(string->symbol "#%$suppress-primitive-inlining") ,(opt 'spi))
       (heap-check-interval ,(opt 'hci 'integer))
       (,(string->symbol "#%$enable-check-prelex-flags") ,(opt 'ecpf))
+      (,(string->symbol "#3%$compile-clobber-dead") ,(opt 'cds 'integer))
+      (,(string->symbol "#3%$compile-clobber-dead-registers") ,(opt 'cdrs 'integer))
       (compile-profile ,(opt 'p))
       (collect-notify ,(opt 'cn))
       (collect-trip-bytes (or ,(opt 'ctb 's-exp) (collect-trip-bytes)))
@@ -534,7 +541,7 @@
                            (not (equal? v (hash-ref default-options key))))
                       (~a " " key "=" v)
                       "")))
-              '(spi hci ecpf cp0 cis p eval ctb cgr cmg eoc cl rmg)))
+              '(spi hci ecpf cds cdrs cp0 cis p eval ctb cgr cmg eoc cl rmg)))
         (if name?
             (~a " " (hash-ref options 'name))
             "")
@@ -959,4 +966,3 @@
        (end-make-targets))))
 
   the-targets)
-
