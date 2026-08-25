@@ -407,6 +407,7 @@ extern void S_handle_nonprocedure_symbol(void);
 extern void S_handle_values_error(void);
 extern void S_handle_mvlet_error(void);
 extern void S_handle_event_detour(void);
+extern void S_native_fiber_transition(void);
 extern ptr S_allocate_scheme_signal_queue(void);
 extern ptr S_dequeue_scheme_signals(ptr tc);
 extern void S_register_scheme_signal(iptr sig);

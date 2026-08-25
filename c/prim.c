@@ -148,6 +148,8 @@ static void create_c_entry_vector(void) {
     S_install_c_entry(CENTRY_handle_mvlet_error, proc2ptr(S_handle_mvlet_error));
     S_install_c_entry(CENTRY_handle_arg_error, proc2ptr(S_handle_arg_error));
     S_install_c_entry(CENTRY_handle_event_detour, proc2ptr(S_handle_event_detour));
+    S_install_c_entry(CENTRY_native_fiber_transition,
+                      proc2ptr(S_native_fiber_transition));
     S_install_c_entry(CENTRY_foreign_entry, proc2ptr(S_foreign_entry));
     S_install_c_entry(CENTRY_install_library_entry, proc2ptr(scheme_install_library_entry));
     S_install_c_entry(CENTRY_get_more_room, proc2ptr(S_get_more_room));
@@ -185,6 +187,33 @@ void S_check_c_entry_vector() {
     }
 }
 
+static void register_runtime_test_symbols(void) {
+    Sforeign_symbol("(cs)checkheap_test_mark_fault",
+                    (void *)S_checkheap_test_mark_fault);
+    Sforeign_symbol("(cs)checkheap_test_remembered_fault",
+                    (void *)S_checkheap_test_remembered_fault);
+    Sforeign_symbol("(cs)gc_test_phase_reset",
+                    (void *)S_gc_test_phase_reset);
+    Sforeign_symbol("(cs)gc_test_phase_arm",
+                    (void *)S_gc_test_phase_arm);
+    Sforeign_symbol("(cs)gc_test_phase_mask",
+                    (void *)S_gc_test_phase_mask);
+    Sforeign_symbol("(cs)native_fiber_test_hook_arm",
+                    (void *)S_native_fiber_test_hook_arm);
+    Sforeign_symbol("(cs)native_fiber_test_hook_release",
+                    (void *)S_native_fiber_test_hook_release);
+    Sforeign_symbol("(cs)native_fiber_test_hook_hit",
+                    (void *)S_native_fiber_test_hook_hit);
+    Sforeign_symbol("(cs)native_fiber_test_hook_saw_gc",
+                    (void *)S_native_fiber_test_hook_saw_gc);
+    Sforeign_symbol("(cs)native_fiber_test_hook_request_exit",
+                    (void *)S_native_fiber_test_hook_request_exit);
+    Sforeign_symbol("(cs)native_fiber_test_hook_saw_exit",
+                    (void *)S_native_fiber_test_hook_saw_exit);
+    Sforeign_symbol("(cs)native_fiber_test_hook_reset",
+                    (void *)S_native_fiber_test_hook_reset);
+}
+
 void S_prim_init(void) {
     if (!S_boot_time) return;
 
@@ -201,38 +230,15 @@ void S_prim_init(void) {
     Sforeign_symbol("(cs)check_heap_enabledp", (void *)s_check_heap_enabledp);
     Sforeign_symbol("(cs)enable_check_heap", (void *)s_enable_check_heap);
     Sforeign_symbol("(cs)check_heap_errors", (void *)s_check_heap_errors);
-    Sforeign_symbol("(cs)checkheap_test_mark_fault",
-                    (void *)S_checkheap_test_mark_fault);
-    Sforeign_symbol("(cs)checkheap_test_remembered_fault",
-                    (void *)S_checkheap_test_remembered_fault);
     Sforeign_symbol("(cs)register_native_fiber_rtd",
                     (void *)S_register_native_fiber_rtd);
-    Sforeign_symbol("(cs)gc_test_phase_reset",
-                    (void *)S_gc_test_phase_reset);
-    Sforeign_symbol("(cs)gc_test_phase_arm",
-                    (void *)S_gc_test_phase_arm);
-    Sforeign_symbol("(cs)gc_test_phase_mask",
-                    (void *)S_gc_test_phase_mask);
+    register_runtime_test_symbols();
     Sforeign_symbol("(cs)native_fiber_invariant_failure",
                     (void *)s_native_fiber_invariant_failure);
     Sforeign_symbol("(cs)native_fiber_worker_state_mask",
                     (void *)s_native_fiber_worker_state_mask);
     Sforeign_symbol("(cs)native_fiber_current_root",
                     (void *)s_native_fiber_current_root);
-    Sforeign_symbol("(cs)native_fiber_test_hook_arm",
-                    (void *)S_native_fiber_test_hook_arm);
-    Sforeign_symbol("(cs)native_fiber_test_hook_release",
-                    (void *)S_native_fiber_test_hook_release);
-    Sforeign_symbol("(cs)native_fiber_test_hook_hit",
-                    (void *)S_native_fiber_test_hook_hit);
-    Sforeign_symbol("(cs)native_fiber_test_hook_saw_gc",
-                    (void *)S_native_fiber_test_hook_saw_gc);
-    Sforeign_symbol("(cs)native_fiber_test_hook_request_exit",
-                    (void *)S_native_fiber_test_hook_request_exit);
-    Sforeign_symbol("(cs)native_fiber_test_hook_saw_exit",
-                    (void *)S_native_fiber_test_hook_saw_exit);
-    Sforeign_symbol("(cs)native_fiber_test_hook_reset",
-                    (void *)S_native_fiber_test_hook_reset);
     Sforeign_symbol("(cs)count_size_increments", (void *)S_count_size_increments);
     Sforeign_symbol("(cs)lookup_library_entry", (void *)S_lookup_library_entry);
     Sforeign_symbol("(cs)link_code_object", (void *)s_link_code_object);
@@ -391,14 +397,17 @@ static iptr s_native_fiber_worker_state_mask(void) {
   ptr depth = FIBERSWITCHPROHIBITEDDEPTH(tc);
   iptr mask = 0;
 
-  if (!Sfixnump(depth) || UNFIX(depth) < 0) mask |= 1;
+  if (!Sfixnump(depth) || UNFIX(depth) < 0)
+    mask |= native_fiber_worker_error_switch_prohibited;
 #ifdef tc_native_fiber_transition_disp
-  if (NATIVEFIBERTRANSITION(tc) != Sfalse) mask |= 2;
+  if (NATIVEFIBERTRANSITION(tc) != Sfalse)
+    mask |= native_fiber_worker_error_transition;
   if (NATIVEFIBERPREEMPTACTIVE(tc) != Sfalse
       && NATIVEFIBERPREEMPTACTIVE(tc) != Strue)
-    mask |= 4;
+    mask |= native_fiber_worker_error_preemption;
 # ifdef tc_native_fiber_test_active_disp
-  if (NATIVEFIBERTESTACTIVE(tc) != Sfalse) mask |= 8;
+  if (NATIVEFIBERTESTACTIVE(tc) != Sfalse)
+    mask |= native_fiber_worker_error_test_hook;
 # endif
 #endif
   return mask;

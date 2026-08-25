@@ -2047,6 +2047,13 @@
       (memory-order-acquire)
       control)))
 
+(define native-fiber-control-cas!
+  (lambda (fiber old new)
+    ;; Keep the record layout dependency and atomic update protocol in one
+    ;; place. Callers provide the acquire/release ordering required by their
+    ;; ownership transition.
+    ($record-cas! fiber 0 old new)))
+
 (define native-fiber-current-owner)
 (define native-fiber-valid-flags?)
 (define native-fiber-task-flags?)
@@ -2057,6 +2064,7 @@
 (define native-fiber-check-stable!)
 (define native-fiber-context-valid?)
 (define native-fiber-empty-context-valid?)
+(define native-fiber-control-word-valid?)
 (define native-fiber-control-valid?)
 (define native-fiber-transition-valid?)
 (define native-fiber-check-exchange-plan!)
@@ -2290,10 +2298,34 @@
          (list? ($continuation-winders context))
          (list? ($continuation-attachments context)))))
 
-(set! native-fiber-control-valid?
-  (lambda (control flags stable?)
+(set! native-fiber-control-word-valid?
+  (lambda (control stable?)
+    ;; CONTROL is the only field that may be inspected before ownership is
+    ;; acquired.  Validate its self-contained lifecycle/owner relationship
+    ;; here; flag-dependent parked ownership is checked after a successful
+    ;; claim.
     (and (fixnum? control)
          (fx>= control 0)
+         (let ([state (native-fiber-control-state control)]
+               [owner (native-fiber-control-owner control)])
+           (and (or (not stable?)
+                    (not (or (fx= state (constant native-fiber-state-parking))
+                             (fx= state (constant native-fiber-state-finishing)))))
+                (cond
+                  [(or (fx= state (constant native-fiber-state-new))
+                       (fx= state (constant native-fiber-state-finished)))
+                   (fx= owner 0)]
+                  [(or (fx= state (constant native-fiber-state-claimed))
+                       (fx= state (constant native-fiber-state-running))
+                       (fx= state (constant native-fiber-state-parking))
+                       (fx= state (constant native-fiber-state-finishing)))
+                   (fx> owner 0)]
+                  [(fx= state (constant native-fiber-state-parked)) #t]
+                  [else #f]))))))
+
+(set! native-fiber-control-valid?
+  (lambda (control flags stable?)
+    (and (native-fiber-control-word-valid? control stable?)
          (native-fiber-valid-flags? flags)
          (let ([state (native-fiber-control-state control)]
                [owner (native-fiber-control-owner control)]
@@ -2305,16 +2337,10 @@
                 (not (fx= (fxlogand flags
                               (constant native-fiber-flag-migratable))
                            0))])
-           (and (or (not stable?)
-                    (not (or (fx= state (constant native-fiber-state-parking))
-                             (fx= state (constant native-fiber-state-finishing)))))
-                (case state
-                  [(0) (fx= owner 0)]
-                  [(1 2 3 5) (fx> owner 0)]
-                  [(4) (if pinned? (fx> owner 0)
-                           (and migratable? (fx= owner 0)))]
-                  [(6) (fx= owner 0)]
-                  [else #f]))))))
+           (or (not (fx= state (constant native-fiber-state-parked)))
+               (if pinned?
+                   (fx> owner 0)
+                   (and migratable? (fx= owner 0))))))))
 
 (set! native-fiber-transition-valid?
   (lambda (flags from to)
@@ -2441,14 +2467,18 @@
     ;; snapshot outside the closed exchange.
     (let-values ([(state-mask current)
                   ($app/no-inline native-fiber-worker-snapshot)])
-      (unless (fx= (fxlogand state-mask 1) 0)
+      (unless (fx= (fxlogand state-mask
+                     (constant native-fiber-worker-error-switch-prohibited)) 0)
         ($oops who "invalid native-fiber switch-prohibition depth"))
-      (unless (fx= (fxlogand state-mask 2) 0)
+      (unless (fx= (fxlogand state-mask
+                     (constant native-fiber-worker-error-transition)) 0)
         ($oops who "native-fiber transition is visible at a stable boundary"))
-      (unless (fx= (fxlogand state-mask 4) 0)
+      (unless (fx= (fxlogand state-mask
+                     (constant native-fiber-worker-error-preemption)) 0)
         ($native-fiber-preempt-active #f)
         ($oops who "invalid native-fiber preemption-window state"))
-      (unless (fx= (fxlogand state-mask 8) 0)
+      (unless (fx= (fxlogand state-mask
+                     (constant native-fiber-worker-error-test-hook)) 0)
         (#3%$tc-field 'native-fiber-test-active (#3%$tc) #f)
         ($oops who "native-fiber test hook is visible at a stable boundary"))
       (let ([claimed ($native-fiber-claimed)]
@@ -2659,14 +2689,20 @@
         #f
         (let ([owner (native-fiber-current-owner)])
       (let loop ()
-        (let* ([old (native-fiber-read-control fiber)]
-               [state (native-fiber-control-state old)]
-               [old-owner (native-fiber-control-owner old)])
-          (cond
-            [(or (and (fx= state (constant native-fiber-state-new))
-                      (fx= old-owner 0))
-                 (and (fx= state (constant native-fiber-state-parked))
-                      (or (fx= old-owner 0) (fx= old-owner owner))))
+        (let ([old (native-fiber-read-control fiber)])
+          ;; A racing owner may legitimately be in parking or finishing.
+          ;; Validate the packed word itself here and let the state dispatch
+          ;; below decide whether this observation is claimable.
+          (unless (native-fiber-control-word-valid? old #f)
+            ($oops '$native-fiber-try-claim!
+              "native fiber has an invalid control word ~s" old))
+          (let ([state (native-fiber-control-state old)]
+                [old-owner (native-fiber-control-owner old)])
+            (cond
+              [(or (and (fx= state (constant native-fiber-state-new))
+                        (fx= old-owner 0))
+                   (and (fx= state (constant native-fiber-state-parked))
+                        (or (fx= old-owner 0) (fx= old-owner owner))))
              ;; Ordinary fiber fields belong to the owner named by control.
              ;; Do not inspect them before CAS: another worker can advance a
              ;; parked fiber through a complete run/park cycle while this
@@ -2676,7 +2712,7 @@
                           (constant native-fiber-state-claimed)
                           owner)])
                (disable-interrupts)
-               (if ($record-cas! fiber 0 old new)
+               (if (native-fiber-control-cas! fiber old new)
                    (begin
                      ;; The same stable control value can be published again
                      ;; after another worker runs and parks a migratable
@@ -2693,7 +2729,7 @@
                    (begin
                      (enable-interrupts)
                      (loop))))]
-            [else #f])))))))
+              [else #f]))))))))
 
 (set! $native-fiber-release-claim!
   (lambda (fiber)
@@ -2707,7 +2743,7 @@
       ;; Publish every ordinary write performed while this worker owned the
       ;; claim before another worker can acquire the restored stable state.
       (memory-order-release)
-      (unless ($record-cas! fiber 0 claimed old)
+      (unless (native-fiber-control-cas! fiber claimed old)
         (native-fiber-invariant-failure))
       ($native-fiber-claimed #f)
       ($native-fiber-claimed-control #f)
@@ -2982,7 +3018,7 @@
         (disable-interrupts)
         (memory-order-release)
         (unless (and old
-                     ($record-cas! claimed 0
+                     (native-fiber-control-cas! claimed
                        (native-fiber-read-control claimed) old))
           (native-fiber-invariant-failure))
         ($native-fiber-claimed #f)
@@ -3011,7 +3047,7 @@
                            (constant native-fiber-state-parked))
                       (fx= (native-fiber-control-owner old)
                            (native-fiber-current-owner))
-                      ($record-cas! fiber 0 old finishing))
+                      (native-fiber-control-cas! fiber old finishing))
               (native-fiber-invariant-failure))
             (#3%$tc-field 'native-fiber-pinned-head (#3%$tc)
               (if (null? next) #f next))
@@ -3027,7 +3063,7 @@
             (native-fiber-cache-context-set! fiber #f)
             (native-fiber-pinned-next-set! fiber #f)
             (memory-order-release)
-            (unless ($record-cas! fiber 0 finishing finished)
+            (unless (native-fiber-control-cas! fiber finishing finished)
               (native-fiber-invariant-failure))
             (retire)))))
     (enable-interrupts)
@@ -3047,7 +3083,7 @@
                     (fx= (native-fiber-control-owner control)
                          (native-fiber-current-owner))
                     (begin (memory-order-release) #t)
-                    ($record-cas! current 0 control finished))
+                    (native-fiber-control-cas! current control finished))
             (native-fiber-invariant-failure))
           ($current-native-fiber #f)
           (native-fiber-check-stable-internal!

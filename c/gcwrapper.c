@@ -33,39 +33,10 @@ static IBOOL checkheap_noisy;
  * test needs to retain the source address without making the object live. */
 static ptr S_checkheap_test_mark_target;
 static iptr S_checkheap_test_mark_action;
+static IBOOL S_checkheap_test_mark_started;
 static ptr S_checkheap_test_remembered_source;
 static iptr S_checkheap_test_remembered_index;
 
-void S_checkheap_test_mark_fault(ptr target, iptr action) {
-  if (FIXMEDIATE(target)
-      || MaybeSegInfo(ptr_get_segment(target)) == NULL
-      || (action != CHECKHEAP_TEST_MARK_OMIT
-          && action != CHECKHEAP_TEST_MARK_EXTRA))
-    S_error_abort("checkheap mark fault is invalid");
-  S_checkheap_test_mark_target = target;
-  S_checkheap_test_mark_action = action;
-}
-
-/* The source is required to stay in an uncollected generation until the
- * armed generation-zero collection reaches its pre-GC heap check. */
-void S_checkheap_test_remembered_fault(ptr source, iptr index) {
-  if (!Svectorp(source)
-      || index < 0
-      || index >= (iptr)Svector_length(source)
-      || S_checkheap_test_remembered_source != (ptr)0)
-    S_error_abort("checkheap remembered-set fault is invalid");
-  S_checkheap_test_remembered_source = source;
-  S_checkheap_test_remembered_index = index;
-}
-
-/* GC phase coverage is dormant outside explicitly armed runtime tests. The
- * phase mask contains no Scheme pointers and is protected independently of
- * collector locks so a test can observe collections performed by another
- * native thread. */
-static iptr S_gc_test_phase_bits;
-static iptr S_gc_test_phase_target;
-static iptr S_gc_test_phase_action;
-static IBOOL S_gc_test_phase_active;
 #ifdef PTHREADS
 static s_thread_mutex_t S_gc_test_phase_mutex;
 # define gc_test_phase_lock() \
@@ -76,6 +47,48 @@ static s_thread_mutex_t S_gc_test_phase_mutex;
 # define gc_test_phase_lock() ((void)0)
 # define gc_test_phase_unlock() ((void)0)
 #endif
+
+void S_checkheap_test_mark_fault(ptr target, iptr action) {
+  if (FIXMEDIATE(target)
+      || MaybeSegInfo(ptr_get_segment(target)) == NULL
+      || (action != CHECKHEAP_TEST_MARK_OMIT
+          && action != CHECKHEAP_TEST_MARK_EXTRA))
+    S_error_abort("checkheap mark fault is invalid");
+  gc_test_phase_lock();
+  if (S_checkheap_test_mark_started || S_checkheap_test_mark_action != 0) {
+    gc_test_phase_unlock();
+    S_error_abort("checkheap mark fault is already armed");
+  }
+  S_checkheap_test_mark_target = target;
+  S_checkheap_test_mark_action = action;
+  gc_test_phase_unlock();
+}
+
+/* The source is required to stay in an uncollected generation until the
+ * armed generation-zero collection reaches its pre-GC heap check. */
+void S_checkheap_test_remembered_fault(ptr source, iptr index) {
+  if (!Svectorp(source)
+      || index < 0
+      || index >= (iptr)Svector_length(source))
+    S_error_abort("checkheap remembered-set fault is invalid");
+  gc_test_phase_lock();
+  if (S_checkheap_test_remembered_source != (ptr)0) {
+    gc_test_phase_unlock();
+    S_error_abort("checkheap remembered-set fault is already armed");
+  }
+  S_checkheap_test_remembered_source = source;
+  S_checkheap_test_remembered_index = index;
+  gc_test_phase_unlock();
+}
+
+/* GC phase coverage is dormant outside explicitly armed runtime tests. The
+ * phase mask contains no Scheme pointers and is protected independently of
+ * collector locks so a test can observe collections performed by another
+ * native thread. */
+static iptr S_gc_test_phase_bits;
+static iptr S_gc_test_phase_target;
+static iptr S_gc_test_phase_action;
+static IBOOL S_gc_test_phase_active;
 
 void S_gc_test_phase_reset(void) {
   gc_test_phase_lock();
@@ -144,6 +157,9 @@ void S_gc_init(void) {
   checkheap_noisy = 0; /* 0 for error output only; 1 for more noisy output */
   S_checkheap_test_mark_target = (ptr)0;
   S_checkheap_test_mark_action = 0;
+  S_checkheap_test_mark_started = 0;
+  S_checkheap_test_remembered_source = (ptr)0;
+  S_checkheap_test_remembered_index = 0;
   S_G.prcgeneration = static_generation;
 
   if (ATOMIC_LOAD_IBOOL(&S_checkheap)) {
@@ -724,11 +740,11 @@ static IBOOL remembered_object_card_spacep(ISPC s) {
       || s == space_impure_record;
 }
 
-static size_t remembered_segment_hash(uptr segment, size_t capacity) {
-  segment ^= segment >> 17;
-  segment *= (uptr)0xed5ad4bbU;
-  segment ^= segment >> 11;
-  return (size_t)segment & (capacity - 1);
+static size_t checkheap_hash_word(uptr word, size_t capacity) {
+  word ^= word >> 17;
+  word *= (uptr)0xed5ad4bbU;
+  word ^= word >> 11;
+  return (size_t)word & (capacity - 1);
 }
 
 static void remembered_rehash(size_t capacity) {
@@ -748,8 +764,7 @@ static void remembered_rehash(size_t capacity) {
   if (old_segments != NULL) {
     for (i = 0; i < old_capacity; i += 1) {
       if (old_segments[i].segment != REMEMBERED_EMPTY_SEGMENT) {
-        size_t at = remembered_segment_hash(old_segments[i].segment,
-                                             capacity);
+        size_t at = checkheap_hash_word(old_segments[i].segment, capacity);
         while (rebuilt_remembered.segments[at].segment
                != REMEMBERED_EMPTY_SEGMENT)
           at = (at + 1) & (capacity - 1);
@@ -775,7 +790,7 @@ static rebuilt_remembered_segment *remembered_find_segment(uptr segment,
     remembered_rehash(rebuilt_remembered.capacity * 2);
   }
 
-  at = remembered_segment_hash(segment, rebuilt_remembered.capacity);
+  at = checkheap_hash_word(segment, rebuilt_remembered.capacity);
   while (rebuilt_remembered.segments[at].segment
          != REMEMBERED_EMPTY_SEGMENT) {
     if (rebuilt_remembered.segments[at].segment == segment)
@@ -881,12 +896,21 @@ static void remembered_record_pointer(ptr *pp, ptr p,
 static void remembered_verify(void) {
   IGEN from_generation;
   size_t i;
+  ptr fault_source;
+  iptr fault_index;
 
   if (!rebuilt_remembered.active) return;
 
-  if (S_checkheap_test_remembered_source != (ptr)0) {
-    ptr source = S_checkheap_test_remembered_source;
-    iptr index = S_checkheap_test_remembered_index;
+  gc_test_phase_lock();
+  fault_source = S_checkheap_test_remembered_source;
+  fault_index = S_checkheap_test_remembered_index;
+  S_checkheap_test_remembered_source = (ptr)0;
+  S_checkheap_test_remembered_index = 0;
+  gc_test_phase_unlock();
+
+  if (fault_source != (ptr)0) {
+    ptr source = fault_source;
+    iptr index = fault_index;
     ptr *location = &INITVECTIT(source, index);
     seginfo *source_si = MaybeSegInfo(ptr_get_segment(source));
     seginfo *target_si = FIXMEDIATE(*location)
@@ -894,8 +918,6 @@ static void remembered_verify(void) {
     uptr card = ((uptr)TO_PTR(location) >> card_offset_bits)
               & ((1 << segment_card_offset_bits) - 1);
 
-    S_checkheap_test_remembered_source = (ptr)0;
-    S_checkheap_test_remembered_index = 0;
     if (source_si == NULL
         || target_si == NULL
         || source_si->generation == 0
@@ -1129,23 +1151,6 @@ static IBOOL native_fiber_contextp(ptr p) {
 
 #define NATIVE_FIBER_CENSUS_EMPTY ((size_t)-1)
 
-enum {
-  native_fiber_control_index = 0,
-  native_fiber_context_index = 1,
-  native_fiber_handler_stack_index = 2,
-  native_fiber_entry_index = 3,
-  native_fiber_on_return_index = 4,
-  native_fiber_starter_index = 5,
-  native_fiber_incoming_source_index = 6,
-  native_fiber_incoming_payload_index = 7,
-  native_fiber_switch_control_index = 8,
-  native_fiber_commit_control_index = 9,
-  native_fiber_cache_context_index = 10,
-  native_fiber_flags_index = 11,
-  native_fiber_id_index = 12,
-  native_fiber_pinned_next_index = 13
-};
-
 typedef struct {
   ptr object;
   IBOOL fiber_seen;
@@ -1170,14 +1175,6 @@ typedef struct {
 
 static native_fiber_census_state native_fiber_census;
 
-static size_t native_fiber_census_hash(ptr p, size_t capacity) {
-  uptr n = (uptr)TO_PTR(p);
-  n ^= n >> 17;
-  n *= (uptr)0xed5ad4bbU;
-  n ^= n >> 11;
-  return (size_t)n & (capacity - 1);
-}
-
 static void native_fiber_census_reset(void) {
   free(native_fiber_census.entries);
   free(native_fiber_census.slots);
@@ -1194,8 +1191,8 @@ static void native_fiber_census_rehash(size_t capacity) {
   for (i = 0; i < capacity; i += 1)
     slots[i] = NATIVE_FIBER_CENSUS_EMPTY;
   for (i = 0; i < native_fiber_census.entry_count; i += 1) {
-    size_t at = native_fiber_census_hash(
-      native_fiber_census.entries[i].object, capacity);
+    size_t at = checkheap_hash_word(
+      (uptr)TO_PTR(native_fiber_census.entries[i].object), capacity);
     while (slots[at] != NATIVE_FIBER_CENSUS_EMPTY)
       at = (at + 1) & (capacity - 1);
     slots[at] = i;
@@ -1218,7 +1215,8 @@ static native_fiber_census_entry *native_fiber_census_find(ptr p,
     native_fiber_census_rehash(native_fiber_census.slot_capacity * 2);
   }
 
-  at = native_fiber_census_hash(p, native_fiber_census.slot_capacity);
+  at = checkheap_hash_word(
+    (uptr)TO_PTR(p), native_fiber_census.slot_capacity);
   while (native_fiber_census.slots[at] != NATIVE_FIBER_CENSUS_EMPTY) {
     size_t index = native_fiber_census.slots[at];
     if (native_fiber_census.entries[index].object == p)
@@ -1257,12 +1255,12 @@ static void native_fiber_census_fail(ptr object, const char *reason) {
   fprintf(stderr, "native-fiber census failure for %p: %s",
           TO_VOIDP(object), reason);
   if (entry != NULL && entry->fiber_seen) {
-    ptr control = RECORDINSTIT(object, native_fiber_control_index);
-    ptr flags = RECORDINSTIT(object, native_fiber_flags_index);
+    ptr control = NATIVE_FIBER_FIELD(object, control);
+    ptr flags = NATIVE_FIBER_FIELD(object, flags);
     fprintf(stderr,
             " (control=%p flags=%p context=%p current=%td claimed=%td pinned=%td)",
             TO_VOIDP(control), TO_VOIDP(flags),
-            TO_VOIDP(RECORDINSTIT(object, native_fiber_context_index)),
+            TO_VOIDP(NATIVE_FIBER_FIELD(object, context)),
             (ptrdiff_t)entry->current_count,
             (ptrdiff_t)entry->claimed_count,
             (ptrdiff_t)entry->pinned_count);
@@ -1336,14 +1334,14 @@ static void native_fiber_census_validate_record(
   native_fiber_census_entry *entry) {
   ptr fiber = entry->object;
   ptr control = (ptr)ATOMIC_LOAD_IPTR_ACQUIRE(
-    (iptr *)&RECORDINSTIT(fiber, native_fiber_control_index));
-  ptr flags = RECORDINSTIT(fiber, native_fiber_flags_index);
-  ptr context = RECORDINSTIT(fiber, native_fiber_context_index);
-  ptr handler_stack = RECORDINSTIT(fiber, native_fiber_handler_stack_index);
-  ptr initial_entry = RECORDINSTIT(fiber, native_fiber_entry_index);
-  ptr on_return = RECORDINSTIT(fiber, native_fiber_on_return_index);
-  ptr starter = RECORDINSTIT(fiber, native_fiber_starter_index);
-  ptr pinned_next = RECORDINSTIT(fiber, native_fiber_pinned_next_index);
+    (iptr *)&NATIVE_FIBER_FIELD(fiber, control));
+  ptr flags = NATIVE_FIBER_FIELD(fiber, flags);
+  ptr context = NATIVE_FIBER_FIELD(fiber, context);
+  ptr handler_stack = NATIVE_FIBER_FIELD(fiber, handler_stack);
+  ptr initial_entry = NATIVE_FIBER_FIELD(fiber, entry);
+  ptr on_return = NATIVE_FIBER_FIELD(fiber, on_return);
+  ptr starter = NATIVE_FIBER_FIELD(fiber, starter);
+  ptr pinned_next = NATIVE_FIBER_FIELD(fiber, pinned_next);
   iptr bits, state, owner, flag_bits;
   IBOOL schedulerp, pinnedp, migratablep;
   IBOOL owns_context = 0;
@@ -1351,7 +1349,7 @@ static void native_fiber_census_validate_record(
   if (!Sfixnump(control) || UNFIX(control) < 0 || !Sfixnump(flags)
       || UNFIX(flags) < 0
       || (UNFIX(flags) & ~native_fiber_flags_mask) != 0
-      || !Sfixnump(RECORDINSTIT(fiber, native_fiber_id_index)))
+      || !Sfixnump(NATIVE_FIBER_FIELD(fiber, id)))
     native_fiber_census_fail(fiber, "record metadata is malformed");
 
   bits = UNFIX(control);
@@ -1382,11 +1380,11 @@ static void native_fiber_census_validate_record(
   if (owner != 0 && native_fiber_census_owner_count(owner) != 1)
     native_fiber_census_fail(fiber, "owner does not identify one live worker");
 
-  if (RECORDINSTIT(fiber, native_fiber_incoming_source_index) != Sfalse
-      || RECORDINSTIT(fiber, native_fiber_incoming_payload_index) != Sfalse
-      || RECORDINSTIT(fiber, native_fiber_switch_control_index) != Sfalse
-      || RECORDINSTIT(fiber, native_fiber_commit_control_index) != Sfalse
-      || RECORDINSTIT(fiber, native_fiber_cache_context_index) != Sfalse)
+  if (NATIVE_FIBER_FIELD(fiber, incoming_source) != Sfalse
+      || NATIVE_FIBER_FIELD(fiber, incoming_payload) != Sfalse
+      || NATIVE_FIBER_FIELD(fiber, switch_control) != Sfalse
+      || NATIVE_FIBER_FIELD(fiber, commit_control) != Sfalse
+      || NATIVE_FIBER_FIELD(fiber, cache_context) != Sfalse)
     native_fiber_census_fail(fiber, "stable record retains transition scratch");
 
   switch (state) {
@@ -1470,7 +1468,7 @@ static void native_fiber_census_validate_workers(void) {
       native_fiber_census_entry *entry =
         native_fiber_census_require(current,
           "current root is not a strongly reachable native fiber");
-      ptr control = RECORDINSTIT(current, native_fiber_control_index);
+      ptr control = NATIVE_FIBER_FIELD(current, control);
       if (!Sfixnump(control)
           || (UNFIX(control) & native_fiber_state_mask)
                != native_fiber_state_running
@@ -1487,8 +1485,8 @@ static void native_fiber_census_validate_workers(void) {
       native_fiber_census_entry *entry =
         native_fiber_census_require(claimed,
           "claim root is not a strongly reachable native fiber");
-      ptr control = RECORDINSTIT(claimed, native_fiber_control_index);
-      ptr flags = RECORDINSTIT(claimed, native_fiber_flags_index);
+      ptr control = NATIVE_FIBER_FIELD(claimed, control);
+      ptr flags = NATIVE_FIBER_FIELD(claimed, flags);
       iptr old_state, old_owner;
       if (claimed == current || !Sfixnump(control)
           || !Sfixnump(claimed_control)
@@ -1510,7 +1508,7 @@ static void native_fiber_census_validate_workers(void) {
         native_fiber_census_fail(claimed,
           "claim rollback control disagrees with prior ownership");
       if ((old_state == native_fiber_state_new)
-          != Sprocedurep(RECORDINSTIT(claimed, native_fiber_entry_index)))
+          != Sprocedurep(NATIVE_FIBER_FIELD(claimed, entry)))
         native_fiber_census_fail(claimed,
           "claim rollback state disagrees with execution roots");
       entry->claimed_count += 1;
@@ -1522,8 +1520,8 @@ static void native_fiber_census_validate_workers(void) {
       native_fiber_census_entry *entry =
         native_fiber_census_require(node,
           "pinned-list node is not a strongly reachable native fiber");
-      ptr control = RECORDINSTIT(node, native_fiber_control_index);
-      ptr flags = RECORDINSTIT(node, native_fiber_flags_index);
+      ptr control = NATIVE_FIBER_FIELD(node, control);
+      ptr flags = NATIVE_FIBER_FIELD(node, flags);
       iptr state;
       if (entry->pinned_count != 0)
         native_fiber_census_fail(node, "pinned-list node is duplicated or cyclic");
@@ -1539,7 +1537,7 @@ static void native_fiber_census_validate_workers(void) {
         native_fiber_census_fail(node, "pinned-list membership disagrees with lifecycle");
       entry->pinned_count = 1;
       entry->pinned_tc = tc;
-      node = RECORDINSTIT(node, native_fiber_pinned_next_index);
+      node = NATIVE_FIBER_FIELD(node, pinned_next);
     }
 
     if (NATIVEFIBERPREEMPTTARGET(tc) == Sfalse) {
@@ -1552,11 +1550,11 @@ static void native_fiber_census_validate_workers(void) {
       ptr current_flags;
       (void)native_fiber_census_require(target,
         "preemption target is not a strongly reachable native fiber");
-      target_control = RECORDINSTIT(target, native_fiber_control_index);
-      target_flags = RECORDINSTIT(target, native_fiber_flags_index);
+      target_control = NATIVE_FIBER_FIELD(target, control);
+      target_flags = NATIVE_FIBER_FIELD(target, flags);
       current_flags = current == Sfalse
                         ? Sfalse
-                        : RECORDINSTIT(current, native_fiber_flags_index);
+                        : NATIVE_FIBER_FIELD(current, flags);
       if (current == Sfalse || !Sfixnump(target_control)
           || target == current || !Sfixnump(target_flags)
           || !Sfixnump(current_flags)
@@ -1592,8 +1590,8 @@ static void native_fiber_census_verify(void) {
   for (i = 0; i < native_fiber_census.entry_count; i += 1) {
     native_fiber_census_entry *entry = &native_fiber_census.entries[i];
     if (entry->fiber_seen) {
-      ptr control = RECORDINSTIT(entry->object, native_fiber_control_index);
-      ptr flags = RECORDINSTIT(entry->object, native_fiber_flags_index);
+      ptr control = NATIVE_FIBER_FIELD(entry->object, control);
+      ptr flags = NATIVE_FIBER_FIELD(entry->object, flags);
       iptr state = UNFIX(control) & native_fiber_state_mask;
       IBOOL schedulerp = (UNFIX(flags) & native_fiber_flag_scheduler) != 0;
       IBOOL pinnedp = (UNFIX(flags) & native_fiber_flag_pinned) != 0;
@@ -1956,13 +1954,6 @@ static void checkmark_object(ptr p);
 #define SHADOW_OFFICIAL_WORDS \
   ((segment_bitmap_bytes + sizeof(uptr) - 1) / sizeof(uptr))
 
-static size_t shadow_segment_hash(uptr segment, size_t capacity) {
-  segment ^= segment >> 17;
-  segment *= (uptr)0xed5ad4bbU;
-  segment ^= segment >> 11;
-  return (size_t)segment & (capacity - 1);
-}
-
 static void shadow_rehash(size_t capacity) {
   shadow_segment *old_segments = shadow.segments;
   size_t old_capacity = shadow.segment_capacity;
@@ -1984,7 +1975,7 @@ static void shadow_rehash(size_t capacity) {
   if (old_segments != NULL) {
     for (i = 0; i < old_capacity; i += 1) {
       if (old_segments[i].segment != SHADOW_EMPTY_SEGMENT) {
-        size_t at = shadow_segment_hash(old_segments[i].segment, capacity);
+        size_t at = checkheap_hash_word(old_segments[i].segment, capacity);
         while (shadow.segments[at].segment != SHADOW_EMPTY_SEGMENT)
           at = (at + 1) & (capacity - 1);
         shadow.segments[at] = old_segments[i];
@@ -2007,7 +1998,7 @@ static shadow_segment *shadow_find_segment(uptr segment, IBOOL create) {
     shadow_rehash(shadow.segment_capacity * 2);
   }
 
-  at = shadow_segment_hash(segment, shadow.segment_capacity);
+  at = checkheap_hash_word(segment, shadow.segment_capacity);
   while (shadow.segments[at].segment != SHADOW_EMPTY_SEGMENT) {
     if (shadow.segments[at].segment == segment)
       return &shadow.segments[at];
@@ -2188,14 +2179,6 @@ static void shadow_drain_expected(void) {
 
 #define SHADOW_GUARDIAN_EMPTY ((size_t)-1)
 
-static size_t shadow_guardian_hash(ptr entry, size_t capacity) {
-  uptr n = (uptr)TO_PTR(entry);
-  n ^= n >> 17;
-  n *= (uptr)0xed5ad4bbU;
-  n ^= n >> 11;
-  return (size_t)n & (capacity - 1);
-}
-
 static void shadow_guardian_rehash(size_t capacity) {
   size_t *old_slots = shadow.guardian_slots;
   size_t old_capacity = shadow.guardian_slot_capacity;
@@ -2212,8 +2195,8 @@ static void shadow_guardian_rehash(size_t capacity) {
     for (i = 0; i < old_capacity; i += 1) {
       size_t index = old_slots[i];
       if (index != SHADOW_GUARDIAN_EMPTY) {
-        size_t at = shadow_guardian_hash(
-          shadow.guardian_entries[index].entry, capacity);
+        size_t at = checkheap_hash_word(
+          (uptr)TO_PTR(shadow.guardian_entries[index].entry), capacity);
         while (shadow.guardian_slots[at] != SHADOW_GUARDIAN_EMPTY)
           at = (at + 1) & (capacity - 1);
         shadow.guardian_slots[at] = index;
@@ -2227,7 +2210,8 @@ static shadow_guardian_entry *shadow_find_guardian(ptr entry) {
   size_t at;
 
   if (shadow.guardian_slot_capacity == 0) return NULL;
-  at = shadow_guardian_hash(entry, shadow.guardian_slot_capacity);
+  at = checkheap_hash_word(
+    (uptr)TO_PTR(entry), shadow.guardian_slot_capacity);
   while (shadow.guardian_slots[at] != SHADOW_GUARDIAN_EMPTY) {
     shadow_guardian_entry *g =
       &shadow.guardian_entries[shadow.guardian_slots[at]];
@@ -2316,7 +2300,8 @@ static void shadow_add_guardian(ptr entry, IBOOL eligible) {
     g->ftype_counter = shadow_add_ftype_counter(TO_VOIDP(address));
   }
 
-  at = shadow_guardian_hash(entry, shadow.guardian_slot_capacity);
+  at = checkheap_hash_word(
+    (uptr)TO_PTR(entry), shadow.guardian_slot_capacity);
   while (shadow.guardian_slots[at] != SHADOW_GUARDIAN_EMPTY)
     at = (at + 1) & (shadow.guardian_slot_capacity - 1);
   shadow.guardian_slots[at] = index;
@@ -2509,6 +2494,10 @@ static void shadow_reset(void) {
   free(shadow.guardian_slots);
   free(shadow.ftype_counters);
   memset(&shadow, 0, sizeof(shadow));
+}
+
+static void checkheap_verifier_reset(void) {
+  shadow_reset();
   native_fiber_census_reset();
 }
 
@@ -2545,19 +2534,24 @@ void S_checkheap_begin_mark_check(IGEN mcg, IGEN min_tg, IGEN max_tg,
   uptr i;
   ptr ls;
 
-  shadow_reset();
+  checkheap_verifier_reset();
   shadow.phase = SHADOW_PHASE_PREPARING;
   native_fiber_census.active = 1;
   shadow.maximum_collected_generation = mcg;
   shadow.minimum_target_generation = min_tg;
   shadow.maximum_target_generation = max_tg;
 
+  gc_test_phase_lock();
+  S_checkheap_test_mark_started = 1;
   if (S_checkheap_test_mark_action != 0) {
     seginfo *si = MaybeSegInfo(
       ptr_get_segment(S_checkheap_test_mark_target));
-    if (si == NULL || si->generation > mcg)
+    if (si == NULL || si->generation > mcg) {
+      gc_test_phase_unlock();
       S_error_abort("checkheap mark fault target is not collected");
+    }
   }
+  gc_test_phase_unlock();
 
   for (g = 0; g <= mcg; INCRGEN(g))
     for (s = 0; s <= max_real_space; s += 1) {
@@ -2710,8 +2704,11 @@ void S_checkheap_verify_mark_check(void) {
     shift = (byte % sizeof(uptr)) * 8;
     ss->official_bits[word] |= ((uptr)segment_bitmap_bit(p)) << shift;
   }
+  gc_test_phase_lock();
   S_checkheap_test_mark_target = (ptr)0;
   S_checkheap_test_mark_action = 0;
+  S_checkheap_test_mark_started = 0;
+  gc_test_phase_unlock();
   if (shadow.phase != SHADOW_PHASE_COLLECTING) return;
   shadow_compare_official("initial", 1);
 }
@@ -2853,7 +2850,7 @@ void S_checkheap_verify_finalization_check(seginfo *oldspacesegments) {
   shadow_compare_official("finalization", 0);
   shadow_verify_weak_entries();
   shadow_verify_ephemerons();
-  shadow_reset();
+  checkheap_verifier_reset();
 }
 
 static void shadow_check_heap(IGEN mcg) {
@@ -2893,7 +2890,7 @@ static void shadow_check_heap(IGEN mcg) {
   /* The collector may retain objects reached from temporary GC roots that no
    * longer exist here. The useful independent check is therefore one-way:
    * every object reachable now must have survived the collector. */
-  shadow_reset();
+  checkheap_verifier_reset();
 }
 
 #ifdef PTHREADS

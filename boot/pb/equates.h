@@ -101,8 +101,8 @@ typedef uint64_t U64;
 #define bytevector_length_factor 0x8
 #define bytevector_length_offset 0x3
 #define bytevector_type_disp 0x1
-#define c_entry_name_vector #(thread-context get-thread-context handle-apply-overflood handle-docall-error handle-overflow handle-overflood handle-nonprocedure-symbol thread-list split-and-resize raw-collect-cond raw-collect-thread0-cond raw-tc-mutex raw-terminated-cond activate-thread deactivate-thread unactivate-thread save-errno save-last-error handle-values-error handle-mvlet-error handle-arg-error handle-event-detour foreign-entry install-library-entry get-more-room scan-remembered-set instantiate-code-object Sreturn Scall-one-result Scall-any-results segment-info bignum-mask-test flfloor flceiling flround fltruncate flsin flcos fltan flasin flacos flatan flatan2 flexp fllog fllog2 flexpt flsqrt null-immutable-vector null-immutable-bytevector null-immutable-string)
-#define c_entry_vector_size 0x33
+#define c_entry_name_vector #(thread-context get-thread-context handle-apply-overflood handle-docall-error handle-overflow handle-overflood handle-nonprocedure-symbol thread-list split-and-resize raw-collect-cond raw-collect-thread0-cond raw-tc-mutex raw-terminated-cond activate-thread deactivate-thread unactivate-thread save-errno save-last-error handle-values-error handle-mvlet-error handle-arg-error handle-event-detour foreign-entry install-library-entry get-more-room scan-remembered-set instantiate-code-object Sreturn Scall-one-result Scall-any-results segment-info bignum-mask-test flfloor flceiling flround fltruncate flsin flcos fltan flasin flacos flatan flatan2 flexp fllog fllog2 flexpt flsqrt null-immutable-vector null-immutable-bytevector null-immutable-string native-fiber-transition)
+#define c_entry_vector_size 0x34
 #define cached_stack_link_disp 0x8
 #define cached_stack_size_disp 0x0
 #define card_offset_bits 0x9
@@ -556,7 +556,15 @@ typedef uint64_t U64;
 #define native_fiber_state_parking 0x3
 #define native_fiber_state_running 0x2
 #define native_fiber_switch_control_disp 0x49
+#define native_fiber_transition_phase_commit 0x2
+#define native_fiber_transition_phase_install 0x1
+#define native_fiber_transition_phase_invalid_return 0x5
+#define native_fiber_transition_phase_post_install_test 0x3
 #define native_fiber_type_disp 0x1
+#define native_fiber_worker_error_preemption 0x4
+#define native_fiber_worker_error_switch_prohibited 0x1
+#define native_fiber_worker_error_test_hook 0x8
+#define native_fiber_worker_error_transition 0x2
 #define never_immutable_flag 0x0
 #define one_shot_headroom 0xC00
 #define open_fd_append 0x8
@@ -1402,6 +1410,7 @@ typedef uint64_t U64;
 #define CENTRY_handle_values_error 18
 #define CENTRY_install_library_entry 23
 #define CENTRY_instantiate_code_object 26
+#define CENTRY_native_fiber_transition 51
 #define CENTRY_null_immutable_bytevector 49
 #define CENTRY_null_immutable_string 50
 #define CENTRY_null_immutable_vector 48

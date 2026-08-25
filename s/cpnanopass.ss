@@ -5221,9 +5221,8 @@
           (lambda ()
             (with-output-language (L13 Effect)
               (%seq
-                ;; `handle-event-detour` is also the runtime's closed-switch
-                ;; invariant gate. Mark the transition so the C entry aborts
-                ;; instead of constructing an event resumption.
+                ;; Mark an otherwise invalid phase so the closed-switch C
+                ;; entry aborts without constructing an event resumption.
                 (set! ,(%tc-ref native-fiber-transition) ,(%constant strue))
                 ,(with-saved-ret-reg
                    (with-saved-scheme-state
@@ -5231,9 +5230,9 @@
                      (out %ac0 %ac1 %cp %xp %yp %ts %td scheme-args extra-regs)
                      `(inline
                         ,(make-info-c-simple-call #t
-                           (lookup-c-entry handle-event-detour))
+                           (lookup-c-entry native-fiber-transition))
                         ,%c-simple-call)))))))
-        (define native-fiber-publish-control
+        (define native-fiber-transition-dispatch
           (lambda (phase)
             (with-output-language (L13 Effect)
               (%seq
@@ -5246,14 +5245,14 @@
                          (out %ts %td %ac0 %cp %xp %yp scheme-args extra-regs)
                          `(inline
                             ,(make-info-c-simple-call #t
-                               (lookup-c-entry handle-event-detour))
+                               (lookup-c-entry native-fiber-transition))
                             ,%c-simple-call))
                        (with-saved-scheme-state
                          (in)
                          (out %ts %td %ac0 %ac1 %cp %xp %yp scheme-args extra-regs)
                          `(inline
                             ,(make-info-c-simple-call #t
-                               (lookup-c-entry handle-event-detour))
+                               (lookup-c-entry native-fiber-transition))
                             ,%c-simple-call))))))))
         (define-who verify-native-fiber-raw-entry
           (lambda (name le)
@@ -5653,7 +5652,8 @@
                     ;; by a nonallocating runtime primitive. Keeping CAS out of
                     ;; this entry avoids the backend's extra unspillable CAS
                     ;; temporaries on register-constrained architectures.
-                    ,(native-fiber-publish-control 1)
+                    ,(native-fiber-transition-dispatch
+                       (constant native-fiber-transition-phase-install))
                     (set! ,%xp ,(ref-reg %ac1))
                     (set! ,(%tc-ref current-native-fiber) ,%xp)
                     (set! ,%td ,%xp)
@@ -5710,7 +5710,9 @@
                                   ,(%tc-ref native-fiber-test-active)
                                   ,(%constant sfalse))
                                (nop)
-                               ,(native-fiber-publish-control 3))
+                               ,(native-fiber-transition-dispatch
+                                  (constant
+                                    native-fiber-transition-phase-post-install-test)))
                            (jump
                              (literal
                                ,(make-info-literal #f 'library-code
@@ -5777,7 +5779,8 @@
                                   ,(%constant strue))
                                (nop)
                                ,(native-fiber-invariant-failure))
-                           ,(native-fiber-publish-control 2)
+                           ,(native-fiber-transition-dispatch
+                              (constant native-fiber-transition-phase-commit))
                            (set! ,%td ,(%tc-ref current-native-fiber))
                            (set! ,(%mref ,%td
                                     ,(constant native-fiber-incoming-source-disp))
@@ -5814,7 +5817,9 @@
                                   ,(%mref ,%xp
                                      ,(constant continuation-return-address-disp))
                                   ,(%constant sfalse))
-                               ,(native-fiber-publish-control 5)
+                               ,(native-fiber-transition-dispatch
+                                  (constant
+                                    native-fiber-transition-phase-invalid-return))
                                (nop))
                            (set! ,(%mref ,%xp
                                     ,(constant continuation-stack-disp))

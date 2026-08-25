@@ -486,8 +486,9 @@
         (string-append "\"" (list->string (subst #\\ #\/ (string->list p))) "\"")
         p)))
 
-(module separate-eval-tools (separate-eval run-script separate-compile)
-  (define (slurp ip)
+(module separate-eval-tools
+    (separate-eval run-script separate-compile slurp-port)
+  (define (slurp-port ip)
     (with-output-to-string
       (lambda ()
         (let f ()
@@ -503,8 +504,8 @@
       (pretty-print `(#%$enable-check-prelex-flags ,(#%$enable-check-prelex-flags)) to-stdin)
       (for-each (lambda (expr) (pretty-print expr to-stdin)) expr*)
       (close-port to-stdin)
-      (let* ([stdout-stuff (slurp from-stdout)]
-             [stderr-stuff (slurp from-stderr)])
+      (let* ([stdout-stuff (slurp-port from-stdout)]
+             [stderr-stuff (slurp-port from-stderr)])
         (when (string=? stderr-stuff "")
           (printf "$separate-eval command succeeded with\nSTDERR:\n~a\nSTDOUT:\n~a\nEND\n" stderr-stuff stdout-stuff))
         (unless (string=? stderr-stuff "")
@@ -523,8 +524,8 @@
                     (buffer-mode block)
                     (native-transcoder))])
       (close-port to-stdin)
-      (let* ([stdout-stuff (slurp from-stdout)]
-             [stderr-stuff (slurp from-stderr)])
+      (let* ([stdout-stuff (slurp-port from-stdout)]
+             [stderr-stuff (slurp-port from-stderr)])
         (unless (string=? stderr-stuff "")
           (errorf 'run-script "~a" stderr-stuff))
         (close-port from-stdout)
@@ -536,6 +537,56 @@
       [(cf x) ($separate-eval 'separate-compile `((,cf ,(if (symbol? x) (format "testfile-~a" x) x))))])))
 
 (import separate-eval-tools)
+
+(module native-fiber-test-tools
+    (native-fiber-return-handler native-fiber-dynamic-return-handler
+     native-fiber-resume-on-new-thread
+     native-fiber-control-field-index native-fiber-context-field-index
+     native-fiber-handler-stack-field-index native-fiber-entry-field-index
+     native-fiber-incoming-source-field-index
+     native-fiber-incoming-payload-field-index
+     native-fiber-flags-field-index native-fiber-pinned-next-field-index)
+  ;; Unsafe record mutation tests name fields here so the VM layout is not
+  ;; restated as unexplained integers throughout the test suite.
+  (define native-fiber-control-field-index 0)
+  (define native-fiber-context-field-index 1)
+  (define native-fiber-handler-stack-field-index 2)
+  (define native-fiber-entry-field-index 3)
+  (define native-fiber-incoming-source-field-index 6)
+  (define native-fiber-incoming-payload-field-index 7)
+  (define native-fiber-flags-field-index 11)
+  (define native-fiber-pinned-next-field-index 13)
+
+  (define (native-fiber-return-handler scheduler)
+    (lambda (fiber outcome)
+      (#3%$native-fiber-try-claim! scheduler)
+      (#3%$native-fiber-finish fiber scheduler outcome)))
+
+  (define (native-fiber-dynamic-return-handler scheduler)
+    (lambda (fiber outcome)
+      (let ([scheduler (scheduler)])
+        (#3%$native-fiber-try-claim! scheduler)
+        (#3%$native-fiber-finish fiber scheduler outcome))))
+
+  (define native-fiber-resume-on-new-thread
+    (case-lambda
+      [(task payload install-scheduler!)
+       (native-fiber-resume-on-new-thread task payload install-scheduler!
+         (lambda (scheduler task payload)
+           (#3%$native-fiber-switch scheduler task payload)))]
+      [(task payload install-scheduler! transfer)
+       (let ([result #f])
+         (thread-join
+           (fork-thread
+             (lambda ()
+               (let ([scheduler (#3%$native-fiber-adopt 0)])
+                 (install-scheduler! scheduler)
+                 (set! result
+                   (and (#3%$native-fiber-try-claim! task)
+                        (transfer scheduler task payload)))))))
+         result)])))
+
+(import native-fiber-test-tools)
 
 #;(collect-request-handler
   (begin

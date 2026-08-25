@@ -551,6 +551,10 @@ typedef struct thread_gc {
 
 #define PTRFIELD(x,disp) (*(ptr *)TO_VOIDP(((uptr)(x)+disp)))
 #define INITPTRFIELD(x,disp) (*(ptr *)TO_VOIDP(((uptr)(x)+disp)))
+#ifdef native_fiber_control_disp
+# define NATIVE_FIBER_FIELD(x,field) \
+    PTRFIELD((x), native_fiber_ ## field ## _disp)
+#endif
 #define SETPTRFIELD(x,disp,y) DIRTYSET(((ptr *)TO_VOIDP((uptr)(x)+disp)),(y))
 
 #define INCRGEN(g) (g = g == S_G.max_nonstatic_generation ? static_generation : g+1)

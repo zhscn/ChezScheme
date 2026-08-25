@@ -22,6 +22,14 @@
            *scheme* *mats-dir*
            *fuzz* ~= fl~= cfl~= == nan pi +pi +pi/2 +pi/4 -pi -pi/2 -pi/4 +e -e
            separate-eval-tools separate-compile separate-eval run-script patch-exec-path $record->vector
+           slurp-port native-fiber-test-tools native-fiber-return-handler
+           native-fiber-dynamic-return-handler
+           native-fiber-resume-on-new-thread
+           native-fiber-control-field-index native-fiber-context-field-index
+           native-fiber-handler-stack-field-index native-fiber-entry-field-index
+           native-fiber-incoming-source-field-index
+           native-fiber-incoming-payload-field-index
+           native-fiber-flags-field-index native-fiber-pinned-next-field-index
            $cat_flush
            test-cp0-expansion
            mkfile rm-rf touch find-source path-build-normal path-equal?
@@ -1113,55 +1121,15 @@
   ;; boundaries where the VM would otherwise acquire stack ownership.
   (let ([fiber (#3%$native-fiber-create values values #b100)])
     ;; state=new with a nonzero owner
-    (#3%$record-set! fiber 0 #b1000)
+    (#3%$record-set! fiber native-fiber-control-field-index #b1000)
     (guard (condition [else #t])
       (#3%$native-fiber-try-claim! fiber)
       #f))
   (let ([fiber (#3%$native-fiber-create values values #b100)])
     ;; reserved lifecycle state
-    (#3%$record-set! fiber 0 #b111)
+    (#3%$record-set! fiber native-fiber-control-field-index #b111)
     (guard (condition [else #t])
       (#3%$native-fiber-state fiber)
-      #f))
-  (let ([fiber (#3%$native-fiber-create values values #b100)])
-    ;; missing parked-stack descriptor
-    (#3%$record-set! fiber 1 #f)
-    (and (guard (condition [else #t])
-           (#3%$native-fiber-try-claim! fiber)
-           #f)
-         ;; Validation precedes the ownership CAS, so rejection cannot poison
-         ;; the otherwise intact lifecycle state.
-         (eq? (#3%$native-fiber-state fiber) 'new)))
-  (let ([fiber (#3%$native-fiber-create values values #b100)]
-        [ordinary-context #f])
-    (call/cc
-      (lambda (k)
-        (set! ordinary-context k)
-        (void)))
-    ;; A generic continuation is not a native stack descriptor even when all
-    ;; of its public continuation metadata is structurally plausible.
-    (#3%$record-set! fiber 1 ordinary-context)
-    (and (guard (condition [else #t])
-           (#3%$native-fiber-try-claim! fiber)
-           #f)
-         (eq? (#3%$native-fiber-state fiber) 'new)))
-  (let ([fiber (#3%$native-fiber-create values values #b100)])
-    ;; transition scratch must be empty in every externally visible state
-    (#3%$record-set! fiber 6 fiber)
-    (guard (condition [else #t])
-      (#3%$native-fiber-try-claim! fiber)
-      #f))
-  (let ([fiber (#3%$native-fiber-create values values #b100)])
-    ;; task flags must select exactly one of pinned or migratable
-    (#3%$record-set! fiber 11 0)
-    (guard (condition [else #t])
-      (#3%$native-fiber-try-claim! fiber)
-      #f))
-  (let ([fiber (#3%$native-fiber-create values values #b100)])
-    ;; Initial entry roots form one indivisible trampoline state.
-    (#3%$record-set! fiber 3 #f)
-    (guard (condition [else #t])
-      (#3%$native-fiber-try-claim! fiber)
       #f))
   (let* ([scheduler (#3%$current-native-fiber)]
          [fiber (#3%$native-fiber-create values values #b100)]
@@ -1169,13 +1137,13 @@
     ;; A saved handler chain must be proper and acyclic.
     (#3%$native-fiber-try-claim! fiber)
     (set-cdr! handlers handlers)
-    (#3%$record-set! fiber 2 handlers)
+    (#3%$record-set! fiber native-fiber-handler-stack-field-index handlers)
     (let ([rejected?
            (parameterize ([#%$enable-check-heap #t])
              (guard (condition [else #t])
                (#3%$native-fiber-switch scheduler fiber 'corrupt)
                #f))])
-      (#3%$record-set! fiber 2 #f)
+      (#3%$record-set! fiber native-fiber-handler-stack-field-index #f)
       (#3%$native-fiber-release-claim! fiber)
       rejected?))
   (let* ([tc (#3%$tc)]
@@ -1312,9 +1280,7 @@
     (set! task
       (#3%$native-fiber-create
         (lambda () (descend 7))
-        (lambda (fiber outcome)
-          (#3%$native-fiber-try-claim! scheduler)
-          (#3%$native-fiber-finish fiber scheduler outcome))
+        (native-fiber-return-handler scheduler)
         #b100))
     (#3%$native-fiber-try-claim! task)
     (let loop ([i 0] [transfer (#3%$native-fiber-switch scheduler task 'start)])
@@ -1337,9 +1303,7 @@
     (set! task
       (#3%$native-fiber-create
         (lambda () 'done)
-        (lambda (fiber outcome)
-          (#3%$native-fiber-try-claim! scheduler)
-          (#3%$native-fiber-finish fiber scheduler outcome))
+        (native-fiber-return-handler scheduler)
         #b100))
     (#3%$native-fiber-try-claim! task)
     (dynamic-wind
@@ -1374,9 +1338,7 @@
               (#3%$native-fiber-switch task scheduler i)
               (loop (fx- i 1))))
           'done)
-        (lambda (fiber outcome)
-          (#3%$native-fiber-try-claim! scheduler)
-          (#3%$native-fiber-finish fiber scheduler outcome))
+        (native-fiber-return-handler scheduler)
         #b001))
     (let loop ([remaining rounds])
       (#3%$native-fiber-try-claim! task)
@@ -1427,9 +1389,7 @@
       (set! task
         (#3%$native-fiber-create
           (lambda () (descend))
-          (lambda (fiber outcome)
-            (#3%$native-fiber-try-claim! scheduler)
-            (#3%$native-fiber-finish fiber scheduler outcome))
+          (native-fiber-return-handler scheduler)
           #b100))
       ;; Promote the record and initial context.  Each later park attaches a
       ;; newly allocated descriptor and handler stack to this old record.
@@ -1490,9 +1450,7 @@
                   (#3%$tc-field 'native-fiber-preempt-payload tc #f)
                   (#3%$tc-field 'native-fiber-preempt-target tc #f)
                   (#3%$tc-field 'native-fiber-preempt-active tc #f)))))
-          (lambda (fiber outcome)
-            (#3%$native-fiber-try-claim! scheduler)
-            (#3%$native-fiber-finish fiber scheduler outcome))
+          (native-fiber-return-handler scheduler)
           #b100))
       (#3%$native-fiber-try-claim! task)
       (equal? (#3%$native-fiber-switch scheduler task 'start)
@@ -1537,9 +1495,7 @@
                           "unexpected resume payload"))))
                 (lambda () (note! 'inner-out))))
             (lambda () (note! 'outer-out))))
-        (lambda (fiber outcome)
-          (#3%$native-fiber-try-claim! scheduler)
-          (#3%$native-fiber-finish fiber scheduler outcome))
+        (native-fiber-return-handler scheduler)
         #b100))
     (#3%$native-fiber-try-claim! task)
     (let ([first
@@ -1606,9 +1562,7 @@
                   [else (error 'native-fiber-continuations
                           "unexpected one-shot value")]))
               (and marks-ok? (task-marks-ok?)))))
-        (lambda (fiber outcome)
-          (#3%$native-fiber-try-claim! scheduler)
-          (#3%$native-fiber-finish fiber scheduler outcome))
+        (native-fiber-return-handler scheduler)
         #b100))
     (#3%$native-fiber-try-claim! task)
     (let loop ([expected '(multi-first multi-second one-first)])

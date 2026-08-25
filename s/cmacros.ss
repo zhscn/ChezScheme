@@ -1739,6 +1739,18 @@
 (define-constant native-fiber-flag-debug #b1000)
 (define-constant native-fiber-flags-mask #b1111)
 
+;; Closed-switch phases passed to the nonallocating C transaction entry.
+(define-constant native-fiber-transition-phase-install 1)
+(define-constant native-fiber-transition-phase-commit 2)
+(define-constant native-fiber-transition-phase-post-install-test 3)
+(define-constant native-fiber-transition-phase-invalid-return 5)
+
+;; Error bits returned by the worker snapshot validator.
+(define-constant native-fiber-worker-error-switch-prohibited #b0001)
+(define-constant native-fiber-worker-error-transition #b0010)
+(define-constant native-fiber-worker-error-preemption #b0100)
+(define-constant native-fiber-worker-error-test-hook #b1000)
+
 (define-primitive-structure-disps rtd-counts type-typed-object
   ([iptr type]
    [U64 timestamp]
@@ -3237,7 +3249,8 @@
      flsqrt
      null-immutable-vector
      null-immutable-bytevector
-     null-immutable-string))
+     null-immutable-string
+     native-fiber-transition))
 )
 
 
