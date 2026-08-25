@@ -1455,24 +1455,48 @@
 
 (mat native-fiber-preemption-gc-roots
   (parameterize ([#%$enable-check-heap #t])
-    (let* ([tc (#3%$tc)]
-           [payload (vector 'deferred-preemption-payload)]
-           [weak (weak-cons payload #f)])
-      (dynamic-wind
-        (lambda ()
-          (#3%$tc-field 'native-fiber-preempt-payload tc payload))
-        (lambda ()
-          ;; Leave the TC slot as the sole strong reference across a maximal
-          ;; collection. The independent heap walk also verifies that the
-          ;; collector marked the object reached through this root.
-          (set! payload #f)
-          (collect (collect-maximum-generation))
-          (let ([root (#3%$tc-field 'native-fiber-preempt-payload tc)])
-            (and (vector? root)
-                 (eq? (vector-ref root 0) 'deferred-preemption-payload)
-                 (eq? (car weak) root))))
-        (lambda ()
-          (#3%$tc-field 'native-fiber-preempt-payload tc #f))))))
+    (let* ([scheduler (#3%$current-native-fiber)]
+           [task #f])
+      (set! task
+        (#3%$native-fiber-create
+          (lambda ()
+            (let* ([tc (#3%$tc)]
+                   [payload (vector 'deferred-preemption-payload)]
+                   [weak (weak-cons payload #f)])
+              (dynamic-wind
+                (lambda ()
+                  ;; Reproduce the timer-handler publication window. The
+                  ;; active flag suppresses consumption until the synthetic
+                  ;; handler has retired its request.
+                  (#3%$tc-field 'native-fiber-preempt-active tc #t)
+                  (#3%$tc-field
+                    'native-fiber-preempt-payload tc payload)
+                  (#3%$tc-field
+                    'native-fiber-preempt-target tc scheduler))
+                (lambda ()
+                  ;; Leave the TC slot as the sole strong payload reference.
+                  ;; The independent heap walk also validates the complete
+                  ;; deferred-preemption state while marking this root.
+                  (set! payload #f)
+                  (collect (collect-maximum-generation))
+                  (let ([root
+                         (#3%$tc-field
+                           'native-fiber-preempt-payload tc)])
+                    (and (vector? root)
+                         (eq? (vector-ref root 0)
+                              'deferred-preemption-payload)
+                         (eq? (car weak) root))))
+                (lambda ()
+                  (#3%$tc-field 'native-fiber-preempt-payload tc #f)
+                  (#3%$tc-field 'native-fiber-preempt-target tc #f)
+                  (#3%$tc-field 'native-fiber-preempt-active tc #f)))))
+          (lambda (fiber outcome)
+            (#3%$native-fiber-try-claim! scheduler)
+            (#3%$native-fiber-finish fiber scheduler outcome))
+          #b100))
+      (#3%$native-fiber-try-claim! task)
+      (equal? (#3%$native-fiber-switch scheduler task 'start)
+              '(return . #t)))))
 
 (mat native-fiber-dynamic-unwind
   (let* ([scheduler (#3%$current-native-fiber)]
