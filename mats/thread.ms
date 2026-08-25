@@ -1743,6 +1743,10 @@
                  needle)
                (loop (fx+ start 1)))))))
 
+(define (native-fiber-test-scheme-command)
+  (or (getenv "CHEZ_MAT_SCHEME_COMMAND")
+      (patch-exec-path *scheme*)))
+
 (define (native-fiber-run-hook-point point gc-generation)
   (let ([task #f]
         [scheduler #f]
@@ -1941,7 +1945,7 @@
             (loop (cons char chars))))))
   (let-values ([(to-stdin from-stdout from-stderr pid)
                 (open-process-ports
-                  (format "~a -q" (patch-exec-path *scheme*))
+                  (format "~a -q" (native-fiber-test-scheme-command))
                   (buffer-mode block)
                   (native-transcoder))])
     (for-each
@@ -2018,7 +2022,7 @@
             (loop (cons char chars))))))
   (let-values ([(to-stdin from-stdout from-stderr pid)
                 (open-process-ports
-                  (format "~a -q" (patch-exec-path *scheme*))
+                  (format "~a -q" (native-fiber-test-scheme-command))
                   (buffer-mode block)
                   (native-transcoder))])
     (for-each
@@ -2054,7 +2058,7 @@
             (loop (cons char chars))))))
   (let-values ([(to-stdin from-stdout from-stderr pid)
                 (open-process-ports
-                  (format "~a -q" (patch-exec-path *scheme*))
+                  (format "~a -q" (native-fiber-test-scheme-command))
                   (buffer-mode block)
                   (native-transcoder))])
     (for-each

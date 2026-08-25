@@ -56,6 +56,9 @@
       (hash-ref config 'workers)
       " CHEZ_MAT_NAME_PREFIX=native-fiber-"
       " bin/zuo " (~s main.zuo) " thread.mo noisy=t"
+      (if (hash-ref config 'scheme #f)
+          (~a " " (~s (~a "SCHEME=" (hash-ref config 'scheme))))
+          "")
       (if (hash-ref config 'compiler-poison? #f)
           (~a " cds=" seed " cdrs=" (next-seed seed))
           "")))
@@ -101,9 +104,14 @@
         (if (hash-ref config 'compiler-poison? #f)
             (list (~a "cds=" seed) (~a "cdrs=" (next-seed seed)))
             '()))
+      (define scheme-args
+        (if (hash-ref config 'scheme #f)
+            (list (~a "SCHEME=" (hash-ref config 'scheme)))
+            '()))
       (define child
         (process zuo.exe main.zuo
-                 (append (list "thread.mo" "noisy=t") poison-args)
+                 (append (list "thread.mo" "noisy=t")
+                         scheme-args poison-args)
                  (hash 'dir root 'env env)))
       (define child-process (hash-ref child 'process))
       (process-wait child-process)
@@ -123,6 +131,7 @@
                  'publication-rounds 10000
                  'claim-rounds 512
                  'workers 6
+                 'scheme #f
                  'compiler-poison? #f)
      :once-each
      [config "--workarea" path "Use the built workarea at <path>"
@@ -152,6 +161,11 @@
      [config "--workers" count "Use <count> workers in concurrent tests"
              (hash-set config 'workers
                        (parse-at-least "workers" count 2))]
+     [config "--scheme" command
+             "Run mats through the Scheme <command>"
+             (if (string=? command "")
+                 (error "scheme command must not be empty")
+                 (hash-set config 'scheme command))]
      [config "--compiler-poison"
              "Vary dead stack-slot and register poison seeds on every run"
              (hash-set config 'compiler-poison? #t)]))

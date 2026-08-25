@@ -355,7 +355,7 @@
 
   (define-values (call-with-scheme run-scheme/status run-scheme)
     (make-run-scheme at-source at-dir lookup
-                     #f (at-dir "..") m
+                     (lookup 'SCHEME) (at-dir "..") m
                      (source-directories)
                      (library-directories)
                      (let ([init-env (hash-ref (runtime-env) 'env)])
@@ -363,6 +363,21 @@
                        (define lib-env
                          (filter (lambda (p) (not (string=? (car p) "CHEZSCHEMELIBDIRS")))
                                  init-env))
+                       ;; Preserve an explicit Scheme command for tests that
+                       ;; launch a nested Scheme process, such as death tests.
+                       (define scheme-command (lookup 'SCHEME))
+                       (define clean-scheme-env
+                         (filter
+                          (lambda (p)
+                            (not (string=? (car p)
+                                   "CHEZ_MAT_SCHEME_COMMAND")))
+                          lib-env))
+                       (define scheme-env
+                         (if scheme-command
+                             (cons
+                              (cons "CHEZ_MAT_SCHEME_COMMAND" scheme-command)
+                              clean-scheme-env)
+                             clean-scheme-env))
                        ;; communicate C compiler configuration to "ftype.ms":
                        (list*
                         (cons "FTYPE_CC" (or (lookup 'CC)
@@ -383,7 +398,7 @@
                               (if (eq? 'windows (hash-ref (runtime-env) 'toolchain-type))
                                   "windows"
                                   "unix"))
-                        lib-env))))
+                        scheme-env))))
 
   (define (make-config-script opt)
     `((optimize-level ,(opt 'o 'integer))
