@@ -1,0 +1,57 @@
+#lang zuo
+
+;; Compile native-fiber and FFI boundary probes through selected threaded
+;; cross backends. Each target's xpatch must already exist.
+
+(define default-targets
+  '("trv64le" "tarm64le" "tarm64osx" "tarm64nt"))
+
+(define (run-target root config target)
+  (define workarea (hash-ref config 'host-workarea))
+  (define host-machine (hash-ref config 'host-machine))
+  (define scheme.exe
+    (build-path root workarea "bin" host-machine "scheme"))
+  (define xc-dir (build-path root (~a "xc-" target)))
+  (define xpatch (build-path xc-dir "s" "xpatch"))
+  (define driver (build-path root "mats" "native-fiber-cross-check.ss"))
+  (define probe (build-path root "mats" "native-fiber-cross-probe.ss"))
+  (define output (build-path xc-dir "native-fiber-cross-probe.so"))
+  (define assembly (build-path xc-dir "native-fiber-cross-probe.asm"))
+  (unless (file-exists? scheme.exe)
+    (error (~a "host Scheme runtime is not built: " scheme.exe)))
+  (unless (file-exists? xpatch)
+    (error (~a "cross patch is not built: " xpatch)))
+  (alert (~a "checking native-fiber lowering for " target))
+  (when (file-exists? output) (rm output))
+  (when (file-exists? assembly) (rm assembly))
+  (define child
+    (process scheme.exe "-q" "--script" driver
+             target xpatch probe output assembly
+             (hash 'dir root)))
+  (define child-process (hash-ref child 'process))
+  (process-wait child-process)
+  (define status (process-status child-process))
+  (if (= status 0)
+      (begin
+        (when (file-exists? output) (rm output))
+        (when (file-exists? assembly) (rm assembly)))
+      (error (~a "native-fiber cross-check failed for " target
+                 "; inspect " output " and " assembly))))
+
+(module+ main
+  (define config
+    (command-line
+     :init (hash 'host-workarea "ta6le" 'host-machine "ta6le")
+     :once-each
+     [config "--host-workarea" path "Use the built host workarea at <path>"
+             (hash-set config 'host-workarea path)]
+     [config "--host-machine" machine
+             "Use the host executable for <machine>"
+             (hash-set config 'host-machine machine)]
+     :args targets
+     (lambda (config)
+       (define root (path->complete-path (at-source "..")))
+       (for-each
+         (lambda (target) (run-target root config target))
+         (if (null? targets) default-targets targets)))))
+  (void))
