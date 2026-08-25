@@ -22,7 +22,7 @@ ptr S_symbol_value(ptr sym) {
   return SYMVAL(sym);
 }
 
-ptr S_symbol_racy_value(ptr sym) NO_THREAD_SANITIZE {
+NO_THREAD_SANITIZE ptr S_symbol_racy_value(ptr sym) {
   return SYMVAL(sym);
 }
 

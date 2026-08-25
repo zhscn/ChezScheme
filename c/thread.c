@@ -408,11 +408,16 @@ ptr S_make_mutex(void) {
 }
 
 void S_mutex_free(scheme_mutex_t *m) {
+  /* A thread may terminate while owning a mutex. POSIX does not permit
+     another thread to unlock it, and destroying or freeing a locked mutex is
+     undefined. Such an unreachable abandoned mutex must retain its native
+     storage; ordinary unlocked mutexes are reclaimed normally. */
+  if (m->count != 0) return;
   s_thread_mutex_destroy(&m->pmutex);
   free(m);
 }
 
-void S_mutex_acquire(scheme_mutex_t *m) NO_THREAD_SANITIZE {
+NO_THREAD_SANITIZE void S_mutex_acquire(scheme_mutex_t *m) {
   s_thread_t self = s_thread_self();
   iptr count;
   INT status;
@@ -430,7 +435,7 @@ void S_mutex_acquire(scheme_mutex_t *m) NO_THREAD_SANITIZE {
   m->count = 1;
 }
 
-INT S_mutex_tryacquire(scheme_mutex_t *m) NO_THREAD_SANITIZE {
+NO_THREAD_SANITIZE INT S_mutex_tryacquire(scheme_mutex_t *m) {
   s_thread_t self = s_thread_self();
   iptr count;
   INT status;
@@ -452,12 +457,12 @@ INT S_mutex_tryacquire(scheme_mutex_t *m) NO_THREAD_SANITIZE {
   return status;
 }
 
-IBOOL S_mutex_is_owner(scheme_mutex_t *m) NO_THREAD_SANITIZE {
+NO_THREAD_SANITIZE IBOOL S_mutex_is_owner(scheme_mutex_t *m) {
   s_thread_t self = s_thread_self();
   return ((m->count > 0) && s_thread_equal(m->owner, self));
 }
 
-void S_mutex_release(scheme_mutex_t *m) NO_THREAD_SANITIZE {
+NO_THREAD_SANITIZE void S_mutex_release(scheme_mutex_t *m) {
   s_thread_t self = s_thread_self();
   iptr count;
   INT status;
