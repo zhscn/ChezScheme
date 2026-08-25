@@ -2663,40 +2663,36 @@
                [state (native-fiber-control-state old)]
                [old-owner (native-fiber-control-owner old)])
           (cond
-            [(or (fx= state (constant native-fiber-state-new))
-                 (fx= state (constant native-fiber-state-parked)))
-             ;; Validate all worker-owned fields before CAS transfers
-             ;; ownership. A malformed object is rejected while its original
-             ;; stable state remains intact; failures after CAS are internal
-             ;; and therefore fatal.
-             (native-fiber-check-stable! '$native-fiber-try-claim! fiber)
-             (if (and (not (fx= (fxlogand (native-fiber-flags fiber)
-                                           (constant native-fiber-flag-pinned))
-                                  0))
-                      (not (fx= old-owner 0))
-                      (not (fx= old-owner owner)))
-                 #f
-                 (let ([new (native-fiber-pack-control
-                              (constant native-fiber-state-claimed)
-                              owner)])
-                   (unless (native-fiber-transition-valid?
-                             (native-fiber-flags fiber) old new)
-                     ($oops '$native-fiber-try-claim!
-                       "native fiber ~s has an invalid claim transition"
-                       (native-fiber-id fiber)))
-                   (disable-interrupts)
-                   (if ($record-cas! fiber 0 old new)
-                       (begin
-                         ($native-fiber-claimed-control old)
-                         ($native-fiber-claimed fiber)
-                         (native-fiber-register-pinned! fiber)
-                         (enable-interrupts)
-                         (native-fiber-check-stable-internal!
-                           '$native-fiber-try-claim! fiber)
-                         #t)
-                       (begin
-                         (enable-interrupts)
-                         (loop)))))]
+            [(or (and (fx= state (constant native-fiber-state-new))
+                      (fx= old-owner 0))
+                 (and (fx= state (constant native-fiber-state-parked))
+                      (or (fx= old-owner 0) (fx= old-owner owner))))
+             ;; Ordinary fiber fields belong to the owner named by control.
+             ;; Do not inspect them before CAS: another worker can advance a
+             ;; parked fiber through a complete run/park cycle while this
+             ;; worker retains an older control value. A successful CAS is
+             ;; the exclusive-ownership boundary for full validation.
+             (let ([new (native-fiber-pack-control
+                          (constant native-fiber-state-claimed)
+                          owner)])
+               (disable-interrupts)
+               (if ($record-cas! fiber 0 old new)
+                   (begin
+                     ;; The same stable control value can be published again
+                     ;; after another worker runs and parks a migratable
+                     ;; fiber. Acquire from the successful CAS, not merely
+                     ;; from the earlier speculative control load.
+                     (memory-order-acquire)
+                     ($native-fiber-claimed-control old)
+                     ($native-fiber-claimed fiber)
+                     (native-fiber-register-pinned! fiber)
+                     (enable-interrupts)
+                     (native-fiber-check-stable-internal!
+                       '$native-fiber-try-claim! fiber)
+                     #t)
+                   (begin
+                     (enable-interrupts)
+                     (loop))))]
             [else #f])))))))
 
 (set! $native-fiber-release-claim!

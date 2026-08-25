@@ -2877,43 +2877,56 @@
                  (lambda ()
                    (let ([scheduler (#3%$native-fiber-adopt 0)])
                      (let loop ()
-                       (cond
-                         [(eq? (#3%$native-fiber-state task) 'finished)
-                          (void)]
-                         [(#3%$native-fiber-try-claim! task)
-                          ;; The successful claim is the only synchronization
-                          ;; before these ordinary reads.
-                          (let ([seen publication])
-                            (unless (valid-publication? seen)
-                              (with-mutex lock
-                                (unless failure
-                                  (set! failure
-                                    (list 'torn-publication worker-index)))))
-                            (set! current-scheduler scheduler)
-                            (let ([outcome
-                                   (#3%$native-fiber-switch scheduler task
-                                     (if (valid-publication? seen)
-                                         (vector-ref seen 0)
-                                         -1))])
-                              (with-mutex lock
-                                (set! owners
-                                  (cons (get-thread-id) owners)))
-                              (unless (or (and (pair? outcome)
-                                               (eq? (car outcome) 'return))
-                                          (valid-publication? outcome))
+                       (let ([claim
+                              (guard (condition
+                                       [else
+                                        (with-mutex lock
+                                          (unless failure
+                                            (set! failure
+                                              (list 'claim-exception
+                                                worker-index condition))))
+                                        'failed])
+                                (if (#3%$native-fiber-try-claim! task)
+                                    'won
+                                    'lost))])
+                         (cond
+                           [(eq? claim 'failed) (void)]
+                           [(eq? claim 'won)
+                            ;; The successful claim's acquire is the only
+                            ;; synchronization before these ordinary reads.
+                            (let ([seen publication])
+                              (unless (valid-publication? seen)
                                 (with-mutex lock
                                   (unless failure
                                     (set! failure
-                                      (list 'payload-publication
-                                            worker-index)))))
-                              ;; Give another thief a chance to perform the
-                              ;; next acquire instead of repeatedly winning on
-                              ;; one native worker.
-                              (sleep (make-time 'time-duration 1000 0))
-                              (loop)))]
-                         [else
-                          (sleep (make-time 'time-duration 1000 0))
-                          (loop)]))))))
+                                      (list 'torn-publication worker-index)))))
+                              (set! current-scheduler scheduler)
+                              (let ([outcome
+                                     (#3%$native-fiber-switch scheduler task
+                                       (if (valid-publication? seen)
+                                           (vector-ref seen 0)
+                                           -1))])
+                                (with-mutex lock
+                                  (set! owners
+                                    (cons (get-thread-id) owners)))
+                                (unless (or (and (pair? outcome)
+                                                 (eq? (car outcome) 'return))
+                                            (valid-publication? outcome))
+                                  (with-mutex lock
+                                    (unless failure
+                                      (set! failure
+                                        (list 'payload-publication
+                                              worker-index)))))
+                                ;; Give another thief a chance to perform the
+                                ;; next acquire instead of repeatedly winning on
+                                ;; one native worker.
+                                (sleep (make-time 'time-duration 1000 0))
+                                (loop)))]
+                           [(eq? (#3%$native-fiber-state task) 'finished)
+                            (void)]
+                           [else
+                            (sleep (make-time 'time-duration 1000 0))
+                            (loop)])))))))
              (iota worker-count))])
       (for-each thread-join workers)
       (and (not failure)
