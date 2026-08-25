@@ -1736,57 +1736,63 @@
                  needle)
                (loop (fx+ start 1)))))))
 
-(define (native-fiber-run-hook-point point gc?)
+(define (native-fiber-run-hook-point point gc-generation)
   (let ([task #f] [scheduler #f] [result #f])
-    (dynamic-wind
-      (lambda () (native-fiber-test-hook-arm point (if gc? 2 1) 0))
-      (lambda ()
-        (let ([worker
-               (fork-thread
-                 (lambda ()
-                   (set! scheduler (#3%$native-fiber-adopt #b1000))
-                   (set! task
-                     (#3%$native-fiber-create
-                       (lambda () 'done)
-                       (lambda (fiber outcome)
-                         (#3%$native-fiber-try-claim! scheduler)
-                         (#3%$native-fiber-finish fiber scheduler outcome))
-                       #b1100))
-                   (#3%$native-fiber-try-claim! task)
-                   (set! result
-                     (#3%$native-fiber-switch scheduler task 'start))))])
-          (if (not (native-fiber-wait-for-hook point))
-              (begin
-                (native-fiber-test-hook-release)
-                (thread-join worker)
-                #f)
-              (let ([foreign-claim #t])
-                (thread-join
-                  (fork-thread
-                    (lambda ()
-                      (#3%$native-fiber-adopt #b1000)
-                      (set! foreign-claim
-                        (#3%$native-fiber-try-claim! task)))))
-                (let* ([collector
-                       (and gc?
-                            (fork-thread
-                              (lambda ()
-                                (parameterize ([#%$enable-check-heap #t])
-                                  (collect-rendezvous)))))]
-                       [gc-overlap?
-                        (begin
-                          (when collector (thread-join collector))
-                          (or (not gc?)
-                              (and (fx= (native-fiber-test-hook-hit) point)
-                                   (fx= (native-fiber-test-hook-saw-gc) 1))))])
+    (parameterize
+      ([collect-request-handler
+        (if gc-generation
+            (lambda () (collect gc-generation))
+            (collect-request-handler))])
+      (dynamic-wind
+        (lambda ()
+          (native-fiber-test-hook-arm point (if gc-generation 2 1) 0))
+        (lambda ()
+          (let ([worker
+                 (fork-thread
+                   (lambda ()
+                     (set! scheduler (#3%$native-fiber-adopt #b1000))
+                     (set! task
+                       (#3%$native-fiber-create
+                         (lambda () 'done)
+                         (lambda (fiber outcome)
+                           (#3%$native-fiber-try-claim! scheduler)
+                           (#3%$native-fiber-finish fiber scheduler outcome))
+                         #b1100))
+                     (#3%$native-fiber-try-claim! task)
+                     (set! result
+                       (#3%$native-fiber-switch scheduler task 'start))))])
+            (if (not (native-fiber-wait-for-hook point))
+                (begin
                   (native-fiber-test-hook-release)
                   (thread-join worker)
-                  (and (not foreign-claim)
-                       gc-overlap?
-                       (equal? result '(return . done))
-                       (eq? (#3%$native-fiber-state task) 'finished)
-                       (eq? (#3%$native-fiber-state scheduler) 'finished)))))))
-      native-fiber-test-hook-reset)))
+                  #f)
+                (let ([foreign-claim #t])
+                  (thread-join
+                    (fork-thread
+                      (lambda ()
+                        (#3%$native-fiber-adopt #b1000)
+                        (set! foreign-claim
+                          (#3%$native-fiber-try-claim! task)))))
+                  (let* ([collector
+                         (and gc-generation
+                              (fork-thread
+                                (lambda ()
+                                  (parameterize ([#%$enable-check-heap #t])
+                                    (collect-rendezvous)))))]
+                         [gc-overlap?
+                          (begin
+                            (when collector (thread-join collector))
+                            (or (not gc-generation)
+                                (and (fx= (native-fiber-test-hook-hit) point)
+                                     (fx= (native-fiber-test-hook-saw-gc) 1))))])
+                    (native-fiber-test-hook-release)
+                    (thread-join worker)
+                    (and (not foreign-claim)
+                         gc-overlap?
+                         (equal? result '(return . done))
+                         (eq? (#3%$native-fiber-state task) 'finished)
+                         (eq? (#3%$native-fiber-state scheduler) 'finished)))))))
+        native-fiber-test-hook-reset))))
 
 (define (native-fiber-run-hook-preemption point)
   (let ([task #f]
@@ -1923,9 +1929,21 @@
   (andmap (lambda (point) (native-fiber-run-hook-point point #f))
     '(1 2 3 4)))
 
+(define native-fiber-test-generations
+  (let ([maximum (collect-maximum-generation)])
+    (cond
+      [(fx= maximum 0) '(0)]
+      [(fx= maximum 1) '(0 1)]
+      [else (list 0 (fxquotient maximum 2) maximum)])))
+
 (mat native-fiber-concurrent-gc-handshake
-  (andmap (lambda (point) (native-fiber-run-hook-point point #t))
-    '(1 2 3 4)))
+  (andmap
+    (lambda (generation)
+      (andmap
+        (lambda (point)
+          (native-fiber-run-hook-point point generation))
+        '(1 2 3 4)))
+    native-fiber-test-generations))
 
 (mat native-fiber-transition-preemption
   (andmap native-fiber-run-hook-preemption '(1 2 3 4)))
@@ -1935,6 +1953,8 @@
 
 (define (native-fiber-randomized-transition-stress seed rounds)
   (define modulus 2147483647)
+  (define gc-mode-count (length native-fiber-test-generations))
+  (define mode-count (fx+ gc-mode-count 3))
   (define (next state)
     (modulo (+ (* state 48271) 1) modulus))
   (let loop ([state (modulo seed modulus)] [iteration 0])
@@ -1943,17 +1963,28 @@
         (let* ([point-state (next state)]
                [mode-state (next point-state)]
                [point (+ (modulo point-state 4) 1)]
-               [mode (modulo mode-state 4)]
+               [mode (modulo mode-state mode-count)]
+               [scenario
+                (cond
+                  [(fx= mode 0) 'transition]
+                  [(fx<= mode gc-mode-count)
+                   (cons 'gc
+                     (list-ref native-fiber-test-generations (fx- mode 1)))]
+                  [(fx= mode (fx+ gc-mode-count 1)) 'preemption]
+                  [else 'worker-exit])]
                [ok?
-                (case mode
-                  [(0) (native-fiber-run-hook-point point #f)]
-                  [(1) (native-fiber-run-hook-point point #t)]
-                  [(2) (native-fiber-run-hook-preemption point)]
+                (cond
+                  [(eq? scenario 'transition)
+                   (native-fiber-run-hook-point point #f)]
+                  [(pair? scenario)
+                   (native-fiber-run-hook-point point (cdr scenario))]
+                  [(eq? scenario 'preemption)
+                   (native-fiber-run-hook-preemption point)]
                   [else (native-fiber-run-hook-exit point)])])
           (unless ok?
             (error 'native-fiber-randomized-transition-stress
               "transition scenario failed"
-              seed iteration point mode))
+              seed iteration point scenario))
           (loop mode-state (fx+ iteration 1))))))
 
 (define (native-fiber-stress-integer name default minimum)
@@ -2304,8 +2335,12 @@
                    (vector->list tasks))))))
 
 (mat native-fiber-switch-collector-race
-  (let* ([worker-count 3]
-         [rounds 500]
+  (let* ([worker-count
+          (native-fiber-stress-integer
+            "CHEZ_NATIVE_FIBER_RACE_WORKERS" 3 1)]
+         [rounds
+          (native-fiber-stress-integer
+            "CHEZ_NATIVE_FIBER_RACE_ROUNDS" 500 1)]
          [m (make-mutex)]
          [done 0]
          [results (make-vector worker-count #f)])
