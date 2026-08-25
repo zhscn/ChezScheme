@@ -359,11 +359,11 @@ static void s_link_code_object(ptr co, ptr objs) {
 }
 
 static INT s_check_heap_enabledp(void) {
-  return S_checkheap;
+  return ATOMIC_LOAD_IBOOL(&S_checkheap);
 }
 
 static void s_enable_check_heap(IBOOL b) {
-  S_checkheap = b;
+  ATOMIC_STORE_IBOOL(&S_checkheap, b);
 }
 
 static uptr s_check_heap_errors(void) {

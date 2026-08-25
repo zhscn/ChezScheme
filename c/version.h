@@ -584,14 +584,24 @@ typedef int tputsputcchar;
 # define UNUSED_SUB_INDEX /* empty */
 #endif
 
-#if defined(__has_feature)
+#if defined(__SANITIZE_THREAD__)
+# define THREAD_SANITIZER_ENABLED
+#elif defined(__has_feature)
 # if __has_feature(thread_sanitizer)
-#  define NO_THREAD_SANITIZE __attribute__((no_sanitize("thread")))
-#  define IMPLICIT_ATOMIC_AS_EXPLICIT
+#  define THREAD_SANITIZER_ENABLED
 # endif
 #endif
-#ifndef NO_THREAD_SANITIZE
+#ifdef THREAD_SANITIZER_ENABLED
+# define NO_THREAD_SANITIZE __attribute__((no_sanitize("thread")))
+# define IMPLICIT_ATOMIC_AS_EXPLICIT
+extern void __tsan_acquire(void *);
+extern void __tsan_release(void *);
+# define THREAD_SANITIZER_ACQUIRE(address) __tsan_acquire(address)
+# define THREAD_SANITIZER_RELEASE(address) __tsan_release(address)
+#else
 # define NO_THREAD_SANITIZE /* empty */
+# define THREAD_SANITIZER_ACQUIRE(address) ((void)0)
+# define THREAD_SANITIZER_RELEASE(address) ((void)0)
 #endif
 
 /* Use "/dev/urandom" everywhere except Windows */

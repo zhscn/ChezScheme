@@ -361,6 +361,23 @@
                     name
                     count)])))))]))
 
+(let ([run-mat mat-run]
+      [prefix (getenv "CHEZ_MAT_NAME_PREFIX")])
+  (when (and prefix (not (string=? prefix "")))
+    (let ([selected?
+           (lambda (name)
+             (let ([name (symbol->string name)]
+                   [prefix-length (string-length prefix)])
+               (and (fx<= prefix-length (string-length name))
+                    (string=? prefix
+                      (substring name 0 prefix-length)))))])
+      (set! mat-run
+        (case-lambda
+          [(name)
+           (when (selected? name) (run-mat name))]
+          [(name . clauses)
+           (when (selected? name) (apply run-mat name clauses))])))))
+
  );let
 
 (define equivalent-expansion?

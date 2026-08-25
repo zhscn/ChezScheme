@@ -887,7 +887,7 @@ static ptr copy_stack(thread_gc *tgc, ptr old, iptr *length, iptr clength) {
           }                                                     \
         }                                                       \
       } else {                                                  \
-        if (S_checkheap)                                        \
+        if (ATOMIC_LOAD_IBOOL(&S_checkheap))                    \
           S_checkheap_note_guardian(                            \
             ls, CHECKHEAP_GUARDIAN_DROP);                       \
       }                                                         \
@@ -983,7 +983,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
     }
 
    /* perform after ScanDirty */
-    if (S_checkheap) {
+    if (ATOMIC_LOAD_IBOOL(&S_checkheap)) {
       S_checkheap_begin_mark_check(MAX_CG, MIN_TG, MAX_TG,
                                    count_roots_ls);
       S_check_heap(0, MAX_CG);
@@ -1337,7 +1337,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
 
     teardown_sweepers();
 
-    if (S_checkheap) S_checkheap_verify_mark_check();
+    if (ATOMIC_LOAD_IBOOL(&S_checkheap)) S_checkheap_verify_mark_check();
 
     pre_finalization_size = target_generation_space_so_far(tgc);
 
@@ -1404,7 +1404,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
                   addr = TO_VOIDP(RECORDINSTIT(rep, 0));
                   LOCKED_DECR(addr, b);
                   if (!b) {
-                    if (S_checkheap)
+                    if (ATOMIC_LOAD_IBOOL(&S_checkheap))
                       S_checkheap_note_guardian(
                         ls, CHECKHEAP_GUARDIAN_DROP);
                     continue;
@@ -1442,7 +1442,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
                 /* if tconc was old it's been forwarded */
                   tconc = GUARDIANTCONC(ls);
 
-                  if (S_checkheap)
+                  if (ATOMIC_LOAD_IBOOL(&S_checkheap))
                     S_checkheap_note_guardian(
                       ls, CHECKHEAP_GUARDIAN_FINAL);
 
@@ -1478,7 +1478,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
 
               /* discard static pend_hold_ls entries */
               if (g == static_generation) {
-                if (S_checkheap)
+                if (ATOMIC_LOAD_IBOOL(&S_checkheap))
                   S_checkheap_note_guardian(
                     ls, CHECKHEAP_GUARDIAN_DROP);
                 continue;
@@ -1502,7 +1502,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
               WITH_TOP_BACKREFERENCE(tconc, relocate_pure_now(&rep));
               relocate_rep = 1;
 
-              if (S_checkheap)
+              if (ATOMIC_LOAD_IBOOL(&S_checkheap))
                 S_checkheap_note_guardian(
                   ls, CHECKHEAP_GUARDIAN_HOLD);
 
@@ -1605,7 +1605,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
    /* still-pending ephemerons all go to bwp */
     finish_pending_ephemerons(tgc, oldspacesegments);
 
-    if (S_checkheap)
+    if (ATOMIC_LOAD_IBOOL(&S_checkheap))
       S_checkheap_verify_finalization_check(oldspacesegments);
 
     ACCUM_REAL_TIME(collect_accum, step, start);
@@ -1816,7 +1816,7 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
 
     S_resize_oblist();
 
-    if (S_checkheap) S_check_heap(1, MAX_CG);
+    if (ATOMIC_LOAD_IBOOL(&S_checkheap)) S_check_heap(1, MAX_CG);
 
     /* tell profile_release_counters to look for bwp'd counters at least through max_tg */
     if (S_G.prcgeneration < MAX_TG) S_G.prcgeneration = MAX_TG;

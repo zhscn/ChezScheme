@@ -81,6 +81,18 @@
  )
 
 (when-threaded
+(define thread-foreign-library-loaded? #f)
+
+(define (load-thread-foreign-library!)
+  (unless thread-foreign-library-loaded?
+    (load-shared-object
+      (let ([p (find-source "foreign1.so")])
+        (if (or (path-absolute? p)
+                (not (equal? "" (path-parent p))))
+            p
+            (path-build "." p))))
+    (set! thread-foreign-library-loaded? #t)))
+
 (mat thread
   (let ([m (make-mutex)] [c (make-condition)]
         [m2 (make-mutex 'mname)] [c2 (make-condition 'cname)])
@@ -1368,13 +1380,7 @@
     '(3.4 -4))
   ($thread-check)
   (begin
-    (load-shared-object (let ([p (find-source "foreign1.so")])
-                          p
-                          (if (or (path-absolute? p)
-                                  (not (equal? "" (path-parent p))))
-                              p
-                              ;; specify relative to current directory:
-                              (path-build "." p))))
+    (load-thread-foreign-library!)
     #t)
   (equal?
     (let ()
@@ -1693,6 +1699,9 @@
    (void))
 )
 
+(mat native-fiber-foreign-support
+  (begin (load-thread-foreign-library!) #t))
+
 (define native-fiber-test-hook-arm
   (foreign-procedure "(cs)native_fiber_test_hook_arm" (iptr iptr iptr) void))
 (define native-fiber-test-hook-release
@@ -1947,15 +1956,30 @@
               seed iteration point mode))
           (loop mode-state (fx+ iteration 1))))))
 
+(define (native-fiber-stress-integer name default minimum)
+  (let ([value (getenv name)])
+    (if value
+        (let ([value (string->number value)])
+          (unless (and (integer? value) (exact? value) (>= value minimum))
+            (error 'native-fiber-stress-integer
+              "invalid native-fiber stress setting" name value))
+          value)
+        default)))
+
 (mat native-fiber-randomized-transition-stress
-  (native-fiber-randomized-transition-stress 1592594996 24))
+  (native-fiber-randomized-transition-stress
+    (native-fiber-stress-integer
+      "CHEZ_NATIVE_FIBER_STRESS_SEED" 1592594996 0)
+    (native-fiber-stress-integer
+      "CHEZ_NATIVE_FIBER_STRESS_ROUNDS" 24 1)))
 
 (mat native-fiber-transition-death-tests
   (native-fiber-death-test 1 1 "native-fiber source publication raced")
   (native-fiber-death-test 3 2 "native-fiber commit publication raced")
   (native-fiber-death-test 2 3 "native-fiber target return point is invalid")
   (native-fiber-death-test 1 4 "native-fiber stack ownership overlaps")
-  (native-fiber-death-test 4 5 "native-fiber post-commit source corruption"))
+  (native-fiber-death-test 4 5
+    "native-fiber source scratch corrupted before commit"))
 
 (mat native-fiber-repeated-claim-contention
   (let rounds ([round 0])

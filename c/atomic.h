@@ -66,6 +66,29 @@
 #ifndef RELEASE_FENCE
 # define RELEASE_FENCE() do { } while (0)
 #endif
+
+/* Process-wide runtime switches can be observed by mutator and collector
+   threads without taking a runtime lock. Keep those accesses visible to the
+   C memory model and to thread sanitizers. */
+#if !defined(PTHREADS)
+# define ATOMIC_LOAD_IBOOL(a) (*(a))
+# define ATOMIC_STORE_IBOOL(a, v) (*(a) = (v))
+#elif defined(_MSC_VER)
+# define ATOMIC_LOAD_IBOOL(a) \
+    ((IBOOL)_InterlockedCompareExchange((volatile long *)(a), 0, 0))
+# define ATOMIC_STORE_IBOOL(a, v) \
+    ((void)_InterlockedExchange((volatile long *)(a), (long)(v)))
+#elif (__GNUC__ >= 5) || C_COMPILER_HAS_BUILTIN(__atomic_load_n)
+# define ATOMIC_LOAD_IBOOL(a) __atomic_load_n((a), __ATOMIC_ACQUIRE)
+# define ATOMIC_STORE_IBOOL(a, v) \
+    __atomic_store_n((a), (v), __ATOMIC_RELEASE)
+#elif C_COMPILER_HAS_BUILTIN(__sync_val_compare_and_swap)
+# define ATOMIC_LOAD_IBOOL(a) __sync_val_compare_and_swap((a), 0, 0)
+# define ATOMIC_STORE_IBOOL(a, v) ((void)__sync_lock_test_and_set((a), (v)))
+#else
+# define ATOMIC_LOAD_IBOOL(a) (*(volatile IBOOL *)(a))
+# define ATOMIC_STORE_IBOOL(a, v) (*(volatile IBOOL *)(a) = (v))
+#endif
   
 #if !defined(PTHREADS)
 # define COMPARE_AND_SWAP_PTR(a, old, new) ((*(ptr *)(a) == TO_PTR(old)) ? (*(ptr *)(a) = TO_PTR(new), 1) : 0)

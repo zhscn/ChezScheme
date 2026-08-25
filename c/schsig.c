@@ -770,6 +770,14 @@ void S_handle_event_detour() {
                    ? CURRENTNATIVEFIBER(tc)
                    : RECORDINSTIT(target, native_fiber_incoming_source_index);
 
+        /* A migratable target may have been release-published by a different
+           worker and claimed by Scheme-generated atomic code. Tell TSan about
+           that acquire edge before inspecting its ordinary transaction
+           fields; production builds compile this annotation away. */
+        if (phase == FIX(1))
+          THREAD_SANITIZER_ACQUIRE(
+            &RECORDINSTIT(target, native_fiber_control_index));
+
         if (native_fiber_test_activep(tc, source, target))
           action = native_fiber_test_hook(phase == FIX(1) ? 1 : 3);
 
@@ -812,10 +820,20 @@ void S_handle_event_detour() {
              stable parked/finished control word. */
           RECORDINSTIT(source, native_fiber_switch_control_index) = Sfalse;
           RECORDINSTIT(source, native_fiber_commit_control_index) = Sfalse;
+          if (native_fiber_test_activep(tc, source, target)) {
+            iptr post_action = native_fiber_test_hook(4);
+            if (post_action == 5)
+              RECORDINSTIT(source, native_fiber_switch_control_index) = Strue;
+            if (post_action == 6) native_fiber_test_request_timer(tc);
+          }
+          if (RECORDINSTIT(source, native_fiber_switch_control_index) != Sfalse
+              || RECORDINSTIT(source, native_fiber_commit_control_index) != Sfalse)
+            S_error_abort("native-fiber source scratch corrupted before commit");
           field = &RECORDINSTIT(source, native_fiber_control_index);
           old_control = *field;
           S_dirty_mark(field, control);
           if (action == 2) *field = control;
+          THREAD_SANITIZER_RELEASE(field);
           if (!COMPARE_AND_SWAP_PTR(field, TO_VOIDP(old_control),
                                     TO_VOIDP(control)))
             S_error_abort("native-fiber commit publication raced");
@@ -825,15 +843,6 @@ void S_handle_event_detour() {
               && (UNFIX(RECORDINSTIT(source, 11)) & 2) == 0)
             native_fiber_unregister_pinned(tc, source);
 #endif
-          if (native_fiber_test_activep(tc, source, target)) {
-            iptr post_action = native_fiber_test_hook(4);
-            if (post_action == 5)
-              RECORDINSTIT(source, native_fiber_switch_control_index) = Strue;
-            if (post_action == 6) native_fiber_test_request_timer(tc);
-          }
-          if (RECORDINSTIT(source, native_fiber_switch_control_index) != Sfalse
-              || RECORDINSTIT(source, native_fiber_commit_control_index) != Sfalse)
-            S_error_abort("native-fiber post-commit source corruption");
         }
 
         NATIVEFIBERTRANSITION(tc) = Strue;
