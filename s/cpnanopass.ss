@@ -5594,9 +5594,16 @@
                     ;; The target owns the incoming source reference. Decode
                     ;; both records before sfp changes from the source stack
                     ;; to the target stack.
-                    (set! ,%td
-                      ,(%mref ,(ref-reg %ac1)
-                         ,(constant native-fiber-incoming-source-disp)))
+                    ,(if (real-register? '%ac1)
+                         (%seq
+                           (set! ,%td
+                             ,(%mref ,(ref-reg %ac1)
+                                ,(constant native-fiber-incoming-source-disp))))
+                         (%seq
+                            (set! ,%ts ,(ref-reg %ac1))
+                            (set! ,%td
+                              ,(%mref ,%ts
+                                 ,(constant native-fiber-incoming-source-disp)))))
                     (if ,(%inline eq? ,%td ,(%tc-ref current-native-fiber))
                         (nop)
                         ,(native-fiber-invariant-failure))
@@ -5610,9 +5617,16 @@
                     (if ,(%inline eq? ,%xp ,(%constant sfalse))
                         ,(native-fiber-invariant-failure)
                         (nop))
-                    (set! ,%xp
-                      ,(%mref ,(ref-reg %ac1)
-                         ,(constant native-fiber-switch-control-disp)))
+                    ,(if (real-register? '%ac1)
+                         (%seq
+                           (set! ,%xp
+                             ,(%mref ,(ref-reg %ac1)
+                                ,(constant native-fiber-switch-control-disp))))
+                         (%seq
+                            (set! ,%ts ,(ref-reg %ac1))
+                            (set! ,%xp
+                              ,(%mref ,%ts
+                                 ,(constant native-fiber-switch-control-disp)))))
                     (if ,(%inline eq? ,%xp ,(%constant sfalse))
                         ,(native-fiber-invariant-failure)
                         (nop))
