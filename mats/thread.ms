@@ -1924,6 +1924,32 @@
 (mat native-fiber-transition-worker-exit
   (andmap native-fiber-run-hook-exit '(1 2 3 4)))
 
+(define (native-fiber-randomized-transition-stress seed rounds)
+  (define modulus 2147483647)
+  (define (next state)
+    (modulo (+ (* state 48271) 1) modulus))
+  (let loop ([state (modulo seed modulus)] [iteration 0])
+    (if (fx= iteration rounds)
+        #t
+        (let* ([point-state (next state)]
+               [mode-state (next point-state)]
+               [point (+ (modulo point-state 4) 1)]
+               [mode (modulo mode-state 4)]
+               [ok?
+                (case mode
+                  [(0) (native-fiber-run-hook-point point #f)]
+                  [(1) (native-fiber-run-hook-point point #t)]
+                  [(2) (native-fiber-run-hook-preemption point)]
+                  [else (native-fiber-run-hook-exit point)])])
+          (unless ok?
+            (error 'native-fiber-randomized-transition-stress
+              "transition scenario failed"
+              seed iteration point mode))
+          (loop mode-state (fx+ iteration 1))))))
+
+(mat native-fiber-randomized-transition-stress
+  (native-fiber-randomized-transition-stress 1592594996 24))
+
 (mat native-fiber-transition-death-tests
   (native-fiber-death-test 1 1 "native-fiber source publication raced")
   (native-fiber-death-test 3 2 "native-fiber commit publication raced")
