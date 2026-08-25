@@ -4,7 +4,11 @@ export ZUO_JOBS="$(getconf _NPROCESSORS_ONLN)"
 if test "$TOOLCHAIN" = vs ; then
     MSYS_NO_PATHCONV=1 cmd.exe /c "build.bat $TARGET_MACHINE"
 else
-    if test -n "$CONFIGURE_ARGS" ; then
+    if test -n "$SANITIZER" ; then
+        ./configure -m="$TARGET_MACHINE" \
+          "CFLAGS+=-O1 -g -fsanitize=$SANITIZER -fno-omit-frame-pointer" \
+          "LDFLAGS+=-fsanitize=$SANITIZER"
+    elif test -n "$CONFIGURE_ARGS" ; then
         ./configure $CONFIGURE_ARGS
     else
         ./configure -m="$TARGET_MACHINE"

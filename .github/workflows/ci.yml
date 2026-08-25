@@ -30,6 +30,14 @@ jobs:
             configure: CFLAGS+=-std=gnu89
           - machine: ta6le
             os: ubuntu-24.04
+            variant: native-fiber-asan
+            sanitizer: address
+          - machine: ta6le
+            os: ubuntu-24.04
+            variant: native-fiber-tsan
+            sanitizer: thread
+          - machine: ta6le
+            os: ubuntu-24.04
             variant: reboot
             configure: -m=ta6le --force
             make: re.boot SCHEME="chezscheme"
@@ -62,6 +70,7 @@ jobs:
       CONFIGURE_ARGS: ${{ matrix.config.configure }}
       MAKE_ARGS: ${{ matrix.config.make }}
       TEST_TARGET: ${{ matrix.config.test }}
+      SANITIZER: ${{ matrix.config.sanitizer }}
     defaults:
       run:
         shell: bash
@@ -105,6 +114,7 @@ jobs:
           name: ${{ matrix.config.machine }}${{ matrix.config.toolchain }}${{ matrix.config.variant }}
           path: ${{ matrix.config.machine }}${{ matrix.config.toolchain }}${{ matrix.config.variant }}.tgz
       - name: Check test results
+        if: ${{ matrix.config.sanitizer == null }}
         run: |
           cat $TARGET_MACHINE/mats/summary
           diff -q .github/workflows/summary${{ matrix.config.test }} $TARGET_MACHINE/mats/summary
