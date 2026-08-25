@@ -3049,6 +3049,171 @@
              (equal? finished '(return . done)))
            (eq? (#3%$native-fiber-state task) 'finished)))))
 
+(mat native-fiber-foreign-abi-migration
+  (let* ([main-scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [current-scheduler main-scheduler]
+         [call-i64
+          (foreign-procedure
+            "call_i64" (ptr integer-64 int int) integer-64)]
+         [call-df
+          (foreign-procedure
+            "call_df" (ptr double-float int int) double-float)]
+         [call-many
+          (foreign-procedure "call_with_many_args" (void*) boolean)]
+         [task #f]
+         [callback-depths '()]
+         [many-ok? #t])
+    (define (note-depth!)
+      (set! callback-depths
+        (cons (#3%$fiber-switch-prohibited-depth) callback-depths)))
+    (define (yield value)
+      (#3%$native-fiber-try-claim! current-scheduler)
+      (#3%$native-fiber-switch task current-scheduler value))
+    (define (resume-on-worker value)
+      (let ([result #f])
+        (thread-join
+          (fork-thread
+            (lambda ()
+              (let ([scheduler (#3%$native-fiber-adopt 0)])
+                (set! current-scheduler scheduler)
+                (set! result
+                  (and (#3%$native-fiber-try-claim! task)
+                       (#3%$native-fiber-switch scheduler task value)))))))
+        result))
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (let ([i64-callback
+                 (foreign-callable
+                   (lambda (x)
+                     (note-depth!)
+                     (collect (collect-maximum-generation))
+                     (+ x 5))
+                   (integer-64) integer-64)]
+                [df-callback
+                 (foreign-callable
+                   (lambda (x)
+                     (note-depth!)
+                     (+ x 5.0))
+                   (double-float) double-float)]
+                [many-callback
+                 (foreign-callable
+                   (lambda (i s1 s2 s3 s4 i2 s6 s7 i3)
+                     (note-depth!)
+                     (set! many-ok?
+                       (and many-ok?
+                            (fx= i 0)
+                            (equal? (string->utf8 "this") s1)
+                            (equal? (string->utf8 "is") s2)
+                            (equal? (string->utf8 "working") s3)
+                            (equal? (string->utf8 "just") s4)
+                            (fx= i2 1)
+                            (equal? (string->utf8 "fine") s6)
+                            (equal? (string->utf8 "or does it?") s7)
+                            (fx= i3 2))))
+                   (int u8* u8* u8* u8* int u8* u8* int)
+                   void)])
+            (define (check-abi)
+              (and (= (call-i64 i64-callback 1099511627776 7 23)
+                      1099511627811)
+                   (= (call-df df-callback 73.25 7 23) 108.25)
+                   (call-many (foreign-callable-entry-point many-callback))
+                   many-ok?))
+            (and (check-abi)
+                 (eq? (yield 'ffi-parked) 'ffi-resume)
+                 (check-abi)
+                 (begin
+                   (keep-live i64-callback)
+                   (keep-live df-callback)
+                   (keep-live many-callback)
+                   #t))))
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! current-scheduler)
+          (#3%$native-fiber-finish fiber current-scheduler outcome))
+        #b100))
+    (#3%$native-fiber-try-claim! task)
+    (and (eq? (#3%$native-fiber-switch main-scheduler task 'start)
+              'ffi-parked)
+         (not (#3%$native-fiber-owner task))
+         (equal? (resume-on-worker 'ffi-resume) '(return . #t))
+         many-ok?
+         (andmap (lambda (depth) (fx= depth 1)) callback-depths)
+         (fx= (length callback-depths) 6)
+         (eq? (#3%$native-fiber-state task) 'finished))))
+
+(mat native-fiber-timer-foreign-callback-boundary
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [call-callback
+          (foreign-procedure "call_for_interrupt_test" (void* int) int)]
+         [task #f]
+         [callback-timer-seen? #f]
+         [callback-preempt-rejected? #f]
+         [outside-preempted? #f]
+         [saved-handler (timer-interrupt-handler)])
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (let ([callback
+                 (foreign-callable
+                   (lambda (value)
+                     (set-timer 1)
+                     (let loop ([fuel 10000000])
+                       (unless callback-timer-seen?
+                         (when (fx= fuel 0)
+                           (error 'native-fiber-timer-foreign-callback-boundary
+                             "timer was not delivered in callback"))
+                         (vector fuel)
+                         (loop (fx- fuel 1))))
+                     (fx+ value 1))
+                   (int) int)])
+            (unless (fx= (call-callback
+                           (foreign-callable-entry-point callback) 40)
+                         41)
+              (error 'native-fiber-timer-foreign-callback-boundary
+                "foreign callback result was corrupted"))
+            (set-timer 1)
+            (let loop ([fuel 10000000])
+              (unless outside-preempted?
+                (when (fx= fuel 0)
+                  (error 'native-fiber-timer-foreign-callback-boundary
+                    "timer did not preempt after callback"))
+                (vector fuel)
+                (loop (fx- fuel 1))))
+            (keep-live callback)
+            'done))
+        (lambda (fiber outcome)
+          (#3%$native-fiber-try-claim! scheduler)
+          (#3%$native-fiber-finish fiber scheduler outcome))
+        #b001))
+    (dynamic-wind
+      (lambda ()
+        (timer-interrupt-handler
+          (lambda ()
+            (if (fx> (#3%$fiber-switch-prohibited-depth) 0)
+                (begin
+                  (set! callback-timer-seen? #t)
+                  (set! callback-preempt-rejected?
+                    (not (#3%$native-fiber-preempt
+                           scheduler 'callback-preempted))))
+                (set! outside-preempted?
+                  (#3%$native-fiber-preempt scheduler 'outside-preempted))))))
+      (lambda ()
+        (#3%$native-fiber-try-claim! task)
+        (and (eq? (#3%$native-fiber-switch scheduler task 'start)
+                  'outside-preempted)
+             callback-timer-seen?
+             callback-preempt-rejected?
+             outside-preempted?
+             (#3%$native-fiber-try-claim! task)
+             (equal? (#3%$native-fiber-switch scheduler task 'resume)
+                     '(return . done))
+             (eq? (#3%$native-fiber-state task) 'finished)))
+      (lambda ()
+        (set-timer 0)
+        (timer-interrupt-handler saved-handler)))))
+
 (mat native-fiber-adopt-foreign-callback-boundary
   (let ([result #f])
     (let ([thread
