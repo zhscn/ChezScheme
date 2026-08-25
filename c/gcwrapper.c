@@ -1935,7 +1935,8 @@ void S_checkheap_begin_mark_check(IGEN mcg, IGEN min_tg, IGEN max_tg,
   for (i = 0; i < S_G.protect_next; i += 1)
     shadow_expected_pointer(*S_G.protected[i]);
   for (g = 0; g <= static_generation; INCRGEN(g))
-    shadow_expected_pointer(S_G.locked_objects[g]);
+    for (ls = S_G.locked_objects[g]; ls != Snil; ls = Scdr(ls))
+      shadow_expected_pointer(Scar(ls));
 
   if (count_roots_ls != Sfalse)
     for (ls = count_roots_ls; ls != Snil; ls = Scdr(ls)) {

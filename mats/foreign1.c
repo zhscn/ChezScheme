@@ -23,6 +23,12 @@
 #include "scheme.h"
 #endif
 #include <errno.h>
+#include <stdlib.h>
+
+#ifndef _WIN32
+# include <signal.h>
+# include <stdint.h>
+#endif
 
 EXPORT int id(int x) {
    return x;
@@ -163,3 +169,113 @@ EXPORT int call_for_interrupt_test(int (*f)(int), int v) {
 EXPORT int is_in_callback_for_interrupt_test() {
   return in_callback;
 }
+
+#ifndef _WIN32
+# if defined(__GNUC__) || defined(__clang__)
+#  define NO_SANITIZE_ADDRESS __attribute__((no_sanitize_address))
+# else
+#  define NO_SANITIZE_ADDRESS
+# endif
+
+static void *altstack_test_memory;
+static size_t altstack_test_size;
+static struct sigaction altstack_test_previous_action;
+static volatile sig_atomic_t altstack_test_signal;
+static volatile sig_atomic_t altstack_test_nested;
+static volatile sig_atomic_t altstack_test_depth;
+static volatile sig_atomic_t altstack_test_count;
+static volatile sig_atomic_t altstack_test_all_on_stack;
+
+static NO_SANITIZE_ADDRESS void altstack_test_forward(
+  int sig, siginfo_t *info, void *context)
+{
+  char marker;
+  uintptr_t address = (uintptr_t)&marker;
+  uintptr_t low = (uintptr_t)altstack_test_memory;
+  uintptr_t high = low + altstack_test_size;
+
+  if (sig != altstack_test_signal || address < low || address >= high)
+    altstack_test_all_on_stack = 0;
+
+  altstack_test_depth += 1;
+  altstack_test_count += 1;
+  if (altstack_test_nested && altstack_test_depth == 1)
+    raise(sig);
+
+  if (altstack_test_previous_action.sa_flags & SA_SIGINFO) {
+    altstack_test_previous_action.sa_sigaction(sig, info, context);
+  } else if (altstack_test_previous_action.sa_handler != SIG_IGN
+             && altstack_test_previous_action.sa_handler != SIG_DFL) {
+    altstack_test_previous_action.sa_handler(sig);
+  }
+  altstack_test_depth -= 1;
+}
+
+/* Run the signal handler currently installed for `sig` through a temporary
+ * alternate signal stack. With `nested` true, the relay re-enters itself once
+ * before forwarding both deliveries to the original handler. */
+EXPORT int run_signal_altstack_test(int sig, int nested)
+{
+  stack_t stack, previous_stack;
+  struct sigaction action;
+  int result = -1;
+
+#ifndef SA_NODEFER
+  if (nested) return -5;
+#endif
+
+  altstack_test_size = (size_t)SIGSTKSZ * 4;
+  altstack_test_memory = malloc(altstack_test_size);
+  if (altstack_test_memory == NULL) return -1;
+
+  stack.ss_sp = altstack_test_memory;
+  stack.ss_size = altstack_test_size;
+  stack.ss_flags = 0;
+  if (sigaltstack(&stack, &previous_stack) != 0) goto done;
+  if (sigaction(sig, NULL, &altstack_test_previous_action) != 0) {
+    result = -2;
+    goto restore_stack;
+  }
+
+  sigemptyset(&action.sa_mask);
+  action.sa_sigaction = altstack_test_forward;
+  action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+#ifdef SA_NODEFER
+  if (nested) action.sa_flags |= SA_NODEFER;
+#endif
+  altstack_test_signal = sig;
+  altstack_test_nested = nested != 0;
+  altstack_test_depth = 0;
+  altstack_test_count = 0;
+  altstack_test_all_on_stack = 1;
+
+  if (sigaction(sig, &action, NULL) != 0) {
+    result = -3;
+    goto restore_stack;
+  }
+  if (raise(sig) != 0) {
+    result = -4;
+  } else if (!altstack_test_all_on_stack) {
+    result = 0;
+  } else {
+    result = (int)altstack_test_count;
+  }
+  sigaction(sig, &altstack_test_previous_action, NULL);
+
+restore_stack:
+  sigaltstack(&previous_stack, NULL);
+done:
+  free(altstack_test_memory);
+  altstack_test_memory = NULL;
+  altstack_test_size = 0;
+  return result;
+}
+# undef NO_SANITIZE_ADDRESS
+#else
+EXPORT int run_signal_altstack_test(int sig, int nested)
+{
+  (void)sig;
+  (void)nested;
+  return -5;
+}
+#endif

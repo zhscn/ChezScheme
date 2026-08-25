@@ -16,6 +16,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #ifdef _WIN32
 # include <Windows.h>
@@ -212,6 +213,72 @@ EXPORT unsigned spin_a_while(int amt, unsigned a, unsigned b)
   }
 
   return a;
+}
+
+/* Synchronize a collect-safe foreign call with a collector running on a
+ * different Scheme thread. The acquire/release operations keep the test
+ * itself data-race-free under ThreadSanitizer. */
+#if defined(_MSC_VER)
+static volatile LONG collect_safe_block_state_value;
+# define COLLECT_SAFE_BLOCK_LOAD() \
+  ((int)InterlockedCompareExchange(&collect_safe_block_state_value, 0, 0))
+# define COLLECT_SAFE_BLOCK_STORE(v) \
+  ((void)InterlockedExchange(&collect_safe_block_state_value, (LONG)(v)))
+#elif defined(__GNUC__) || defined(__clang__)
+static int collect_safe_block_state_value;
+# define COLLECT_SAFE_BLOCK_LOAD() \
+  __atomic_load_n(&collect_safe_block_state_value, __ATOMIC_ACQUIRE)
+# define COLLECT_SAFE_BLOCK_STORE(v) \
+  __atomic_store_n(&collect_safe_block_state_value, (v), __ATOMIC_RELEASE)
+#else
+# include <stdatomic.h>
+static _Atomic int collect_safe_block_state_value;
+# define COLLECT_SAFE_BLOCK_LOAD() \
+  atomic_load_explicit(&collect_safe_block_state_value, memory_order_acquire)
+# define COLLECT_SAFE_BLOCK_STORE(v) \
+  atomic_store_explicit(&collect_safe_block_state_value, (v), \
+                        memory_order_release)
+#endif
+
+static void collect_safe_block_pause(void)
+{
+#ifdef _WIN32
+  Sleep(1);
+#else
+  struct timespec delay;
+  delay.tv_sec = 0;
+  delay.tv_nsec = 1000000;
+  nanosleep(&delay, NULL);
+#endif
+}
+
+EXPORT void collect_safe_block_reset(void)
+{
+  COLLECT_SAFE_BLOCK_STORE(0);
+}
+
+EXPORT int collect_safe_block_state(void)
+{
+  return COLLECT_SAFE_BLOCK_LOAD();
+}
+
+EXPORT void collect_safe_block_release(void)
+{
+  COLLECT_SAFE_BLOCK_STORE(2);
+}
+
+EXPORT int collect_safe_block_until_release(int timeout_milliseconds)
+{
+  int i;
+
+  COLLECT_SAFE_BLOCK_STORE(1);
+  for (i = 0; i < timeout_milliseconds; i += 1) {
+    int state = COLLECT_SAFE_BLOCK_LOAD();
+    if (state != 1) return state;
+    collect_safe_block_pause();
+  }
+  COLLECT_SAFE_BLOCK_STORE(-1);
+  return -1;
 }
 
 #define GEN(ts, init, sum)                                              \

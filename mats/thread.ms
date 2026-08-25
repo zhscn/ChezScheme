@@ -3127,6 +3127,148 @@
                  '(return . done))
          (eq? (#3%$native-fiber-state task) 'finished))))
 
+(mat native-fiber-collect-safe-blocking-gc
+  (begin
+    (load-thread-foreign-library!)
+    (let* ([main-scheduler
+            (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+           [current-scheduler main-scheduler]
+           [block-reset
+            (foreign-procedure "collect_safe_block_reset" () void)]
+           [block-state
+            (foreign-procedure "collect_safe_block_state" () int)]
+           [block-release
+            (foreign-procedure "collect_safe_block_release" () void)]
+           [block
+            (foreign-procedure __collect_safe
+              "collect_safe_block_until_release" (int) int)]
+           [task #f]
+           [collector-finished? #f]
+           [root-valid-after-call? #f]
+           [root-valid-after-migration? #f])
+      (define (root-valid? root)
+        (and (eq? (vector-ref root 0) 'collect-safe-root)
+             (fx= (bytevector-u8-ref (vector-ref root 1) 8192) 83)))
+      (define (resume-on-worker payload)
+        (let ([result #f])
+          (thread-join
+            (fork-thread
+              (lambda ()
+                (let ([scheduler (#3%$native-fiber-adopt 0)])
+                  (set! current-scheduler scheduler)
+                  (set! result
+                    (and (#3%$native-fiber-try-claim! task)
+                         (#3%$native-fiber-switch scheduler task payload)))))))
+          result))
+      (block-reset)
+      (set! task
+        (#3%$native-fiber-create
+          (lambda ()
+            (let* ([root
+                    (vector 'collect-safe-root
+                      (make-bytevector 16384 83))]
+                   [released-state (block 10000)])
+              (set! root-valid-after-call? (root-valid? root))
+              (#3%$native-fiber-try-claim! current-scheduler)
+              (let ([resume
+                     (#3%$native-fiber-switch
+                       task current-scheduler released-state)])
+                (set! root-valid-after-migration? (root-valid? root))
+                resume)))
+          (lambda (fiber outcome)
+            (#3%$native-fiber-try-claim! current-scheduler)
+            (#3%$native-fiber-finish fiber current-scheduler outcome))
+          #b100))
+      (let ([collector
+             (fork-thread
+               (lambda ()
+                 (let wait ()
+                   (case (block-state)
+                     [(0)
+                      (sleep (make-time 'time-duration 1000 0))
+                      (wait)]
+                     [(1)
+                      (parameterize ([#%$enable-check-heap #t])
+                        (collect (collect-maximum-generation)))
+                      (set! collector-finished? #t)
+                      (block-release)]
+                     [else (void)]))))])
+        (#3%$native-fiber-try-claim! task)
+        (let ([released-state
+               (#3%$native-fiber-switch main-scheduler task 'start)])
+          (thread-join collector)
+          (and (fx= released-state 2)
+               collector-finished?
+               root-valid-after-call?
+               (equal? (resume-on-worker 'collect-safe-resumed)
+                       '(return . collect-safe-resumed))
+               root-valid-after-migration?
+               (eq? (#3%$native-fiber-state task) 'finished)))))))
+
+(if (windows?)
+    (mat native-fiber-nested-signal-altstack #t)
+    (mat native-fiber-nested-signal-altstack
+      (begin
+        (load-thread-foreign-library!)
+        (let* ([scheduler
+                (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+               [run-altstack
+                (foreign-procedure "run_signal_altstack_test"
+                  (int boolean) int)]
+               [task #f]
+               [root #f]
+               [deliveries 0]
+               [relay-deliveries #f]
+               [handler-fiber-valid? #t]
+               [handler-root-valid? #t])
+          (set! task
+            (#3%$native-fiber-create
+              (lambda ()
+                (set! root
+                  (vector 'altstack-signal-root
+                    (make-bytevector 16384 97)))
+                (set! relay-deliveries (run-altstack 14 #t))
+                (let wait ([fuel 10000000])
+                  (unless (fx= deliveries 2)
+                    (when (fx= fuel 0)
+                      (error 'native-fiber-nested-signal-altstack
+                        "nested signals were not delivered"
+                        relay-deliveries deliveries))
+                    (vector fuel root)
+                    (wait (fx- fuel 1))))
+                'done)
+              (lambda (fiber outcome)
+                (#3%$native-fiber-try-claim! scheduler)
+                (#3%$native-fiber-finish fiber scheduler outcome))
+              #b001))
+          (dynamic-wind
+            (lambda ()
+              (register-signal-handler
+                14
+                (lambda (signal)
+                  (unless (fx= signal 14)
+                    (set! handler-fiber-valid? #f))
+                  (set! deliveries (fx+ deliveries 1))
+                  (unless (eq? (#3%$current-native-fiber) task)
+                    (set! handler-fiber-valid? #f))
+                  (unless (and (eq? (vector-ref root 0)
+                                    'altstack-signal-root)
+                               (fx= (bytevector-u8-ref
+                                      (vector-ref root 1) 8192)
+                                    97))
+                    (set! handler-root-valid? #f)))))
+            (lambda ()
+              (#3%$native-fiber-try-claim! task)
+              (let ([outcome (#3%$native-fiber-switch scheduler task 'start)])
+                (and (equal? outcome '(return . done))
+                     (fx= relay-deliveries 2)
+                     (fx= deliveries 2)
+                     handler-fiber-valid?
+                     handler-root-valid?
+                     (eq? (#3%$native-fiber-state task) 'finished))))
+            (lambda ()
+              (register-signal-handler 14 void)))))))
+
 (if (windows?)
     (mat native-fiber-signal-preemption-gc #t)
     (mat native-fiber-signal-preemption-gc
