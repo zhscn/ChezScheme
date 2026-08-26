@@ -53,7 +53,7 @@ include $(STEXLIB)/Mf-stex
 stexsrc = csug.stex title.stex copyright.stex contents.stex\
  preface.stex intro.stex use.stex expeditor.stex debug.stex foreign.stex\
  binding.stex control.stex objects.stex numeric.stex io.stex\
- libraries.stex syntax.stex system.stex smgmt.stex threads.stex\
+ libraries.stex syntax.stex system.stex smgmt.stex threads.stex async.stex\
  compat.stex bibliography.stex summary.stex
 texsrc = ${stexsrc:%.stex=%.tex}
 

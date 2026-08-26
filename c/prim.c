@@ -220,6 +220,8 @@ void S_prim_init(void) {
     create_library_entry_vector();
     create_c_entry_vector();
 
+    S_asyncio_init();
+
     Sforeign_symbol("(cs)fixedpathp", (void *)S_fixedpathp);
     Sforeign_symbol("(cs)bytes_allocated", (void *)S_compute_bytes_allocated);
     Sforeign_symbol("(cs)bytes_finalized", (void *)S_bytes_finalized);
@@ -232,6 +234,8 @@ void S_prim_init(void) {
     Sforeign_symbol("(cs)check_heap_errors", (void *)s_check_heap_errors);
     Sforeign_symbol("(cs)register_native_fiber_rtd",
                     (void *)S_register_native_fiber_rtd);
+    Sforeign_symbol("(cs)validate_native_fiber_layout",
+                    (void *)S_validate_native_fiber_layout);
     register_runtime_test_symbols();
     Sforeign_symbol("(cs)native_fiber_invariant_failure",
                     (void *)s_native_fiber_invariant_failure);

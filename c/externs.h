@@ -194,6 +194,7 @@ extern void S_checkheap_verify_finalization_check(seginfo *oldspacesegments);
 extern void S_checkheap_test_mark_fault(ptr target, iptr action);
 extern void S_checkheap_test_remembered_fault(ptr source, iptr index);
 extern void S_register_native_fiber_rtd(ptr rtd, ptr context);
+extern void S_validate_native_fiber_layout(ptr rtd, ptr layout_probe);
 extern void S_gc_test_phase_reset(void);
 extern void S_gc_test_phase_arm(iptr phase, iptr action);
 extern iptr S_gc_test_phase_mask(void);
@@ -371,6 +372,9 @@ extern ptr S_lookup_c_entry(iptr i);
 extern void S_prim_init(void);
 extern void S_install_c_entry(iptr i, ptr x);
 extern void S_check_c_entry_vector(void);
+
+/* asyncio.c */
+extern void S_asyncio_init(void);
 
 /* prim5.c */
 extern ptr S_strerror(INT errnum);

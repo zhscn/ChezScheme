@@ -1098,6 +1098,244 @@
                    (or stable-claimed?
                        (and stable? (eq? state-name 'claimed)))))]))))))
 
+(mat native-fiber-lifecycle-model
+  (let ()
+    ;; Explore the complete single-fiber lifecycle on two workers.  The
+    ;; publication model above covers the two-fiber cleanup interleaving; this
+    ;; model checks every ownership state that surrounds that transaction.
+    (define state-index 0)
+    (define owner-index 1)
+    (define pinned-index 2)
+    (define context-index 3)
+    (define current-index 4)
+    (define claim-index 5)
+    (define prior-state-index 6)
+    (define prior-owner-index 7)
+    (define transition-index 8)
+    (define scratch-index 9)
+    (define preempt-index 10)
+    (define worker1-live-index 11)
+    (define worker2-live-index 12)
+    (define last-worker-index 13)
+    (define released-index 14)
+    (define preempted-index 15)
+    (define migrated-index 16)
+    (define exited-index 17)
+    (define (changed state . updates)
+      (let ([next (vector-copy state)])
+        (let loop ([updates updates])
+          (unless (null? updates)
+            (vector-set! next (car updates) (cadr updates))
+            (loop (cddr updates))))
+        next))
+    (define (worker-live? state worker)
+      (case worker
+        [(0) #t]
+        [(1) (vector-ref state worker1-live-index)]
+        [(2) (vector-ref state worker2-live-index)]
+        [else #f]))
+    (define (valid? state)
+      (let ([name (vector-ref state state-index)]
+            [owner (vector-ref state owner-index)]
+            [pinned? (vector-ref state pinned-index)]
+            [context? (vector-ref state context-index)]
+            [current (vector-ref state current-index)]
+            [claim (vector-ref state claim-index)]
+            [prior-state (vector-ref state prior-state-index)]
+            [prior-owner (vector-ref state prior-owner-index)]
+            [transition? (vector-ref state transition-index)]
+            [scratch? (vector-ref state scratch-index)]
+            [preempt (vector-ref state preempt-index)])
+        (and (memv owner '(0 1 2))
+             (memv current '(0 1 2))
+             (memv claim '(0 1 2))
+             (memv preempt '(0 1 2))
+             (worker-live? state owner)
+             (worker-live? state current)
+             (worker-live? state claim)
+             (worker-live? state preempt)
+             (eq? transition? scratch?)
+             ;; Collector and observer entry is allowed precisely when this
+             ;; transaction marker is clear.
+             (or transition?
+                 (and (not scratch?)
+                      (not (memq name '(parking finishing)))))
+             (case name
+               [(new)
+                (and (= owner 0) context? (= current 0) (= claim 0)
+                     (not transition?))]
+               [(claimed)
+                (and (> owner 0) context? (= current 0) (= claim owner)
+                     (not transition?)
+                     (memq prior-state '(new parked))
+                     (if (eq? prior-state 'new)
+                         (= prior-owner 0)
+                         (= prior-owner (if pinned? owner 0))))]
+               [(running)
+                (and (> owner 0) (not context?) (= current owner) (= claim 0))]
+               [(parking)
+                (and (> owner 0) context? (= current 0) (= claim 0)
+                     transition?)]
+               [(parked)
+                (and context? (= current 0) (= claim 0) (not transition?)
+                     (= owner (if pinned?
+                                  (vector-ref state last-worker-index)
+                                  0)))]
+               [(finishing)
+                (and (> owner 0) (not context?) (= current 0) (= claim 0)
+                     transition?)]
+               [(finished)
+                (and (= owner 0) (not context?) (= current 0) (= claim 0)
+                     (not transition?))]
+               [else #f])
+             (if (= claim 0)
+                 (and (not prior-state) (= prior-owner 0))
+                 #t)
+             (or (= preempt 0)
+                 (and (eq? name 'running) (= preempt owner)
+                      (= current owner) (not transition?))))))
+    (define (claimable? state worker)
+      (and (worker-live? state worker)
+           (let ([name (vector-ref state state-index)]
+                 [owner (vector-ref state owner-index)])
+             (or (and (eq? name 'new) (= owner 0))
+                 (and (eq? name 'parked)
+                      (or (= owner 0) (= owner worker)))))))
+    (define (successors state)
+      (let ([next '()]
+            [name (vector-ref state state-index)]
+            [owner (vector-ref state owner-index)]
+            [pinned? (vector-ref state pinned-index)]
+            [last-worker (vector-ref state last-worker-index)])
+        (define (add! state) (set! next (cons state next)))
+        (for-each
+          (lambda (worker)
+            (when (claimable? state worker)
+              (add! (changed state
+                      state-index 'claimed
+                      owner-index worker
+                      claim-index worker
+                      prior-state-index name
+                      prior-owner-index owner
+                      migrated-index
+                        (or (vector-ref state migrated-index)
+                            (and (> last-worker 0)
+                                 (not (= last-worker worker))))))))
+          '(1 2))
+        (case name
+          [(claimed)
+           ;; The claim can be rolled back until installation starts.
+           (add! (changed state
+                   state-index (vector-ref state prior-state-index)
+                   owner-index (vector-ref state prior-owner-index)
+                   claim-index 0
+                   prior-state-index #f
+                   prior-owner-index 0
+                   released-index #t))
+           (add! (changed state
+                   state-index 'running
+                   context-index #f
+                   current-index owner
+                   claim-index 0
+                   prior-state-index #f
+                   prior-owner-index 0
+                   transition-index #t
+                   scratch-index #t
+                   last-worker-index owner))]
+          [(running)
+           (if (vector-ref state transition-index)
+               ;; Target-side descriptor cleanup completes before observers or
+               ;; user code can run.
+               (add! (changed state
+                       transition-index #f scratch-index #f))
+               (begin
+                 (unless pinned?
+                   (add! (changed state pinned-index #t)))
+                 (when pinned?
+                   (add! (changed state pinned-index #f)))
+                 (if (= (vector-ref state preempt-index) 0)
+                     (begin
+                       (add! (changed state
+                               preempt-index owner preempted-index #t))
+                       (add! (changed state
+                               state-index 'parking
+                               context-index #t
+                               current-index 0
+                               transition-index #t
+                               scratch-index #t))
+                       (add! (changed state
+                               state-index 'finishing
+                               current-index 0
+                               transition-index #t
+                               scratch-index #t)))
+                     (add! (changed state preempt-index 0)))))]
+          [(parking)
+           (add! (changed state
+                   state-index 'parked
+                   owner-index (if pinned? owner 0)
+                   transition-index #f
+                   scratch-index #f))]
+          [(finishing)
+           (add! (changed state
+                   state-index 'finished
+                   owner-index 0
+                   transition-index #f
+                   scratch-index #f))])
+        ;; A worker may disappear only after all fiber-owned and worker-local
+        ;; roots referring to it have been discharged.
+        (for-each
+          (lambda (worker)
+            (when (and (worker-live? state worker)
+                       (not (= owner worker))
+                       (not (= (vector-ref state current-index) worker))
+                       (not (= (vector-ref state claim-index) worker))
+                       (not (= (vector-ref state preempt-index) worker)))
+              (add! (changed state
+                      (if (= worker 1)
+                          worker1-live-index
+                          worker2-live-index)
+                      #f
+                      exited-index #t))))
+          '(1 2))
+        next))
+    (define (note-state! state states)
+      (let ([name (vector-ref state state-index)])
+        (if (memq name states) states (cons name states))))
+    (let loop ([work
+                (list
+                  (vector 'new 0 #f #t 0 0 #f 0 #f #f 0 #t #t 0
+                          #f #f #f #f)
+                  (vector 'new 0 #t #t 0 0 #f 0 #f #f 0 #t #t 0
+                          #f #f #f #f))]
+               [seen '()]
+               [states '()]
+               [released? #f]
+               [preempted? #f]
+               [migrated? #f]
+               [exited? #f]
+               [pinned-parked? #f])
+      (if (null? work)
+          (and (andmap (lambda (name) (memq name states))
+                 '(new claimed running parking parked finishing finished))
+               released? preempted? migrated? exited? pinned-parked?)
+          (let* ([state (car work)] [key (vector->list state)])
+            (cond
+              [(member key seen)
+               (loop (cdr work) seen states released? preempted? migrated?
+                 exited? pinned-parked?)]
+              [(not (valid? state)) #f]
+              [else
+               (loop (append (successors state) (cdr work))
+                 (cons key seen)
+                 (note-state! state states)
+                 (or released? (vector-ref state released-index))
+                 (or preempted? (vector-ref state preempted-index))
+                 (or migrated? (vector-ref state migrated-index))
+                 (or exited? (vector-ref state exited-index))
+                 (or pinned-parked?
+                     (and (eq? (vector-ref state state-index) 'parked)
+                          (vector-ref state pinned-index))))]))))))
+
 (mat native-fiber-representation
   (not (#3%$native-fiber? #f))
   (let ([fiber (#3%$native-fiber-adopt 0)])

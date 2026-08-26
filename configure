@@ -1000,6 +1000,10 @@ if [ "${LZ4Lib}" = "" ] ; then
     fi
 fi
 
+if [ ! -f "$srcdir"/libuv/include/uv.h ] ; then
+    submod_instructions 'Source in "libuv" is missing'
+fi
+
 if [ "${STEXLIB}" = "" ] ; then
     if [ ! -f "$srcdir"/stex/Mf-stex ] ; then
         submod_instructions 'Source in "stex" is missing'

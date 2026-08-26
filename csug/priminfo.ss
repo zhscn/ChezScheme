@@ -28,19 +28,29 @@
 
   (define put-priminfo!
     (lambda (prim lib*)
-      (when (eq-hashtable-contains? prim-db prim)
-        (warning 'define-symbol-type "extra entry for ~s" prim))
-      (eq-hashtable-set! prim-db prim lib*)))
+      (let ([old-lib* (eq-hashtable-ref prim-db prim #f)])
+        (if old-lib*
+            (let ([new-lib*
+                   (filter
+                     (lambda (lib) (not (member lib old-lib*)))
+                     lib*)])
+              (when (< (length new-lib*) (length lib*))
+                (warning 'define-symbol-type "extra entry for ~s" prim))
+              (eq-hashtable-set! prim-db prim
+                (append old-lib* new-lib*)))
+            (eq-hashtable-set! prim-db prim lib*)))))
 
   (define-syntax define-symbol-flags*
     (lambda (x)
       (syntax-case x (libraries)
-        [(k ([libraries lib ...] [flags flag ...] ignore ...) entry ...)
+        [(k ([libraries] [flags flag ...] ignore ...) entry ...)
          (or (memq 'system (datum (flag ...)))
              (memq 'system-keyword (datum (flag ...))))
          #'(void)]
         [(k ([libraries] ignore ...) entry ...)
          #'(k ([libraries (chezscheme)] ignore ...) entry ...)]
+        [(k ([libraries lib ...] [flags flag ...] ignore ...) entry ...)
+         #'(k ([libraries lib ...] ignore ...) entry ...)]
         [(_ ([libraries lib ...] ignore ...) entry ...)
          (if (syntax-case #'(lib ...) (rnrs)
                    [((rnrs x ...) y ...) #t]

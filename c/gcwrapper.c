@@ -1287,6 +1287,27 @@ static void native_fiber_census_note_context(ptr p) {
   entry->context_seen = 1;
 }
 
+void S_validate_native_fiber_layout(ptr rtd, ptr layout_probe) {
+  if (!Srecordp(rtd) || !Srecordp(layout_probe)
+      || RECORDINSTTYPE(layout_probe) != rtd
+      || size_record_inst(UNFIX(RECORDDESCSIZE(rtd))) != size_native_fiber
+      || NATIVE_FIBER_FIELD(layout_probe, control) != FIX(0)
+      || NATIVE_FIBER_FIELD(layout_probe, context) != FIX(1)
+      || NATIVE_FIBER_FIELD(layout_probe, handler_stack) != FIX(2)
+      || NATIVE_FIBER_FIELD(layout_probe, entry) != FIX(3)
+      || NATIVE_FIBER_FIELD(layout_probe, on_return) != FIX(4)
+      || NATIVE_FIBER_FIELD(layout_probe, starter) != FIX(5)
+      || NATIVE_FIBER_FIELD(layout_probe, incoming_source) != FIX(6)
+      || NATIVE_FIBER_FIELD(layout_probe, incoming_payload) != FIX(7)
+      || NATIVE_FIBER_FIELD(layout_probe, switch_control) != FIX(8)
+      || NATIVE_FIBER_FIELD(layout_probe, commit_control) != FIX(9)
+      || NATIVE_FIBER_FIELD(layout_probe, cache_context) != FIX(10)
+      || NATIVE_FIBER_FIELD(layout_probe, flags) != FIX(11)
+      || NATIVE_FIBER_FIELD(layout_probe, id) != FIX(12)
+      || NATIVE_FIBER_FIELD(layout_probe, pinned_next) != FIX(13))
+    S_error_abort("native-fiber Scheme/C layout is inconsistent");
+}
+
 void S_register_native_fiber_rtd(ptr rtd, ptr context) {
   if (!Srecordp(rtd) || !continuation_objectp(context))
     S_error_abort("native-fiber RTD registration is invalid");
@@ -1631,8 +1652,11 @@ static void check_stack_storage(const char *kind, ptr owner,
   uptr seg, limit_seg;
   seginfo *first_si, *si;
 
-  if (base == 0 || (base & (ptr_bytes - 1)) != 0 || base + span < base)
+  if (base == 0 || (base & (ptr_bytes - 1)) != 0 || base + span < base) {
+    fprintf(stderr, "%s stack bounds: owner=%p base=%p span="Ptd"\n",
+            kind, TO_VOIDP(owner), TO_VOIDP(base), (ptrdiff_t)span);
     malformed_stack(kind, owner, "invalid stack bounds");
+  }
 
   first_si = MaybeSegInfo(addr_get_segment((ptr)base));
   if (first_si == NULL
@@ -1847,6 +1871,11 @@ static void check_continuation_layout(ptr p) {
   iptr clength = CONTCLENGTH(p);
   uptr base, span;
 
+  /* The distinguished terminator has no backing stack allocation.  Stack
+   * walkers in the inspector and continuation runtime stop at the same
+   * object, so it is not a stack-storage owner. */
+  if (p == SYMVAL(S_G.null_continuation_id)) return;
+
   if (length == scaled_shot_1_shot_flag) {
     if (clength != scaled_shot_1_shot_flag)
       malformed_continuation(p, "shot marker mismatch");
@@ -1862,6 +1891,12 @@ static void check_continuation_layout(ptr p) {
 
   base = (uptr)CONTSTACK(p);
   span = (uptr)(length == opportunistic_1_shot_flag ? clength : length);
+  if (span == 0) {
+    if (base != 0)
+      malformed_continuation(p, "empty stack has backing storage");
+    check_stack_frames("continuation", p, 0, 0, CONTRET(p));
+    return;
+  }
   check_stack_storage("continuation", p, base, span);
   if ((uptr)clength > span)
     malformed_continuation(p, "copied stack exceeds storage");

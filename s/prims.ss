@@ -2011,6 +2011,15 @@
    (record-type-descriptor native-fiber-record)
    (#3%$native-fiber-allocate-descriptor)))
 
+(define native-fiber-layout-registration
+  ((foreign-procedure "(cs)validate_native_fiber_layout"
+     (scheme-object scheme-object) void)
+   (record-type-descriptor native-fiber-record)
+   ;; Unique immediates make the Scheme record declaration and the C/VM
+   ;; displacement table an executable ABI contract.
+   (make-native-fiber-record
+     0 1 2 3 4 5 6 7 8 9 10 11 12 13)))
+
 (define native-fiber-next-id (box 0))
 
 (define native-fiber-switch-prohibited?

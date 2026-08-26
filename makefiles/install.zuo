@@ -261,7 +261,10 @@
       (when (string=? zlibLib "")
         (I "-m" "444" (at-workarea* "zlib/libz.a") LibBin))
       (when (string=? LZ4Lib "")
-        (I "-m" "444" (at-workarea* "lz4/lib/liblz4.a") LibBin)))
+        (I "-m" "444" (at-workarea* "lz4/lib/liblz4.a") LibBin))
+      ;; libkernel.a contains the async shim and therefore retains static
+      ;; references to libuv when applications embed the runtime.
+      (I "-m" "444" (at-workarea* "libuv/libuv.a") LibBin))
 
     (apply I (list* "-m" "444" (append
                                 (map (lambda (n) (at-source* "../examples" n))

@@ -5264,6 +5264,71 @@
             (define forbidden
               (lambda (kind)
                 (sorry! who "~s contains forbidden raw-switch IR ~s" name kind)))
+            (define structure-field-disp?
+              (lambda (structure allowed-fields disp)
+                ;; Structure metadata is installed by the active target's
+                ;; cmacros patch.  Consult it instead of embedding host
+                ;; displacements, so this verifier checks cross compilation
+                ;; with the target's TC and object layouts.
+                (let loop ([fields (getprop structure '*fields* '())])
+                  (and (pair? fields)
+                       (let* ([field (car fields)]
+                              [field-name (car field)]
+                              [field-disp (caddr field)]
+                              [limit
+                               (if (pair? (cdr fields))
+                                   (caddr (cadr fields))
+                                   (fx+ field-disp 1))])
+                         (or (and (memq field-name allowed-fields)
+                                  (if (memq field-name '(arg-regs fpregs))
+                                      (and (fx>= disp field-disp)
+                                           (fx< disp limit))
+                                      (fx= disp field-disp)))
+                             (loop (cdr fields))))))))
+            (define tc-switch-disp?
+              (lambda (disp)
+                (structure-field-disp? 'tc
+                  '(arg-regs ac0 ac1 sfp cp esp ap eap ret trap xp yp ts td
+                    save1 fpregs
+                    scheme-stack scheme-stack-size stack-link winders
+                    attachments handler-stack cached-frame
+                    current-native-fiber native-fiber-transition
+                    native-fiber-test-active)
+                  disp)))
+            (define fiber-switch-disp?
+              (lambda (disp)
+                (structure-field-disp? 'native-fiber
+                  '(context handler-stack starter incoming-source
+                    incoming-payload switch-control cache-context)
+                  disp)))
+            (define continuation-switch-disp?
+              (lambda (disp)
+                (structure-field-disp? 'continuation
+                  '(stack stack-length stack-clength link return-address
+                    winders attachments)
+                  disp)))
+            (define verify-lvalue
+              (lambda (lvalue)
+                (nanopass-case (L13 Lvalue) lvalue
+                  [,x (void)]
+                  [(mref ,x1 ,x2 ,imm ,type)
+                   ;; Every raw-switch store is either a TC store through the
+                   ;; canonical TC base or a fiber/descriptor store through a
+                   ;; scratch register.  In particular, this excludes the
+                   ;; parameter vector, allocator, signal, port, and foreign
+                   ;; runtime fields that remain worker-owned.
+                   (unless
+                     (and (eq? x2 %zero)
+                          (if (eq? x1 %tc)
+                              (tc-switch-disp? imm)
+                              (or (fiber-switch-disp? imm)
+                                  (continuation-switch-disp? imm))))
+                     (sorry! who
+                       "~s writes forbidden raw-switch location ~s (tc-base ~s, zero-index ~s, tc-disp ~s, object-disp ~s)"
+                       name lvalue (eq? x1 %tc) (eq? x2 %zero)
+                       (tc-switch-disp? imm)
+                       (or (fiber-switch-disp? imm)
+                           (continuation-switch-disp? imm))))])))
             (define verify-rhs
               (lambda (rhs)
                 (nanopass-case (L13 Rhs) rhs
@@ -5288,7 +5353,9 @@
             (define verify-effect
               (lambda (e)
                 (nanopass-case (L13 Effect) e
-                  [(set! ,lvalue ,rhs) (verify-rhs rhs)]
+                  [(set! ,lvalue ,rhs)
+                   (verify-lvalue lvalue)
+                   (verify-rhs rhs)]
                   [(inline ,info ,effect-prim ,t* ...) (void)]
                   [(nop) (void)]
                   [(if ,p0 ,e1 ,e2)

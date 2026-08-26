@@ -146,6 +146,7 @@ Revised} \revisiondate\raw{ for }\CSVersion\raw{<br>
 \include{smgmt}
 \include{expeditor}
 \include{threads}
+\include{async}
 \include{compat}
 %
 \backmatter

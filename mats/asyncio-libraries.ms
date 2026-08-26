@@ -1,0 +1,28 @@
+;;; Public library boundaries for asynchronous I/O.
+
+(import (chezscheme async io errors))
+(import (chezscheme async io stream))
+(import (chezscheme async io dns))
+(import (chezscheme async io system))
+(import (chezscheme async io poll))
+(import (chezscheme async io process))
+(import (chezscheme async io signal))
+(import (chezscheme async io watch))
+(import (chezscheme async io tty))
+(import (chezscheme async io udp))
+(import (chezscheme async io fs))
+(import (chezscheme async context))
+
+(mat asyncio-libraries
+  (and (procedure? async-io-condition?)
+       (procedure? async-context-cancel!)
+       (procedure? tcp-connect)
+       (procedure? dns-lookup)
+       (procedure? random-bytevector)
+       (procedure? fd-poll-open)
+       (procedure? process-spawn)
+       (procedure? signal-open)
+       (procedure? fs-event-open)
+       (procedure? tty-open)
+       (procedure? udp-open)
+       (procedure? file-open)))

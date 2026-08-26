@@ -3393,6 +3393,97 @@
                        (list-ref result 3) "stack-shape-backtrace")))
               (eq? (#3%$native-fiber-state task) 'finished))]))))
 
+(mat native-fiber-profile-observer-migration
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [current-scheduler scheduler]
+         [task #f]
+         [source-name "native-fiber-profile-observer.ss"]
+         [source
+          "(lambda (suspend limit)\n  (let loop ([i 0] [sum 0])\n    (if (fx= i limit)\n        sum\n        (loop (fx+ i 1) (fx+ sum (suspend i))))))"]
+         [binary-input
+          (open-bytevector-input-port (string->utf8 source))]
+         [source-descriptor
+          (make-source-file-descriptor source-name binary-input)]
+         [profiled-loop
+          (let ()
+            (define (enable-source-profile expression)
+              (cond
+                [(annotation? expression)
+                 (make-annotation
+                   (enable-source-profile (annotation-expression expression))
+                   (annotation-source expression)
+                   (annotation-stripped expression)
+                   (annotation-options debug profile))]
+                [(pair? expression)
+                 (cons (enable-source-profile (car expression))
+                       (enable-source-profile (cdr expression)))]
+                [(vector? expression)
+                 (list->vector
+                   (map enable-source-profile (vector->list expression)))]
+                [else expression]))
+            (let-values ([(expression end)
+                          (get-datum/annotations
+                            (open-string-input-port source)
+                            source-descriptor
+                            0)])
+              (parameterize ([compile-profile 'source]
+                             [current-eval compile])
+                (eval (enable-source-profile expression)
+                  (interaction-environment)))))]
+         [rounds 12])
+    (define (yield value)
+      (#3%$native-fiber-try-claim! current-scheduler)
+      (#3%$native-fiber-switch task current-scheduler value))
+    (close-port binary-input)
+    (set! task
+      (#3%$native-fiber-create
+        (lambda () (profiled-loop yield rounds))
+        (native-fiber-dynamic-return-handler (lambda () current-scheduler))
+        #b100))
+    (#3%$native-fiber-try-claim! task)
+    (let loop ([i 0]
+               [transfer (#3%$native-fiber-switch scheduler task 'start)])
+      (if (fx= i rounds)
+          (let ([entries
+                 (filter
+                   (lambda (entry)
+                     (and (pair? entry)
+                          (pair? (cdr entry))
+                          (equal? (cadr entry) source-name)))
+                   (profile-dump-list))])
+            (let ([ok?
+                   (and (equal? transfer
+                                (cons 'return
+                                  (fxquotient
+                                    (fx* rounds (fx- rounds 1)) 2)))
+                        (eq? (#3%$native-fiber-state task) 'finished)
+                        (pair? entries)
+                        (andmap (lambda (entry)
+                                  (and (integer? (car entry))
+                                       (exact? (car entry))
+                                       (fx>= (car entry) 0)))
+                          entries)
+                        (ormap (lambda (entry)
+                                 (fx> (car entry) rounds))
+                          entries))])
+              (or ok?
+                  (error 'native-fiber-profile-observer-migration
+                    "profile observation disagrees with fiber execution"
+                    transfer
+                    (#3%$native-fiber-state task)
+                    entries))))
+          (and (fx= transfer i)
+               (begin
+                 (parameterize ([#%$enable-check-heap #t])
+                   (collect (collect-maximum-generation)))
+                 #t)
+               (loop (fx+ i 1)
+                 (native-fiber-resume-on-new-thread
+                   task i
+                   (lambda (new-scheduler)
+                     (set! current-scheduler new-scheduler)))))))))
+
 (mat native-fiber-foreign-callback-gc
   (let* ([scheduler
           (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]

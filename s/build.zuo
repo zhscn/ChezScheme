@@ -104,7 +104,7 @@
         "interpret.ss" "cprep.ss" "cpcheck.ss" "cp0.ss" "cpvalid.ss" "cptypes.ss"
         "cpcommonize.ss" "cpletrec.ss" "inspect.ss"
         "enum.ss" "io.ss" "read.ss" "primvars.ss" "syntax.ss" "costctr.ss" "expeditor.ss"
-        "exceptions.ss" "pretty.ss" "env.ss"
+        "exceptions.ss" "async.ss" "asyncsyntax.ss" "asyncio.ss" "pretty.ss" "env.ss"
         "fasl.ss" "vfasl.ss" "pbchunk.ss" "reloc.ss" "pdhtml.ss" "strip.ss" "ftype.ss" "back.ss"))
 
 ;; Note: `raco cross` looks for this definition:
@@ -121,7 +121,10 @@
 (define type-src-names
   ;; files that are `include`d by other files:
   (list "base-lang.ss" "expand-lang.ss" "primref.ss" "types.ss" "io-types.ss"
-        "fasl-helpers.ss" "hashtable-types.ss" "strip-types.ss" "target-fixnum.ss"))
+        "fasl-helpers.ss" "hashtable-types.ss" "strip-types.ss" "target-fixnum.ss"
+        "async/core.ss" "async/operations.ss" "async/runtime.ss" "async/api.ss"
+        "asyncio/ffi.ss" "asyncio/core.ss" "asyncio/network.ss"
+        "asyncio/filesystem.ss" "asyncio/api.ss"))
 
 (define cpnanopass-src-names
   ;; files that are `include`d by "cpnanopass.ss" and "cpprim.ss"
