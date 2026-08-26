@@ -1,6 +1,30 @@
 ;;; -------------------------------------------------------------- suspension
 
 (define async-suspend-token (list 'async-suspended))
+(define async-yield-token (list 'async-yielded))
+
+;;; Cooperative yield is a scheduler transition, not a cancelable wait.  It
+;;; therefore bypasses the generic operation registration handshake while
+;;; retaining cancellation points on both sides of the transfer.
+(define $async-yield
+  (lambda (sched task)
+    (async-check-operation-entry! task)
+    ($async-scheduler-suspension-count-set! sched
+      (fx+ 1 ($async-scheduler-suspension-count sched)))
+    (let ([scheduler-fiber (async-scheduler-native-fiber sched)]
+          [task-fiber (async-task-native-fiber task)])
+      (async-debug-check-native-fiber! '$async-yield
+        task-fiber '(running) #f)
+      (async-debug-check-native-fiber! '$async-yield
+        scheduler-fiber '(parked) #t)
+      (unless ($native-fiber-try-claim! scheduler-fiber)
+        ($oops '$async-yield "scheduler fiber is not claimable"))
+      (guard (c [else
+                 ($native-fiber-release-claim! scheduler-fiber)
+                 (raise c)])
+        ($native-fiber-switch task-fiber scheduler-fiber async-yield-token))
+      (async-check-operation-entry! task)
+      #t)))
 
 ;;; Publish one checked wait and park the active native task fiber.  Completion
 ;;; may win while registration is in progress; the suspension-state handshake
@@ -187,15 +211,20 @@
 
 (define async-fire-due-timers!
   (lambda (sched)
-    (let ([now (sched-now sched)] [heap (async-scheduler-timers sched)])
-      (let loop ()
-        (let ([timer (async-timer-heap-pop-due! heap now)])
-          (when timer
-            (let* ([deliver-box (async-timer-deliver-box timer)]
-                   [deliver (unbox deliver-box)])
-              (when (and deliver (box-cas! deliver-box deliver #f))
-                (deliver (cons 'values '()))))
-            (loop)))))))
+    (let* ([heap (async-scheduler-timers sched)]
+           [next (async-timer-heap-peek heap)])
+      ;; Querying the platform monotonic clock is materially more expensive
+      ;; than an empty-heap check and should disappear from timer-free turns.
+      (when next
+        (let ([now (sched-now sched)])
+          (let loop ()
+            (let ([timer (async-timer-heap-pop-due! heap now)])
+              (when timer
+                (let* ([deliver-box (async-timer-deliver-box timer)]
+                       [deliver (unbox deliver-box)])
+                  (when (and deliver (box-cas! deliver-box deliver #f))
+                    (deliver (cons 'values '()))))
+                (loop)))))))))
 
 
 
@@ -210,9 +239,15 @@
                ($oops 'future-fulfil! "future is already fulfilled"))
              (let ([waiters
                     (async-wait-queue-drain! (async-future-waiters f))])
-               (set-box! (async-future-state f) (cons 'done payload))
+               (async-atomic-box-set!
+                 (async-future-state f) (cons 'done payload))
                waiters))])
       (for-each (lambda (w) ((cdr w) payload)) waiters))))
+
+(define future-ready-payload
+  (lambda (f)
+    (let ([state (async-atomic-box-ref (async-future-state f))])
+      (and (pair? state) (eq? (car state) 'done) (cdr state)))))
 
 
 
@@ -222,24 +257,42 @@
 
 (define async-mutex-current-task
   (lambda (who)
-    (let ([sched ($async-scheduler)])
-      (unless (and ($async-scheduler? sched)
-                   (async-scheduler-current-task sched))
-        ($oops who "outside of an async task"))
-      (async-scheduler-current-task sched))))
+    (async-current-task/required who)))
+
+(define async-owned-mutex-list-limit 8)
+
+(define async-task-owned-mutex-list
+  (lambda (task)
+    (let ([owned (async-task-owned-mutexes task)])
+      (if (hashtable? owned)
+          (vector->list (hashtable-keys owned))
+          owned))))
 
 (define async-task-add-owned-mutex!
   (lambda (task mutex)
     (with-async-mutex (async-task-mutex task)
-      (unless (memq mutex (async-task-owned-mutexes task))
-        (async-task-owned-mutexes-set! task
-          (cons mutex (async-task-owned-mutexes task)))))))
+      (let ([owned (async-task-owned-mutexes task)])
+        (if (hashtable? owned)
+            (hashtable-set! owned mutex mutex)
+            (unless (memq mutex owned)
+              (if (fx>= (length owned) async-owned-mutex-list-limit)
+                  (let ([table (make-eq-hashtable)])
+                    (for-each
+                      (lambda (lock) (hashtable-set! table lock lock))
+                      owned)
+                    (hashtable-set! table mutex mutex)
+                    (async-task-owned-mutexes-set! task table))
+                  (async-task-owned-mutexes-set! task
+                    (cons mutex owned)))))))))
 
 (define async-task-remove-owned-mutex!
   (lambda (task mutex)
     (with-async-mutex (async-task-mutex task)
-      (async-task-owned-mutexes-set! task
-        (remq mutex (async-task-owned-mutexes task))))))
+      (let ([owned (async-task-owned-mutexes task)])
+        (if (hashtable? owned)
+            (hashtable-delete! owned mutex)
+            (async-task-owned-mutexes-set! task
+              (remq mutex owned)))))))
 
 ;;; Ownership is published before a waiter can resume on another scheduler.
 (define async-mutex-handoff!
@@ -265,6 +318,20 @@
                         (publish)))
                     (loop)))))))))
 
+(define async-fiber-mutex-try-acquire!
+  (lambda (mutex task who)
+    (let ([acquired?
+           (with-async-mutex (async-fiber-mutex-mutex mutex)
+             (cond
+               [(not (async-fiber-mutex-owner mutex))
+                (async-fiber-mutex-owner-set! mutex task)
+                (async-task-add-owned-mutex! task mutex)
+                #t]
+               [(eq? (async-fiber-mutex-owner mutex) task)
+                ($oops who "mutex is not recursive")]
+               [else #f]))])
+      acquired?)))
+
 (define async-fiber-mutex-acquire-operation
   (lambda (mutex)
     (let ([token (list 'async-mutex-acquire-operation)]
@@ -273,19 +340,12 @@
         (lambda (ss)
           (let ([task (async-mutex-current-task
                         'async-mutex-acquire-operation)])
-            (async-sync-slot-set! ss token task)
-            (let ([result
-                   (with-async-mutex (async-fiber-mutex-mutex mutex)
-                     (cond
-                       [(not (async-fiber-mutex-owner mutex))
-                        (async-fiber-mutex-owner-set! mutex task)
-                        'acquired]
-                       [(eq? (async-fiber-mutex-owner mutex) task)
-                        ($oops 'async-mutex-acquire-operation
-                          "mutex is not recursive")]
-                       [else #f]))])
-              (when result (async-task-add-owned-mutex! task mutex))
-              (and result (cons 'values '())))))
+            (if (async-fiber-mutex-try-acquire! mutex task
+                  'async-mutex-acquire-operation)
+                (cons 'values '())
+                (begin
+                  (async-sync-slot-set! ss token task)
+                  #f))))
         (lambda (ss deliver)
           (let ([task (async-sync-slot-ref ss token #f)])
             (unless task
@@ -362,6 +422,35 @@
     (and (not (async-rw-mutex-writer mutex))
          (fx= (hashtable-size (async-rw-mutex-readers mutex)) 0))))
 
+(define async-rw-mutex-try-acquire!
+  (lambda (mutex mode task)
+    (with-async-mutex (async-rw-mutex-mutex mutex)
+      (if (eq? mode 'read)
+          (cond
+            [(eq? (async-rw-mutex-writer mutex) task)
+             ($oops 'async-rw-mutex-read-acquire
+               "write owner cannot acquire a read lock")]
+            [(fx> (async-rw-mutex-reader-count mutex task) 0)
+             (async-rw-mutex-add-reader! mutex task)
+             #t]
+            [(and (not (async-rw-mutex-writer mutex))
+                  (async-wait-queue-empty? (async-rw-mutex-waiters mutex)))
+             (async-rw-mutex-add-reader! mutex task)
+             #t]
+            [else #f])
+          (cond
+            [(eq? (async-rw-mutex-writer mutex) task)
+             ($oops 'async-rw-mutex-acquire "mutex is not recursive")]
+            [(fx> (async-rw-mutex-reader-count mutex task) 0)
+             ($oops 'async-rw-mutex-acquire
+               "read-to-write upgrade is not supported")]
+            [(and (async-rw-mutex-idle? mutex)
+                  (async-wait-queue-empty? (async-rw-mutex-waiters mutex)))
+             (async-rw-mutex-writer-set! mutex task)
+             (async-task-add-owned-mutex! task mutex)
+             #t]
+            [else #f])))))
+
 ;;; Grant either the first writer or the consecutive reader prefix.  The
 ;;; state is installed before delivery so resumed tasks observe ownership.
 (define async-rw-mutex-handoff!
@@ -429,38 +518,11 @@
                         (if (eq? mode 'read)
                             'async-rw-mutex-read-acquire-operation
                             'async-rw-mutex-acquire-operation))])
-            (async-sync-slot-set! ss token task)
-            (with-async-mutex (async-rw-mutex-mutex mutex)
-              (cond
-                [(eq? mode 'read)
-                 (cond
-                   [(eq? (async-rw-mutex-writer mutex) task)
-                    ($oops 'async-rw-mutex-read-acquire-operation
-                      "write owner cannot acquire a read lock")]
-                   [(fx> (async-rw-mutex-reader-count mutex task) 0)
-                    (async-rw-mutex-add-reader! mutex task)
-                    (cons 'values '())]
-                   [(and (not (async-rw-mutex-writer mutex))
-                         (async-wait-queue-empty?
-                           (async-rw-mutex-waiters mutex)))
-                    (async-rw-mutex-add-reader! mutex task)
-                    (cons 'values '())]
-                   [else #f])]
-                [else
-                 (cond
-                   [(eq? (async-rw-mutex-writer mutex) task)
-                    ($oops 'async-rw-mutex-acquire-operation
-                      "mutex is not recursive")]
-                   [(fx> (async-rw-mutex-reader-count mutex task) 0)
-                    ($oops 'async-rw-mutex-acquire-operation
-                      "read-to-write upgrade is not supported")]
-                   [(and (async-rw-mutex-idle? mutex)
-                         (async-wait-queue-empty?
-                           (async-rw-mutex-waiters mutex)))
-                    (async-rw-mutex-writer-set! mutex task)
-                    (async-task-add-owned-mutex! task mutex)
-                    (cons 'values '())]
-                   [else #f])]))))
+            (if (async-rw-mutex-try-acquire! mutex mode task)
+                (cons 'values '())
+                (begin
+                  (async-sync-slot-set! ss token task)
+                  #f))))
         (lambda (ss deliver)
           (let ([task (async-sync-slot-ref ss token #f)])
             (unless task

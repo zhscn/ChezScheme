@@ -55,7 +55,7 @@
 ;;; foreign-procedure bindings, resolved lazily from the statically linked
 ;;; kernel
 (define aio-loop-open #f)
-(define aio-set-notify #f)
+(define aio-completion-pop #f)
 (define aio-loop-run #f)
 (define aio-loop-alive #f)
 (define aio-loop-destroy #f)
@@ -208,7 +208,8 @@
 (define aio-resolve!
   (lambda ()
     (set! aio-loop-open (foreign-procedure "aio_loop_open" () void*))
-    (set! aio-set-notify (foreign-procedure "aio_set_notify" (void* void*) void))
+    (set! aio-completion-pop
+      (foreign-procedure "aio_completion_pop" (void* u8*) int))
     (set! aio-loop-run (foreign-procedure "aio_loop_run" (void* int) int))
     (set! aio-loop-alive (foreign-procedure "aio_loop_alive" (void*) int))
     (set! aio-loop-destroy (foreign-procedure "aio_loop_destroy" (void*) int))
@@ -231,7 +232,7 @@
     (set! aio-read-stop (foreign-procedure "aio_read_stop" (void*) int))
     (set! aio-read-copy (foreign-procedure "aio_read_copy" (void* u8* integer-64) void))
     (set! aio-free (foreign-procedure "aio_free" (void*) void))
-    (set! aio-write (foreign-procedure "aio_write" (void* u8* integer-64 integer-64) int))
+    (set! aio-write (foreign-procedure "chez_aio_write" (void* u8* integer-64 integer-64) int))
     (set! aio-shutdown (foreign-procedure "aio_shutdown" (void* integer-64) int))
     (set! aio-udp-init (foreign-procedure "aio_udp_init" (void* integer-64) void*))
     (set! aio-udp-bind (foreign-procedure "aio_udp_bind" (void* string integer-64 int) int))

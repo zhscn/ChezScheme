@@ -18,7 +18,6 @@ outer_timeout_seconds=$((timeout_seconds + 10))
 
 exec timeout --signal=TERM --kill-after=5 "$outer_timeout_seconds" \
   env CHEZ_ASYNC_CHECK_INVARIANTS="${CHEZ_ASYNC_CHECK_INVARIANTS:-1}" \
-      CHEZ_NATIVE_FIBER_CHECK_INVARIANTS="${CHEZ_NATIVE_FIBER_CHECK_INVARIANTS:-1}" \
       CHEZ_ASYNC_STRESS_ITERATIONS="$iterations" \
       CHEZ_ASYNC_STRESS_TIMEOUT="$timeout_seconds" \
       CHEZ_ASYNC_STRESS_IO="${CHEZ_ASYNC_STRESS_IO:-1}" \

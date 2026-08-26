@@ -37,8 +37,8 @@
 (define stress-io?
   (let ([v (getenv "CHEZ_ASYNC_STRESS_IO")])
     (not (and v (member v '("" "0" "false" "no"))))))
-(define stress-native-fiber-invariants?
-  (let ([v (getenv "CHEZ_NATIVE_FIBER_CHECK_INVARIANTS")])
+(define stress-invariants?
+  (let ([v (getenv "CHEZ_ASYNC_CHECK_INVARIANTS")])
     (and v (not (member v '("" "0" "false" "no"))))))
 (define stress-scenario (or (getenv "CHEZ_ASYNC_STRESS_SCENARIO") "all"))
 (define stress-trace? (and (getenv "CHEZ_ASYNC_STRESS_TRACE") #t))
@@ -56,7 +56,7 @@
 
 (define stress-check-native-fiber-invariants!
   (lambda ()
-    (when stress-native-fiber-invariants?
+    (when stress-invariants?
       ;; Heap checking includes the VM's global native-fiber census,
       ;; stack-root ownership checks, pinned registries, and transition
       ;; scratch invariants.  Enable it only for the explicit full-collection

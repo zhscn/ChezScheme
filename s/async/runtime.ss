@@ -4,10 +4,7 @@
   (lambda (sched name parent-group parent-context migratable?
            termination-actions entry)
     (let* ([group ($async-scheduler-group sched)]
-           [id (with-async-mutex (async-scheduler-group-mutex group)
-                 (let ([id (async-scheduler-group-next-task-id group)])
-                   (async-scheduler-group-next-task-id-set! group (fx+ 1 id))
-                   id))]
+           [id (async-next-task-id! group)]
            [task #f])
       (set! task
         (make-async-task id name 'ready entry #f group sched #f migratable? #f #f
@@ -53,9 +50,13 @@
                            ($native-fiber-try-claim! scheduler-fiber))
                 ($oops 'async-task "scheduler fiber is not claimable at task exit"))
               ($native-fiber-finish fiber scheduler-fiber outcome)))
-          (if migratable?
-              (constant native-fiber-flag-migratable)
-              (constant native-fiber-flag-pinned))))
+          (fxlogor
+            (if migratable?
+                (constant native-fiber-flag-migratable)
+                (constant native-fiber-flag-pinned))
+            (if async-debug-invariants?
+                (constant native-fiber-flag-debug)
+                0))))
       task)))
 
 (define ensure-child-group
@@ -121,7 +122,9 @@
     ;; backstop for both that race and unscoped acquisitions.
     (let ([owned-locks
            (with-async-mutex (async-task-mutex task)
-             (async-task-owned-mutexes task))])
+             (let ([locks (async-task-owned-mutex-list task)])
+               (async-task-owned-mutexes-set! task '())
+               locks))])
       (for-each
         (lambda (lock) (async-release-task-lock! lock task))
         owned-locks))
@@ -171,6 +174,15 @@
       [(completed) (cons 'values (async-task-result-values task))]
       [else (cons 'raise (async-task-failure-condition task))])))
 
+(define async-task-join-ready-payload!
+  (lambda (task)
+    (with-async-mutex (async-task-mutex task)
+      (and (task-terminal? task)
+           (begin
+             (when (eq? (async-task-state task) 'failed)
+               (async-task-observed?-set! task #t))
+             (task-join-payload task))))))
+
 (define async-task-join-operation
   (lambda (task)
     (let ([token (list 'task-join-operation)])
@@ -180,12 +192,7 @@
           (when (and (async-scheduler? sched)
                      (eq? task (async-scheduler-current-task sched)))
             ($oops 'task-join-operation "a task cannot join itself")))
-        (with-async-mutex (async-task-mutex task)
-          (and (task-terminal? task)
-               (begin
-                 (when (eq? (async-task-state task) 'failed)
-                   (async-task-observed?-set! task #t))
-                 (task-join-payload task)))))
+        (async-task-join-ready-payload! task))
       (lambda (ss deliver)
         (let ([payload
                (with-async-mutex (async-task-mutex task)
@@ -231,7 +238,8 @@
       (make-async-work-deque)
       (make-async-queue) (make-async-os-mutex)
       (if-feature pthreads (make-condition) #f)
-      (make-eq-hashtable) 0 0 #f 'created virtual? 0 (make-async-timer-heap) #f
+      #f #f #f (fx+ index 1) #f 'created virtual? 0
+      (make-async-timer-heap) #f
       0 0 preemption-ticks 0 0 (box 0) #f #f #f)))
 
 (define async-drain-remote!
@@ -361,20 +369,32 @@
                     async-preemption-token)
             (set-timer (async-scheduler-preemption-ticks sched))))))))
 
+;;; Install the handler once for a scheduler worker.  Individual dispatches
+;;; only arm and disarm the timer, avoiding parameter and handler churn on
+;;; every cooperative suspension.
+(define call-with-async-preemption-handler
+  (lambda (sched thunk)
+    (if (not (async-scheduler-preemption-ticks sched))
+        (thunk)
+        (let* ([saved-handler (timer-interrupt-handler)]
+               [saved-ticks (set-timer 0)])
+          (dynamic-wind
+            (lambda ()
+              (timer-interrupt-handler async-preemption-handler)
+              (set-timer 0))
+            thunk
+            (lambda ()
+              (set-timer 0)
+              (timer-interrupt-handler saved-handler)
+              (set-timer saved-ticks)))))))
+
 ;;; Reserve the Chez tick timer only while a native task fiber is running.
 (define call-with-async-preemption
   (lambda (sched thunk)
-    (let* ([saved-handler (timer-interrupt-handler)]
-           [saved-ticks (set-timer 0)])
-      (dynamic-wind
-        (lambda ()
-          (timer-interrupt-handler async-preemption-handler)
-          (set-timer (async-scheduler-preemption-ticks sched)))
-        thunk
-        (lambda ()
-          (set-timer 0)
-          (timer-interrupt-handler saved-handler)
-          (set-timer saved-ticks))))))
+    (dynamic-wind
+      (lambda () (set-timer (async-scheduler-preemption-ticks sched)))
+      thunk
+      (lambda () (set-timer 0)))))
 
 (define async-switch-to-task
   (lambda (sched task)
@@ -440,6 +460,11 @@
         [(eq? outcome async-suspend-token)
          (async-finish-suspension! task)
          task]
+        [(eq? outcome async-yield-token)
+         (async-task-state-set! task 'ready)
+         (async-atomic-box-add! (async-scheduler-wakeup-count-box sched) 1)
+         (async-publish-ready! task sched)
+         #f]
         [(eq? outcome async-preemption-token)
          (async-task-state-set! task 'ready)
          (async-scheduler-preemption-count-set! sched
@@ -526,7 +551,12 @@
 
 (define async-install-scheduler-fiber!
   (lambda (sched)
-    (let ([fiber (or ($current-native-fiber) ($native-fiber-adopt 0))])
+    (let ([fiber
+           (or ($current-native-fiber)
+               ($native-fiber-adopt
+                 (if async-debug-invariants?
+                     (constant native-fiber-flag-debug)
+                     0)))])
       (unless (not (fx= (fxlogand ($native-fiber-flags fiber)
                                   (constant native-fiber-flag-scheduler))
                          0))
@@ -544,7 +574,9 @@
             ($async-scheduler sched)
             (async-scheduler-status-set! sched 'running)
             (async-scheduler-owner-thread-set! sched (get-thread-id)))
-          (lambda () (async-scheduler-run sched))
+          (lambda ()
+            (call-with-async-preemption-handler sched
+              (lambda () (async-scheduler-run sched))))
           (lambda ()
             ($async-io-shutdown sched)
             (async-scheduler-status-set! sched 'shutdown)

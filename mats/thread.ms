@@ -1969,7 +1969,7 @@
 
 (define (native-fiber-claim-corruption-death-test corruption expected)
   (native-fiber-subprocess-death-test
-    `((define fiber (#3%$native-fiber-create values values #b100))
+    `((define fiber (#3%$native-fiber-create values values #b1100))
       (case ',corruption
         [(missing-context)
          (#3%$record-set! fiber ,native-fiber-context-field-index #f)]
@@ -1980,7 +1980,7 @@
         [(stable-scratch)
          (#3%$record-set! fiber ,native-fiber-incoming-source-field-index fiber)]
         [(bad-flags)
-         (#3%$record-set! fiber ,native-fiber-flags-field-index 0)]
+         (#3%$record-set! fiber ,native-fiber-flags-field-index #b1000)]
         [(mixed-entry-roots)
          (#3%$record-set! fiber ,native-fiber-entry-field-index #f)])
       (#3%$native-fiber-try-claim! fiber))

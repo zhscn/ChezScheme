@@ -19,13 +19,15 @@
 (define async-debug-runnable-mutex (make-async-os-mutex))
 (define async-debug-runnable (make-eq-hashtable))
 
-(define async-invariant
-  (lambda (ok? message object)
-    (when (and async-debug-invariants? (not ok?))
-      (fprintf (console-error-port) "async invariant failed: ~a: ~s\n"
-        message object)
-      (flush-output-port (console-error-port))
-      ($oops 'async-invariant "~a: ~s" message object))))
+(define-syntax async-invariant
+  (syntax-rules ()
+    [(_ ok? message object)
+     (when async-debug-invariants?
+       (unless ok?
+         (fprintf (console-error-port) "async invariant failed: ~a: ~s\n"
+           message object)
+         (flush-output-port (console-error-port))
+         ($oops 'async-invariant "~a: ~s" message object)))]))
 
 (define async-debug-queue-claim!
   (lambda (task location)
@@ -247,6 +249,8 @@
 ;;; Initialized after the public task procedures are assembled.  The internal
 ;;; entry accepts non-inherited termination actions for scoped task creation.
 (define async-spawn-task #f)
+(define async-channel-try-put! #f)
+(define async-channel-try-receive! #f)
 
 ;;; -------------------------------------------------------- sync states
 ;;;
@@ -346,7 +350,7 @@
 ;;; ------------------------------------------------------------ records
 
 (define-record-type (async-scheduler make-async-scheduler% $async-scheduler?)
-  (nongenerative async-scheduler-layer15)
+  (nongenerative async-scheduler-layer16)
   (sealed #t)
   (fields
     (mutable native-fiber)          ; worker's adopted scheduler fiber
@@ -358,9 +362,10 @@
     (immutable remote-queue)        ; cross-thread submissions
     (immutable remote-mutex)
     (immutable remote-cond)
-    (mutable tasks)                 ; eq-hashtable id -> task
-    (mutable task-count $async-scheduler-task-count $async-scheduler-task-count-set!)
-    (mutable next-id)
+    (mutable idle-previous)         ; group idle-list links
+    (mutable idle-next)
+    (mutable idle-linked?)
+    (mutable steal-seed)            ; owner-only victim permutation state
     (mutable owner-thread)          ; thread id running the loop, or #f
     (mutable status)                ; created | running | shutdown
     (mutable virtual?)              ; deterministic virtual clock
@@ -378,18 +383,20 @@
     (mutable io-state)))            ; io layer data
 
 (define-record-type (async-scheduler-group make-async-scheduler-group async-scheduler-group?)
-  (nongenerative)
+  (nongenerative async-scheduler-group-layer2)
   (sealed #t)
   (fields
     (immutable mutex)
     (immutable condition)
     (immutable ready-queue)         ; ready migratable tasks
-    (immutable tasks)               ; stable id -> task registry for the group
-    (mutable task-count)
+    (immutable tasks)               ; debug-only stable id -> task registry
+    (immutable task-count-box)
     (mutable schedulers)
     (mutable root-task)
-    (mutable next-task-id)
-    (mutable idle-schedulers)       ; schedulers that may block waiting for work
+    (immutable next-task-id-box)
+    (mutable idle-schedulers)       ; intrusive list head
+    (immutable idle-count-box)
+    (immutable work-count-box)      ; published Chase--Lev entries
     (mutable shutdown?)
     (mutable failure)
     (mutable workers)))
@@ -460,7 +467,7 @@
     (mutable sync-state)            ; box of the current wait, or #f
     (immutable cancel-shield-box)   ; atomic box: cancellation temporarily masked
     (mutable termination-actions)   ; trusted hooks run exactly at termination
-    (mutable owned-mutexes)         ; async locks released at termination
+    (mutable owned-mutexes)         ; short list or eq-hashtable of owned locks
     (immutable mutex)))
 
 (define-record-type (async-task-group make-async-task-group% $async-task-group?)
@@ -799,6 +806,21 @@
                (not (async-task-cancel-shield? task)))
       (raise (task-cancellation-condition task)))))
 
+(define async-check-operation-entry!
+  (lambda (task)
+    (async-check-cancellation! task)
+    (let ([context (and (not (async-task-cancel-shield? task))
+                        (async-current-context))])
+      (when (and context (async-context-canceled?/raw context))
+        (raise (async-context-cancellation-condition context)))
+      context)))
+
+(define async-return-payload
+  (lambda (payload)
+    (if (eq? (car payload) 'values)
+        (apply values (cdr payload))
+        (raise (cdr payload)))))
+
 (define async-task-group-runnable?
   (lambda (task)
     (and (async-task-migratable? task)
@@ -810,6 +832,19 @@
         (async-scheduler-vtime sched)
         (async-monotonic-us))))
 
+(define async-scheduler-group-task-count
+  (lambda (group)
+    (async-atomic-box-ref (async-scheduler-group-task-count-box group))))
+
+(define async-next-task-id!
+  (lambda (group)
+    (let ([id-box (async-scheduler-group-next-task-id-box group)])
+      (let loop ([id (async-atomic-box-ref id-box)])
+        (let ([next (if (fx= id (most-positive-fixnum)) 0 (fx+ id 1))])
+          (if (box-cas! id-box id next)
+              id
+              (loop (async-atomic-box-ref id-box))))))))
+
 (define sched-registry-add/raw!
   (lambda (sched task)
     (let* ([group ($async-scheduler-group sched)]
@@ -817,8 +852,7 @@
            [id (async-task-id task)])
       (unless (hashtable-ref tasks id #f)
         (hashtable-set! tasks id task)
-        (async-scheduler-group-task-count-set! group
-          (fx+ 1 (async-scheduler-group-task-count group))))
+        (async-atomic-box-add! (async-scheduler-group-task-count-box group) 1))
       (async-invariant
         (fx= (async-scheduler-group-task-count group)
              (hashtable-size tasks))
@@ -831,8 +865,7 @@
            [id (async-task-id task)])
       (when (hashtable-ref tasks id #f)
         (hashtable-delete! tasks id)
-        (async-scheduler-group-task-count-set! group
-          (fx- (async-scheduler-group-task-count group) 1)))
+        (async-atomic-box-add! (async-scheduler-group-task-count-box group) -1))
       (async-invariant
         (fx= (async-scheduler-group-task-count group)
              (hashtable-size tasks))
@@ -840,15 +873,19 @@
 
 (define sched-registry-add!
   (lambda (sched task)
-    (with-async-mutex
-      (async-scheduler-group-mutex ($async-scheduler-group sched))
-      (sched-registry-add/raw! sched task))))
+    (let ([group ($async-scheduler-group sched)])
+      (if async-debug-invariants?
+          (with-async-mutex (async-scheduler-group-mutex group)
+            (sched-registry-add/raw! sched task))
+          (async-atomic-box-add! (async-scheduler-group-task-count-box group) 1)))))
 
 (define sched-registry-remove!
   (lambda (sched task)
-    (with-async-mutex
-      (async-scheduler-group-mutex ($async-scheduler-group sched))
-      (sched-registry-remove/raw! sched task))))
+    (let ([group ($async-scheduler-group sched)])
+      (if async-debug-invariants?
+          (with-async-mutex (async-scheduler-group-mutex group)
+            (sched-registry-remove/raw! sched task))
+          (async-atomic-box-add! (async-scheduler-group-task-count-box group) -1)))))
 
 (define async-group-parallel?
   (lambda (group)
@@ -856,15 +893,8 @@
 
 (define async-group-has-work?
   (lambda (group)
-    (let ([schedulers (async-scheduler-group-schedulers group)])
-      (let loop ([i 0])
-        (and (fx< i (vector-length schedulers))
-             (let* ([deque
-                     (async-scheduler-work-deque (vector-ref schedulers i))]
-                    [top (async-atomic-box-ref (async-work-deque-top deque))]
-                    [bottom
-                     (async-atomic-box-ref (async-work-deque-bottom deque))])
-               (or (fx< top bottom) (loop (fx+ i 1)))))))))
+    (fx> (async-atomic-box-ref
+           (async-scheduler-group-work-count-box group)) 0)))
 
 (define async-debug-check-owner!
   (lambda (sched)
@@ -901,31 +931,56 @@
 (define async-group-take-idle/raw!
   (lambda (group)
     (let ([idle (async-scheduler-group-idle-schedulers group)])
-      (if (null? idle)
+      (if (not idle)
           #f
           (begin
-            (async-scheduler-group-idle-schedulers-set! group (cdr idle))
-            (car idle))))))
+            (let ([next (async-scheduler-idle-next idle)])
+              (async-scheduler-group-idle-schedulers-set! group next)
+              (when next (async-scheduler-idle-previous-set! next #f))
+              (async-scheduler-idle-previous-set! idle #f)
+              (async-scheduler-idle-next-set! idle #f)
+              (async-scheduler-idle-linked?-set! idle #f)
+              (async-atomic-box-add!
+                (async-scheduler-group-idle-count-box group) -1)
+              idle))))))
 
 (define async-group-next-wake-target!
   (lambda (group)
-    (with-async-mutex (async-scheduler-group-mutex group)
-      (async-group-take-idle/raw! group))))
+    (and (fx> (async-atomic-box-ref
+                (async-scheduler-group-idle-count-box group)) 0)
+         (with-async-mutex (async-scheduler-group-mutex group)
+           (async-group-take-idle/raw! group)))))
 
 (define async-group-mark-idle!
   (lambda (sched)
     (let ([group ($async-scheduler-group sched)])
       (with-async-mutex (async-scheduler-group-mutex group)
-        (unless (memq sched (async-scheduler-group-idle-schedulers group))
-          (async-scheduler-group-idle-schedulers-set! group
-            (cons sched (async-scheduler-group-idle-schedulers group))))))))
+        (unless (async-scheduler-idle-linked? sched)
+          (let ([head (async-scheduler-group-idle-schedulers group)])
+            (async-scheduler-idle-previous-set! sched #f)
+            (async-scheduler-idle-next-set! sched head)
+            (when head (async-scheduler-idle-previous-set! head sched))
+            (async-scheduler-group-idle-schedulers-set! group sched)
+            (async-scheduler-idle-linked?-set! sched #t)
+            (async-atomic-box-add!
+              (async-scheduler-group-idle-count-box group) 1)))))))
 
 (define async-group-unmark-idle!
   (lambda (sched)
     (let ([group ($async-scheduler-group sched)])
       (with-async-mutex (async-scheduler-group-mutex group)
-        (async-scheduler-group-idle-schedulers-set! group
-          (remq sched (async-scheduler-group-idle-schedulers group)))))))
+        (when (async-scheduler-idle-linked? sched)
+          (let ([previous (async-scheduler-idle-previous sched)]
+                [next (async-scheduler-idle-next sched)])
+            (if previous
+                (async-scheduler-idle-next-set! previous next)
+                (async-scheduler-group-idle-schedulers-set! group next))
+            (when next (async-scheduler-idle-previous-set! next previous))
+            (async-scheduler-idle-previous-set! sched #f)
+            (async-scheduler-idle-next-set! sched #f)
+            (async-scheduler-idle-linked?-set! sched #f)
+            (async-atomic-box-add!
+              (async-scheduler-group-idle-count-box group) -1)))))))
 
 (define async-work-push!
   (lambda (sched task)
@@ -942,7 +997,10 @@
       (vector-set! (async-work-ring-slots ring)
         (fxand bottom (async-work-ring-mask ring)) task)
       ;; Publish only after the ring slot is visible to thieves.
-      (async-atomic-box-set! (async-work-deque-bottom deque) (fx+ bottom 1)))))
+      (async-atomic-box-set! (async-work-deque-bottom deque) (fx+ bottom 1))
+      (async-atomic-box-add!
+        (async-scheduler-group-work-count-box
+          ($async-scheduler-group sched)) 1))))
 
 (define async-work-pop!
   (lambda (sched)
@@ -973,26 +1031,61 @@
                          (when (fx= top bottom)
                            (async-atomic-box-set!
                              (async-work-deque-bottom deque) (fx+ top 1)))
+                         (unless task
+                           ($oops 'async-work-pop!
+                             "published work-deque slot is empty"))
                          (async-debug-queue-release! task)
                          task)))])])
+        (when task
+          (async-atomic-box-add!
+            (async-scheduler-group-work-count-box
+              ($async-scheduler-group sched)) -1))
         task))))
 
-(define async-work-steal!
+(define async-work-steal-one!
   (lambda (victim)
     (let* ([deque (async-scheduler-work-deque victim)]
            [top (async-atomic-box-ref (async-work-deque-top deque))]
            [bottom (async-atomic-box-ref (async-work-deque-bottom deque))]
            [task
             (and (fx< top bottom)
-                 (let* ([ring (async-atomic-box-ref (async-work-deque-ring deque))]
+                 (let* ([ring (async-atomic-box-ref
+                                (async-work-deque-ring deque))]
                         [slot (fxand top (async-work-ring-mask ring))]
                         [task (vector-ref (async-work-ring-slots ring) slot)])
                    (and (box-cas! (async-work-deque-top deque) top (fx+ top 1))
                         (begin
+                          (unless task
+                            ($oops 'async-work-steal-one!
+                              "published work-deque slot is empty"))
                           (vector-set! (async-work-ring-slots ring) slot #f)
                           (async-debug-queue-release! task)
+                          (async-atomic-box-add!
+                            (async-scheduler-group-work-count-box
+                              ($async-scheduler-group victim)) -1)
                           task))))])
       task)))
+
+;;; Repeated single-item claims preserve the Chase--Lev last-item race while
+;;; still amortizing victim selection and wakeup costs across a batch.
+(define async-work-steal-batch!
+  (lambda (victim)
+    (let ([first (async-work-steal-one! victim)])
+      (and first
+           (let* ([deque (async-scheduler-work-deque victim)]
+                  [available
+                   (fx- (async-atomic-box-ref (async-work-deque-bottom deque))
+                        (async-atomic-box-ref (async-work-deque-top deque)))]
+                  [extra (if (fx> available 1)
+                             (fxquotient available 2)
+                             available)])
+             (let loop ([remaining extra] [tasks (list first)])
+               (if (fx= remaining 0)
+                   (reverse tasks)
+                   (let ([task (async-work-steal-one! victim)])
+                     (if task
+                         (loop (fx- remaining 1) (cons task tasks))
+                         (reverse tasks))))))))))
 
 (define async-adopt-work!
   (lambda (sched task)
@@ -1011,17 +1104,33 @@
                 (let* ([group ($async-scheduler-group sched)]
                        [schedulers (async-scheduler-group-schedulers group)]
                        [n (vector-length schedulers)]
-                       [start (async-scheduler-group-index sched)])
-                  (let loop ([offset 1])
-                    (if (fx= offset n)
+                       [self (async-scheduler-group-index sched)]
+                       [start (fxmod (fx+ (async-scheduler-steal-seed sched) 1) n)]
+                       [budget (let ([others (fx- n 1)])
+                                 (if (fx< others 8) others 8))])
+                  (async-scheduler-steal-seed-set! sched start)
+                  (let loop ([index start] [remaining budget])
+                    (if (fx= remaining 0)
                         #f
-                        (let ([task
-                               (async-work-steal!
-                                 (vector-ref schedulers
-                                   (fxmod (fx+ start offset) n)))])
-                          (if task
-                              (async-adopt-work! sched task)
-                              (loop (fx+ offset 1)))))))))))))
+                        (if (fx= index self)
+                            (loop (fxmod (fx+ index 1) n) remaining)
+                            (let ([batch
+                                   (async-work-steal-batch!
+                                     (vector-ref schedulers index))])
+                              (if batch
+                                  (begin
+                                    ;; Keep one task for immediate execution
+                                    ;; and amortize the successful steal by
+                                    ;; publishing the remainder locally.
+                                    (for-each
+                                      (lambda (task)
+                                        (async-work-push! sched
+                                          (async-adopt-work! sched task)))
+                                      (cdr batch))
+                                    (async-adopt-work! sched
+                                      (car batch)))
+                                  (loop (fxmod (fx+ index 1) n)
+                                    (fx- remaining 1))))))))))))))
 
 (define async-work-submit!
   (lambda (task preferred)

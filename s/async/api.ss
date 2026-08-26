@@ -210,7 +210,10 @@
 (set-who! task-group-wait
   (lambda (grp)
     (unless (task-group? grp) ($oops who "~s is not a task group" grp))
-    (perform-operation (group-empty-operation grp))
+    (async-check-operation-entry! (async-current-task/required who))
+    (unless (with-async-mutex (async-task-group-mutex grp)
+              (async-group-empty?/locked grp))
+      (perform-operation (group-empty-operation grp)))
     (let loop ()
       (let ([u
              (with-async-mutex (async-task-group-mutex grp)
@@ -240,7 +243,10 @@
   (lambda (mutex)
     (unless (async-mutex? mutex)
       ($oops who "~s is not an async mutex" mutex))
-    (perform-operation (async-fiber-mutex-acquire-operation mutex))))
+    (let ([task (async-mutex-current-task who)])
+      (async-check-operation-entry! task)
+      (unless (async-fiber-mutex-try-acquire! mutex task who)
+        (perform-operation (async-fiber-mutex-acquire-operation mutex))))))
 
 (set-who! async-mutex-release!
   (lambda (mutex)
@@ -300,13 +306,21 @@
   (lambda (mutex)
     (unless (async-rw-mutex? mutex)
       ($oops who "~s is not an async rw mutex" mutex))
-    (perform-operation (async-rw-mutex-acquire-operation/raw mutex 'write))))
+    (let ([task (async-mutex-current-task who)])
+      (async-check-operation-entry! task)
+      (unless (async-rw-mutex-try-acquire! mutex 'write task)
+        (perform-operation
+          (async-rw-mutex-acquire-operation/raw mutex 'write))))))
 
 (set-who! async-rw-mutex-read-acquire
   (lambda (mutex)
     (unless (async-rw-mutex? mutex)
       ($oops who "~s is not an async rw mutex" mutex))
-    (perform-operation (async-rw-mutex-acquire-operation/raw mutex 'read))))
+    (let ([task (async-mutex-current-task who)])
+      (async-check-operation-entry! task)
+      (unless (async-rw-mutex-try-acquire! mutex 'read task)
+        (perform-operation
+          (async-rw-mutex-acquire-operation/raw mutex 'read))))))
 
 (set-who! async-rw-mutex-release!
   (lambda (mutex)
@@ -386,7 +400,10 @@
   (lambda (group)
     (unless (async-wait-group? group)
       ($oops who "~s is not an async wait group" group))
-    (perform-operation (async-wait-group-wait-operation/raw group))))
+    (async-check-operation-entry! (async-current-task/required who))
+    (unless (with-async-mutex (async-wait-group-mutex group)
+              (= (async-wait-group-count group) 0))
+      (perform-operation (async-wait-group-wait-operation/raw group)))))
 
 (set-who! spawn-task/async-wait-group
   (lambda (group thunk . options)
@@ -699,12 +716,8 @@
       (let ([task (async-scheduler-current-task sched)])
         (unless task
           ($oops who "perform-operation outside of an async task"))
-        (async-check-cancellation! task)
-        (let* ([context (and (not (async-task-cancel-shield? task))
-                             (async-current-context))]
+        (let* ([context (async-check-operation-entry! task)]
                [ss (make-async-sync-state)])
-          (when (and context (async-context-canceled?/raw context))
-            (raise (async-context-cancellation-condition context)))
           (let ([r ((operation-try op) ss)])
             (if r
                 (async-deliver-operation-result op r)
@@ -813,8 +826,7 @@
     (let ([token (list 'future-operation)])
       (make-async-operation
       (lambda (ss)
-        (let ([state (unbox (async-future-state f))])
-          (and (pair? state) (eq? (car state) 'done) (cdr state))))
+        (future-ready-payload f))
       (lambda (ss deliver)
         (with-async-mutex (async-future-mutex f)
           (let ([state (unbox (async-future-state f))])
@@ -835,7 +847,13 @@
 
 (set-who! future-get
   (lambda (f)
-    (perform-operation (future-operation f))))
+    (unless (future? f) ($oops who "~s is not a future" f))
+    (let ([task (async-current-task/required who)])
+      (async-check-operation-entry! task)
+      (let ([payload (future-ready-payload f)])
+        (if payload
+            (async-return-payload payload)
+            (perform-operation (future-operation f)))))))
 
 (set-who! make-channel
   (case-lambda
@@ -888,30 +906,62 @@
     (with-async-mutex (async-channel-mutex ch)
       (async-channel-closed? ch))))
 
+(set! async-channel-try-put!
+  (lambda (ch v)
+    (let-values ([(payload publications)
+                  (with-async-mutex (async-channel-mutex ch)
+                    (cond
+                      [(async-channel-closed? ch)
+                       (values (async-channel-put-closed-payload ch) '())]
+                      [(async-channel-reserve-getter! ch v)
+                       => (lambda (reservation)
+                            (values (cons 'values '())
+                              (async-delivery-prepare-all!
+                                (list (cdr reservation)))))]
+                      [(and (fx> (async-channel-capacity ch) 0)
+                            (fx< (async-channel-bcount ch)
+                              (async-channel-capacity ch)))
+                       (async-buffer-push! ch v)
+                       (values (cons 'values '()) '())]
+                      [else (values #f '())]))])
+      (async-delivery-publish-all! publications)
+      payload)))
+
+(set! async-channel-try-receive!
+  (lambda (ch)
+    (let-values ([(payload publications)
+                  (with-async-mutex (async-channel-mutex ch)
+                    (cond
+                      [(and (fx> (async-channel-capacity ch) 0)
+                            (fx> (async-channel-bcount ch) 0))
+                       (let* ([v (async-buffer-pop! ch)]
+                              [putter (async-channel-reserve-putter! ch)])
+                         (when putter
+                           (async-buffer-push! ch (vector-ref putter 0)))
+                         (values (cons 'values (list v #t))
+                           (if putter
+                               (async-delivery-prepare-all!
+                                 (list (vector-ref putter 2)))
+                               '())))]
+                      [(async-channel-reserve-putter! ch)
+                       => (lambda (putter)
+                            (values
+                              (cons 'values (list (vector-ref putter 0) #t))
+                              (async-delivery-prepare-all!
+                                (list (vector-ref putter 2)))))]
+                      [(async-channel-closed? ch)
+                       (values (async-channel-receive-closed-payload) '())]
+                      [else (values #f '())]))])
+      (async-delivery-publish-all! publications)
+      payload)))
+
 (set-who! channel-put-operation
   (lambda (ch v)
     (unless (channel? ch) ($oops who "~s is not a channel" ch))
     (let ([token (list 'channel-put-operation)])
       (make-async-operation
         (lambda (ss)
-          (let-values ([(payload publications)
-                        (with-async-mutex (async-channel-mutex ch)
-                          (cond
-                            [(async-channel-closed? ch)
-                             (values (async-channel-put-closed-payload ch) '())]
-                            [(async-channel-reserve-getter! ch v)
-                             => (lambda (reservation)
-                                  (values (cons 'values '())
-                                    (async-delivery-prepare-all!
-                                      (list (cdr reservation)))))]
-                            [(and (fx> (async-channel-capacity ch) 0)
-                                  (fx< (async-channel-bcount ch)
-                                    (async-channel-capacity ch)))
-                             (async-buffer-push! ch v)
-                             (values (cons 'values '()) '())]
-                            [else (values #f '())]))])
-            (async-delivery-publish-all! publications)
-            payload))
+          (async-channel-try-put! ch v))
         (lambda (ss deliver)
           (let-values ([(descriptor publications)
                         (with-async-mutex (async-channel-mutex ch)
@@ -971,33 +1021,7 @@
     (let ([token (list 'channel-receive-operation)])
       (make-async-operation
         (lambda (ss)
-          (let-values ([(payload publications)
-                        (with-async-mutex (async-channel-mutex ch)
-                          (cond
-                            [(and (fx> (async-channel-capacity ch) 0)
-                                  (fx> (async-channel-bcount ch) 0))
-                             (let* ([v (async-buffer-pop! ch)]
-                                    [putter (async-channel-reserve-putter! ch)])
-                               (when putter
-                                 (async-buffer-push! ch (vector-ref putter 0)))
-                               (values (cons 'values (list v #t))
-                                 (if putter
-                                     (async-delivery-prepare-all!
-                                       (list (vector-ref putter 2)))
-                                     '())))]
-                            [(async-channel-reserve-putter! ch)
-                             => (lambda (putter)
-                                  (values
-                                    (cons 'values
-                                      (list (vector-ref putter 0) #t))
-                                    (async-delivery-prepare-all!
-                                      (list (vector-ref putter 2)))))]
-                            [(async-channel-closed? ch)
-                             (values
-                               (async-channel-receive-closed-payload) '())]
-                            [else (values #f '())]))])
-            (async-delivery-publish-all! publications)
-            payload))
+          (async-channel-try-receive! ch))
         (lambda (ss deliver)
           (let-values ([(descriptor publications)
                         (with-async-mutex (async-channel-mutex ch)
@@ -1078,16 +1102,36 @@
 
 (set-who! channel-put
   (lambda (ch v)
-    (perform-operation (channel-put-operation ch v))
+    (unless (channel? ch) ($oops who "~s is not a channel" ch))
+    (async-check-operation-entry! (async-current-task/required who))
+    (let ([payload (async-channel-try-put! ch v)])
+      (if payload
+          (async-return-payload payload)
+          (perform-operation (channel-put-operation ch v))))
     (void)))
 
 (set-who! channel-get
   (lambda (ch)
-    (perform-operation (channel-get-operation ch))))
+    (unless (channel? ch) ($oops who "~s is not a channel" ch))
+    (async-check-operation-entry! (async-current-task/required who))
+    (let ([payload (async-channel-try-receive! ch)])
+      (if payload
+          (if (eq? (car payload) 'raise)
+              (raise (cdr payload))
+              (let ([values (cdr payload)])
+                (if (cadr values)
+                    (car values)
+                    (raise (async-channel-closed-condition ch)))))
+          (perform-operation (channel-get-operation ch))))))
 
 (set-who! channel-receive
   (lambda (ch)
-    (perform-operation (channel-receive-operation ch))))
+    (unless (channel? ch) ($oops who "~s is not a channel" ch))
+    (async-check-operation-entry! (async-current-task/required who))
+    (let ([payload (async-channel-try-receive! ch)])
+      (if payload
+          (async-return-payload payload)
+          (perform-operation (channel-receive-operation ch))))))
 
 (set! async-spawn-task
   (lambda (who thunk options termination-actions)
@@ -1146,11 +1190,14 @@
 (set-who! task-join
   (lambda (task)
     (unless (task? task) ($oops who "~s is not a task" task))
-    (let ([sched ($async-scheduler)])
-      (when (and (async-scheduler? sched)
-                 (eq? task (async-scheduler-current-task sched)))
-        ($oops who "a task cannot join itself")))
-    (perform-operation (async-task-join-operation task))))
+    (let ([current (async-current-task/required who)])
+      (when (eq? task current)
+        ($oops who "a task cannot join itself"))
+      (async-check-operation-entry! current)
+      (let ([payload (async-task-join-ready-payload! task)])
+        (if payload
+            (async-return-payload payload)
+            (perform-operation (async-task-join-operation task)))))))
 
 (set-who! task-join-operation
   (lambda (task)
@@ -1187,16 +1234,7 @@
     (let ([sched ($async-scheduler)])
       (if (and (async-scheduler? sched)
                (async-scheduler-current-task sched))
-          (let ([op
-                 (make-async-operation
-                   (lambda (ss) #f)
-                   (lambda (ss deliver)
-                     (deliver (cons 'values (list #t)))
-                     '(yield))
-                   (lambda (vals) vals)
-                   (lambda (ss) (void)))])
-            (perform-operation op)
-            #t)
+          ($async-yield sched (async-scheduler-current-task sched))
           #f))))
 
 (set-who! async-dynamic-wind
@@ -1247,8 +1285,10 @@
       (let* ([group (make-async-scheduler-group
                       (make-async-os-mutex)
                       (if-feature pthreads (make-condition) #f)
-                      (make-async-queue) (make-eq-hashtable) 0
-                      '#() #f 0 '() #f #f '())]
+                      (make-async-queue)
+                      (and async-debug-invariants? (make-eq-hashtable))
+                      (box 0) '#() #f (box 0) #f (box 0) (box 0)
+                      #f #f '())]
              [schedulers (make-vector parallelism)])
         (do ([i 0 (fx+ i 1)]) ((fx= i parallelism))
           (vector-set! schedulers i
@@ -1285,7 +1325,9 @@
                 ($async-scheduler sched)
                 (async-scheduler-status-set! sched 'running)
                 (async-scheduler-owner-thread-set! sched (get-thread-id)))
-              (lambda () (async-scheduler-run sched))
+              (lambda ()
+                (call-with-async-preemption-handler sched
+                  (lambda () (async-scheduler-run sched))))
               (lambda ()
                 ($async-io-shutdown sched)
                 (async-scheduler-status-set! sched 'shutdown)
@@ -1323,9 +1365,7 @@
 (set-who! async-scheduler-task-count
   (lambda (sched)
     (unless (async-scheduler? sched) ($oops who "~s is not a scheduler" sched))
-    (let ([group ($async-scheduler-group sched)])
-      (with-async-mutex (async-scheduler-group-mutex group)
-        (async-scheduler-group-task-count group)))))
+    (async-scheduler-group-task-count ($async-scheduler-group sched))))
 
 (set-who! async-scheduler-turn-count
   (lambda (sched)

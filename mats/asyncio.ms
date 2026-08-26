@@ -36,6 +36,16 @@
   (lambda (path)
     (when (file-exists? path) (delete-file path))))
 
+;; Internal libuv entry points retain their identity when other shared
+;; libraries contribute symbols from the POSIX AIO namespace.
+(when (threaded?)
+  (load-shared-object
+    (let ([p (find-source "foreign1.so")])
+      (if (or (path-absolute? p)
+              (not (equal? "" (path-parent p))))
+          p
+          (path-build "." p)))))
+
 (define asyncio-test-burn
   (lambda (n)
     (let loop ([i 0])

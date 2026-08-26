@@ -4,9 +4,9 @@
    uv_req_t.  Scheme code refers to native objects through opaque pointers
    and stable integer identifiers registered in a Scheme-side registry.
 
-   All user-visible events are reported through a single notify trampoline
-   installed per loop; the trampoline runs only inside uv_run on the thread
-   that owns the loop.  libuv worker threads never call back into Scheme. */
+   All user-visible events are appended to a loop-local completion queue.
+   Scheme drains that queue after uv_run returns, so libuv worker threads and
+   callbacks never enter Scheme. */
 
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 # define _POSIX_C_SOURCE 200112L
@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdio.h>
 #if !defined(_WIN32)
 # include <unistd.h>
 #else
@@ -45,11 +46,15 @@
 #define AIO_EV_FS_EVENT 16
 #define AIO_EV_FS_POLL  17
 
-/* notify(loop, id, kind, status, aux) */
-typedef void (*aio_notify_t)(void *loop, int64_t id, int64_t kind,
-                             int64_t status, void *aux);
-
 typedef struct aio_loop aio_loop_t;
+
+typedef struct aio_completion {
+  struct aio_completion *next;
+  int64_t id;
+  int64_t kind;
+  int64_t status;
+  void *aux;
+} aio_completion_t;
 
 typedef struct aio_read_buffer {
   struct aio_read_buffer *next;
@@ -59,11 +64,12 @@ typedef struct aio_read_buffer {
 
 struct aio_loop {
   uv_loop_t *loop;
-  aio_notify_t notify;
   uv_async_t *wakeup;    /* lets foreign threads interrupt a blocking uv_run */
   uv_timer_t *bridge;    /* fires at the nearest Scheme-side timer deadline */
   aio_read_buffer_t *read_buffers;
   unsigned int read_buffer_count;
+  aio_completion_t *completion_head;
+  aio_completion_t *completion_tail;
 };
 
 /* per-request context for operations that carry C-owned data */
@@ -173,7 +179,22 @@ static void aio_read_buffer_return(char *data) {
 static void aio_report(uv_loop_t *loop, int64_t id, int64_t kind,
                        int64_t status, void *aux) {
   aio_loop_t *al = aio_loop_of(loop);
-  if (al->notify) al->notify(al, id, kind, status, aux);
+  aio_completion_t *completion =
+    (aio_completion_t *)malloc(sizeof(aio_completion_t));
+  if (!completion) {
+    fputs("async I/O completion queue allocation failed\n", stderr);
+    abort();
+  }
+  completion->next = NULL;
+  completion->id = id;
+  completion->kind = kind;
+  completion->status = status;
+  completion->aux = aux;
+  if (al->completion_tail)
+    al->completion_tail->next = completion;
+  else
+    al->completion_head = completion;
+  al->completion_tail = completion;
 }
 
 static char *aio_strdup(const char *s) {
@@ -194,20 +215,32 @@ void *aio_loop_open(void) {
     free(al);
     return NULL;
   }
-  al->notify = NULL;
   al->wakeup = NULL;
   al->bridge = NULL;
   al->read_buffers = NULL;
   al->read_buffer_count = 0;
+  al->completion_head = NULL;
+  al->completion_tail = NULL;
   uv_loop_set_data(al->loop, al);
   (void)uv_loop_configure(al->loop, UV_METRICS_IDLE_TIME);
   return al;
 }
 
-void aio_set_notify(void *al_, void (*notify)(void *, int64_t, int64_t,
-                                              int64_t, void *)) {
+/* Writes id, kind, status, and aux as four native int64 values. */
+int aio_completion_pop(void *al_, unsigned char *out) {
   aio_loop_t *al = (aio_loop_t *)al_;
-  al->notify = notify;
+  aio_completion_t *completion = al->completion_head;
+  int64_t values[4];
+  if (!completion) return 0;
+  al->completion_head = completion->next;
+  if (!al->completion_head) al->completion_tail = NULL;
+  values[0] = completion->id;
+  values[1] = completion->kind;
+  values[2] = completion->status;
+  values[3] = (int64_t)(intptr_t)completion->aux;
+  memcpy(out, values, sizeof(values));
+  free(completion);
+  return 1;
 }
 
 /* mode: 0 = poll without waiting, 1 = wait for one event */
@@ -224,7 +257,9 @@ int aio_loop_alive(void *al_) {
 /* closes the loop after all handles are closed; frees the wrapper */
 int aio_loop_destroy(void *al_) {
   aio_loop_t *al = (aio_loop_t *)al_;
-  int r = uv_loop_close(al->loop);
+  int r;
+  if (al->completion_head) return UV_EBUSY;
+  r = uv_loop_close(al->loop);
   if (r == 0) {
     while (al->read_buffers) {
       aio_read_buffer_t *buffer = al->read_buffers;
@@ -2051,7 +2086,7 @@ int64_t aio_eagain_code(void) { return UV_EAGAIN; }
 void S_asyncio_init(void) {
 #define AIO_REGISTER(name) Sforeign_symbol(#name, (void *)name)
   AIO_REGISTER(aio_loop_open);
-  AIO_REGISTER(aio_set_notify);
+  AIO_REGISTER(aio_completion_pop);
   AIO_REGISTER(aio_loop_run);
   AIO_REGISTER(aio_loop_alive);
   AIO_REGISTER(aio_loop_destroy);
@@ -2074,9 +2109,7 @@ void S_asyncio_init(void) {
   AIO_REGISTER(aio_read_stop);
   AIO_REGISTER(aio_read_copy);
   AIO_REGISTER(aio_free);
-  /* Keep the Scheme ABI name without exporting a definition that collides
-     with the POSIX aio_write function declared by <aio.h>. */
-  Sforeign_symbol("aio_write", (void *)chez_aio_write);
+  Sforeign_symbol("chez_aio_write", (void *)chez_aio_write);
   AIO_REGISTER(aio_shutdown);
   AIO_REGISTER(aio_udp_init);
   AIO_REGISTER(aio_udp_bind);

@@ -2071,6 +2071,7 @@
 (define native-fiber-start)
 (define native-fiber-check-running!)
 (define native-fiber-check-stable!)
+(define native-fiber-check-stable/full!)
 (define native-fiber-context-valid?)
 (define native-fiber-empty-context-valid?)
 (define native-fiber-control-word-valid?)
@@ -2541,7 +2542,7 @@
             ($oops who "the current native-fiber root disagrees with worker state"))))
       (native-fiber-check-preemption-request! who #t))))
 
-(set! native-fiber-check-stable!
+(set! native-fiber-check-stable/full!
   (lambda (who fiber)
     ;; This checker runs only outside the noninterruptible exchange. It makes
     ;; the lifecycle/stack-root agreement explicit at every public boundary.
@@ -2659,17 +2660,29 @@
            (native-fiber-id fiber) state)])
       (native-fiber-check-worker! who))))
 
+(set! native-fiber-check-stable!
+  (lambda (who fiber)
+    (when (or ($enable-check-heap)
+              (not (fx= (fxlogand (native-fiber-flags fiber)
+                           (constant native-fiber-flag-debug))
+                         0)))
+      (native-fiber-check-stable/full! who fiber))))
+
 (set! native-fiber-check-stable-internal!
   (lambda (who fiber)
     ;; Once ownership or stack publication has committed, an invariant
     ;; failure cannot be delivered as a recoverable Scheme exception: doing
     ;; so would expose a half-transitioned fiber to user code.
-    (guard (condition
-             [else
-              (display-condition condition (current-error-port))
-              (newline (current-error-port))
-              (native-fiber-invariant-failure)])
-      (native-fiber-check-stable! who fiber))))
+    (when (or ($enable-check-heap)
+              (not (fx= (fxlogand (native-fiber-flags fiber)
+                           (constant native-fiber-flag-debug))
+                         0)))
+      (guard (condition
+               [else
+                (display-condition condition (current-error-port))
+                (newline (current-error-port))
+                (native-fiber-invariant-failure)])
+        (native-fiber-check-stable/full! who fiber)))))
 
 (set! $native-fiber-create
   (lambda (entry on-return flags)

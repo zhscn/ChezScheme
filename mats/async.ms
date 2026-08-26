@@ -1369,6 +1369,20 @@
              (task-join child))))
     'inherited)
 
+  ;; Cooperative yield observes cancellation of the ambient context.
+  (eq? (run-async
+         (lambda ()
+           (let ([context (make-async-context)])
+             (call-with-async-context context
+               (lambda ()
+                 (async-context-cancel! context 'yield-canceled)
+                 (guard (c
+                          [(async-cancellation-condition? c)
+                           (async-cancellation-reason c)])
+                   (task-yield)
+                   'unexpected))))))
+    'yield-canceled)
+
   ;; Direct thread-parameter assignment has native worker semantics.  The
   ;; scheduler does not snapshot or restore the parameter vector.
   (equal? (let ([p (make-thread-parameter 'outside)])
@@ -1987,6 +2001,27 @@
                 (async-mutex-acquire mutex)
                 'finished)))
           (with-async-mutex mutex 'reacquired))))
+    'reacquired)
+
+  ;; The owned-lock index remains exact after it grows beyond the short-list
+  ;; representation used by ordinary tasks.
+  (equal?
+    (run-async
+      (lambda ()
+        (let ([mutexes
+               (let loop ([i 0] [mutexes '()])
+                 (if (fx= i 12)
+                     mutexes
+                     (loop (fx+ i 1)
+                       (cons (make-async-mutex) mutexes))))])
+          (task-join
+            (spawn-task
+              (lambda ()
+                (for-each async-mutex-acquire mutexes)
+                'finished)))
+          (for-each async-mutex-acquire mutexes)
+          (for-each async-mutex-release! mutexes)
+          'reacquired)))
     'reacquired)
 
   ;; Suspension and scheduler migration retain ownership until scope exit.

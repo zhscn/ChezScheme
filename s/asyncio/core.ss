@@ -1,46 +1,5 @@
 ;;; ------------------------------------------------------------ records
 
-(define-record-type (aio-completion make-aio-completion aio-completion?)
-  (nongenerative)
-  (sealed #t)
-  (fields
-    (immutable id)
-    (immutable kind)
-    (immutable status)
-    (immutable aux)
-    (mutable next)))
-
-(define-record-type (aio-completion-queue
-                      make-aio-completion-queue%
-                      aio-completion-queue?)
-  (nongenerative)
-  (sealed #t)
-  (fields (mutable head) (mutable tail)))
-
-(define make-aio-completion-queue
-  (lambda () (make-aio-completion-queue% #f #f)))
-
-(define aio-completion-queue-empty?
-  (lambda (queue) (not (aio-completion-queue-head queue))))
-
-(define aio-completion-queue-push!
-  (lambda (queue completion)
-    (let ([tail (aio-completion-queue-tail queue)])
-      (if tail
-          (aio-completion-next-set! tail completion)
-          (aio-completion-queue-head-set! queue completion))
-      (aio-completion-queue-tail-set! queue completion))))
-
-(define aio-completion-queue-pop!
-  (lambda (queue)
-    (let ([head (aio-completion-queue-head queue)])
-      (when head
-        (let ([next (aio-completion-next head)])
-          (aio-completion-queue-head-set! queue next)
-          (unless next (aio-completion-queue-tail-set! queue #f))
-          (aio-completion-next-set! head #f)))
-      head)))
-
 ;;; Intrusive owner-locked queues are used for I/O waiters and serialized
 ;;; filesystem operations.  Cancellation unlinks the exact node in O(1).
 (define-record-type (aio-queue-node make-aio-queue-node aio-queue-node?)
@@ -125,7 +84,7 @@
 ;;; by handle id.  The tables are guarded because a cancellation nack can run
 ;;; on a thread other than the scheduler's.
 (define-record-type (aio-state make-aio-state aio-state?)
-  (nongenerative)
+  (nongenerative aio-state-layer4)
   (sealed #t)
   (fields
     (immutable owner)             ; scheduler that drives this loop
@@ -138,11 +97,12 @@
     (immutable handles)           ; id -> weak-cons wrapper #t
     (immutable files)             ; fd -> weak-cons async-file #t
     (immutable directories)       ; native pointer -> weak-cons async-directory #t
-    (immutable completions)       ; owner-only FIFO of native completions
+    (immutable completion-buffer) ; scratch for one native completion
     (mutable commands)            ; owner-thread thunks, newest first
     (immutable command-mutex)     ; also guards closing and wakeup lifetime
     (mutable stop-set)            ; streams that may need uv_read_stop
     (immutable stop-mutex)
+    (mutable poll-count)          ; owner-only guardian maintenance cadence
     (mutable closing?)
     (immutable guardian)
     (immutable file-guardian)
@@ -207,33 +167,18 @@
     (mutable busy?)
     (immutable queue)))
 
-;;; ------------------------------------------------- notify trampoline
+;;; --------------------------------------------------------- invariants
 
 (define aio-debug-invariants?
   (let ([v (getenv "CHEZ_ASYNC_CHECK_INVARIANTS")])
     (and v (not (member v '("" "0" "false" "no"))))))
 
-(define aio-invariant
-  (lambda (ok? message object)
-    (when (and aio-debug-invariants? (not ok?))
-      ($oops 'async-io-invariant "~a: ~s" message object))))
-
-;;; Runs inside uv_run on the scheduler thread.  Enqueues the completion and
-;;; nothing more; a condition is swallowed rather than escaping through C.
-(define aio-notify-trampoline
-  (let ([p (foreign-callable
-             (lambda (lp id kind status aux)
-               (guard (c [else (void)])
-                 (let* ([sched (current-async-scheduler)]
-                        [st (and sched ($async-scheduler-io-state sched))])
-                   (when (and st (= lp (aio-state-loop st)))
-                     (aio-completion-queue-push!
-                       (aio-state-completions st)
-                       (make-aio-completion id kind status aux #f))))))
-             (void* integer-64 integer-64 integer-64 void*)
-             void)])
-    (lock-object p)
-    p))
+(define-syntax aio-invariant
+  (syntax-rules ()
+    [(_ ok? message object)
+     (when aio-debug-invariants?
+       (unless ok?
+         ($oops 'async-io-invariant "~a: ~s" message object)))]))
 
 ;;; ------------------------------------------------------------ helpers
 
@@ -370,7 +315,10 @@
                      (cons command (aio-state-commands st)))
                    #t)))])
       (when accepted?
-        (aio-wakeup-send (aio-state-loop st)))
+        (let ([status (aio-wakeup-send (aio-state-loop st))])
+          (when (fx< status 0)
+            ($oops 'async-io "cannot wake the owning libuv loop: ~s"
+              status))))
       accepted?)))
 
 (define aio-drain-commands!
@@ -754,17 +702,18 @@
 
 (define aio-drain-completions!
   (lambda (st)
-    (let ([queue (aio-state-completions st)])
-      (let loop ([n aio-dispatch-bound])
-        (unless (fx= n 0)
-          (let ([completion (aio-completion-queue-pop! queue)])
-            (when completion
+    (let ([buffer (aio-state-completion-buffer st)])
+      (let loop ([n aio-dispatch-bound] [count 0])
+        (if (or (fx= n 0)
+                (fx= (aio-completion-pop (aio-state-loop st) buffer) 0))
+            count
+            (begin
               (aio-dispatch-event st
-                (aio-completion-id completion)
-                (aio-completion-kind completion)
-                (aio-completion-status completion)
-                (aio-completion-aux completion))
-              (loop (fx- n 1)))))))))
+                (bytevector-s64-native-ref buffer 0)
+                (bytevector-s64-native-ref buffer 8)
+                (bytevector-s64-native-ref buffer 16)
+                (bytevector-u64-native-ref buffer 24))
+              (loop (fx- n 1) (fx+ count 1))))))))
 
 ;;; deferred uv_read_stop requests: set by cancellation nacks that may run
 ;;; off the scheduler thread, drained by the poll hook on the scheduler thread
@@ -845,6 +794,7 @@
 ;;; ------------------------------------------------------- poll and wake
 
 (define AIO-IDLE-RECHECK-MS 100)
+(define AIO-GUARDIAN-POLL-INTERVAL 256)
 
 (define aio-arm-bridge
   (lambda (st sched)
@@ -859,22 +809,40 @@
                    (min AIO-IDLE-RECHECK-MS
                      (quotient (+ delta 999) 1000)))
                  AIO-IDLE-RECHECK-MS)])
-        (aio-bridge-start (aio-state-loop st) timeout-ms)))))
+        (let ([status
+               (aio-bridge-start (aio-state-loop st) timeout-ms)])
+          (when (fx< status 0)
+            ($oops 'async-io "cannot arm the libuv scheduler bridge: ~s"
+              status)))))))
 
 (define aio-poll
   (lambda (sched block?)
     (let ([st ($async-scheduler-io-state sched)])
       (when (and st (not (aio-state-closing? st)))
         (aio-debug-check-owner! st)
-        (aio-drain-guardian! st)
-        (aio-drain-file-guardian! st)
-        (aio-drain-directory-guardian! st)
-        (aio-drain-commands! st)
-        (aio-drain-stop-set! st)
-        (when block? (aio-arm-bridge st sched))
-        (aio-loop-run (aio-state-loop st) (if block? 1 0))
-        (when block? (aio-bridge-stop (aio-state-loop st)))
-        (aio-drain-completions! st)))))
+        (let* ([old-count (aio-state-poll-count st)]
+               [count (if (fx= old-count (most-positive-fixnum))
+                          0
+                          (fx+ old-count 1))])
+          (aio-state-poll-count-set! st count)
+          ;; Event dispatch advances on every scheduler turn because a libuv
+          ;; operation can require multiple nonblocking uv_run transitions
+          ;; while Scheme work keeps the scheduler runnable.
+          (when (or block?
+                    (fx= (fxmod count AIO-GUARDIAN-POLL-INTERVAL) 0))
+            (aio-drain-guardian! st)
+            (aio-drain-file-guardian! st)
+            (aio-drain-directory-guardian! st))
+          (aio-drain-commands! st)
+          (aio-drain-stop-set! st)
+          (when block? (aio-arm-bridge st sched))
+          (aio-loop-run (aio-state-loop st) (if block? 1 0))
+          (when block?
+            (let ([status (aio-bridge-stop (aio-state-loop st))])
+              (when (fx< status 0)
+                ($oops 'async-io
+                  "cannot disarm the libuv scheduler bridge: ~s" status))))
+          (aio-drain-completions! st))))))
 
 ;;; ------------------------------------------------------------ shutdown
 
@@ -931,8 +899,7 @@
             (aio-drain-completions! st)
             (loop)))
         (let drain ()
-          (unless (aio-completion-queue-empty? (aio-state-completions st))
-            (aio-drain-completions! st)
+          (when (fx= (aio-drain-completions! st) aio-dispatch-bound)
             (drain)))
         ;; No native request remains at this point, so synchronous close cannot
         ;; race an in-flight read, write, or async close request.
@@ -990,21 +957,28 @@
                     (when (fx= 1 (aio-loop-alive loop))
                       (aio-loop-run loop 0)
                       (drain)))
+                  (let ([buffer (make-bytevector 32)])
+                    (let discard ()
+                      (when (fx= (aio-completion-pop loop buffer) 1)
+                        (discard))))
                   (aio-loop-destroy loop)
                   ($oops who "cannot initialize the libuv timer handle"))
                 (let ([st (make-aio-state sched loop wakeup bridge
                         1 (make-eq-hashtable) (make-mutex)
                         (make-eq-hashtable) (make-eq-hashtable)
                         (make-eq-hashtable)
-                        (make-aio-completion-queue) '() (make-mutex)
-                        '() (make-mutex) #f
+                        (make-bytevector 32) '() (make-mutex)
+                        '() (make-mutex) 0 #f
                         (make-guardian) (make-guardian) (make-guardian))])
-                  (aio-set-notify loop (foreign-callable-entry-point aio-notify-trampoline))
                   ($async-scheduler-io-state-set! sched st)
                   ($async-scheduler-poll-proc-set! sched aio-poll)
                   ($async-scheduler-wake-proc-set! sched
                     (lambda ()
                       (with-mutex (aio-state-command-mutex st)
                         (unless (aio-state-closing? st)
-                          (aio-wakeup-send loop)))))
+                          (let ([status (aio-wakeup-send loop)])
+                            (when (fx< status 0)
+                              ($oops 'async-io
+                                "cannot wake the libuv scheduler: ~s"
+                                status)))))))
                   st))))))))
