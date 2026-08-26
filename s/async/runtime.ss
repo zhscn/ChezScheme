@@ -283,36 +283,41 @@
 
 (define async-thread-idle-wait
   (if-feature pthreads
-    (lambda (sched)
-      (let ([group ($async-scheduler-group sched)]
-            [timer (async-timer-heap-peek (async-scheduler-timers sched))])
-        (with-mutex (async-scheduler-remote-mutex sched)
-          (when
-            (and
-              (async-queue-empty? (async-scheduler-remote-queue sched))
-              (or
-                (not (async-group-parallel? group))
-                (with-mutex (async-scheduler-group-mutex group)
-                  (and
-                    (async-queue-empty?
-                      (async-scheduler-group-ready-queue group))
-                    (not (async-group-has-work? group))
-                    (not (async-scheduler-group-shutdown? group))))))
-            (if (not timer)
-                (condition-wait (async-scheduler-remote-cond sched)
-                                (async-scheduler-remote-mutex sched))
-                (let* ([deadline (async-timer-deadline timer)]
-                       [delta (max 0 (- deadline (async-monotonic-us)))]
-                       [timeout (add-duration (current-time)
-                                  (make-time 'time-duration
-                                    (* (remainder delta 1000000) 1000)
-                                    (quotient delta 1000000)))])
-                  (condition-wait (async-scheduler-remote-cond sched)
-                                  (async-scheduler-remote-mutex sched)
-                                  timeout)))))))
-    (lambda (sched)
-      ($oops 'run-async
-        "thread idle wait requires thread support"))))
+    (case-lambda
+      [(sched) (async-thread-idle-wait sched (lambda () #f))]
+      [(sched external-ready?)
+       (let ([group ($async-scheduler-group sched)]
+             [timer (async-timer-heap-peek (async-scheduler-timers sched))])
+         (with-mutex (async-scheduler-remote-mutex sched)
+           (when
+             (and
+               (not (external-ready?))
+               (async-queue-empty? (async-scheduler-remote-queue sched))
+               (or
+                 (not (async-group-parallel? group))
+                 (with-mutex (async-scheduler-group-mutex group)
+                   (and
+                     (async-queue-empty?
+                       (async-scheduler-group-ready-queue group))
+                     (not (async-group-has-work? group))
+                     (not (async-scheduler-group-shutdown? group))))))
+             (if (not timer)
+                 (condition-wait (async-scheduler-remote-cond sched)
+                                 (async-scheduler-remote-mutex sched))
+                 (let* ([deadline (async-timer-deadline timer)]
+                        [delta (max 0 (- deadline (async-monotonic-us)))]
+                        [timeout (add-duration (current-time)
+                                   (make-time 'time-duration
+                                     (* (remainder delta 1000000) 1000)
+                                     (quotient delta 1000000)))])
+                   (condition-wait (async-scheduler-remote-cond sched)
+                                   (async-scheduler-remote-mutex sched)
+                                   timeout))))))])
+    (case-lambda
+      [(sched)
+       ($oops 'run-async "thread idle wait requires thread support")]
+      [(sched external-ready?)
+       ($oops 'run-async "thread idle wait requires thread support")])))
 
 (define async-idle-wait
   (lambda (sched)
@@ -412,14 +417,9 @@
       (async-debug-check-native-fiber! 'async-switch-to-task
         task-fiber '(new parked) #f)
       (async-task-payload-set! task #f)
-      (unless ($native-fiber-try-claim! task-fiber)
-        ($oops 'async-switch-to-task
-          "task native fiber is not claimable: ~s" (async-task-id task)))
       (let ([outcome
-             (guard (c [else
-                        ($native-fiber-release-claim! task-fiber)
-                        (raise c)])
-               ($native-fiber-switch scheduler-fiber task-fiber payload))])
+             ($native-fiber-claim-and-switch
+               scheduler-fiber task-fiber payload)])
         (async-debug-check-native-fiber! 'async-switch-to-task
           scheduler-fiber '(running) #t)
         (async-debug-check-native-fiber! 'async-switch-to-task
@@ -456,11 +456,10 @@
       (async-task-scheduler-set! task sched))
     (async-scheduler-current-task-set! sched task)
     (let ([outcome
-           (guard (c [else (cons 'internal-escape c)])
-             (if (async-scheduler-preemption-ticks sched)
-                 (call-with-async-preemption sched
-                   (lambda () (async-switch-to-task sched task)))
-                 (async-switch-to-task sched task)))])
+           (if (async-scheduler-preemption-ticks sched)
+               (call-with-async-preemption sched
+                 (lambda () (async-switch-to-task sched task)))
+               (async-switch-to-task sched task))])
       (async-scheduler-current-task-set! sched #f)
       (cond
         [(eq? outcome async-suspend-token)
@@ -488,12 +487,10 @@
         [else
          (terminate-task! sched task 'failed
            (cons 'raise
-             (if (and (pair? outcome) (eq? (car outcome) 'internal-escape))
-                 (cdr outcome)
-                 (condition
-                   (make-error)
-                   (make-message-condition
-                     "invalid native-fiber scheduler outcome")))))
+            (condition
+              (make-error)
+              (make-message-condition
+                "invalid native-fiber scheduler outcome"))))
          #f]))))
 
 (define async-scheduler-run

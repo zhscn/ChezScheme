@@ -17,12 +17,8 @@
         task-fiber '(running) #f)
       (async-debug-check-native-fiber! '$async-yield
         scheduler-fiber '(parked) #t)
-      (unless ($native-fiber-try-claim! scheduler-fiber)
-        ($oops '$async-yield "scheduler fiber is not claimable"))
-      (guard (c [else
-                 ($native-fiber-release-claim! scheduler-fiber)
-                 (raise c)])
-        ($native-fiber-switch task-fiber scheduler-fiber async-yield-token))
+      ($native-fiber-claim-and-switch
+        task-fiber scheduler-fiber async-yield-token)
       (async-check-operation-entry! task)
       #t)))
 
@@ -55,14 +51,9 @@
           [task-fiber (async-task-native-fiber task)])
       (async-debug-check-native-fiber! '$async-suspend task-fiber '(running) #f)
       (async-debug-check-native-fiber! '$async-suspend scheduler-fiber '(parked) #t)
-      (unless ($native-fiber-try-claim! scheduler-fiber)
-        ($oops '$async-suspend "scheduler fiber is not claimable"))
       (let ([payload
-             (guard (c [else
-                        ($native-fiber-release-claim! scheduler-fiber)
-                        (raise c)])
-               ($native-fiber-switch task-fiber scheduler-fiber
-                 async-suspend-token))])
+             ($native-fiber-claim-and-switch
+               task-fiber scheduler-fiber async-suspend-token)])
         (async-debug-check-native-fiber! '$async-suspend task-fiber '(running) #f)
         ;; A migratable task can resume on another worker; the scheduler that
         ;; accepted this suspension is then foreign-owned and may be in a

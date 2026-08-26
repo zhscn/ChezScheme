@@ -1008,4 +1008,13 @@
                 (tcp-listener-close listener)
                 (and (string=? (task-join server) "tcp-request")
                      (string=? reply "tcp-reply")))))))))
+
+  ;; Merely inspecting loop metrics leaves the loop dormant.  Cooperative
+  ;; scheduling does not drive uv_run until a user-visible handle, request,
+  ;; command, or deferred stop is present.
+  (run-async
+    (lambda ()
+      (let ([before (cdr (assq 'loop-count (async-loop-metrics)))])
+        (do ([i 0 (fx+ i 1)]) ((fx= i 64)) (task-yield))
+        (= before (cdr (assq 'loop-count (async-loop-metrics)))))))
 )

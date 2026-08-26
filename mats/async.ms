@@ -381,6 +381,12 @@
             'clock 'virtual)
     '(early late))
   (equal? (run-async (lambda () (async-sleep 0) 'done)) 'done)
+  (run-async
+    (lambda ()
+      (let* ([sched (current-async-scheduler)]
+             [before (async-scheduler-suspension-count sched)])
+        (async-sleep 0)
+        (= before (async-scheduler-suspension-count sched)))))
 
   ;; timers with the same deadline fire in registration order
   (equal? (run-async

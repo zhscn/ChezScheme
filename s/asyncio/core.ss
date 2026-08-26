@@ -100,13 +100,23 @@
     (immutable completion-buffer) ; scratch for one native completion
     (mutable commands)            ; owner-thread thunks, newest first
     (immutable command-mutex)     ; also guards closing and wakeup lifetime
+    (immutable command-pending-box)
     (mutable stop-set)            ; streams that may need uv_read_stop
     (immutable stop-mutex)
+    (immutable stop-pending-box)
     (mutable poll-count)          ; owner-only guardian maintenance cadence
-    (mutable closing?)
+    (immutable closing-box)
     (immutable guardian)
     (immutable file-guardian)
     (immutable directory-guardian)))
+
+(define aio-state-closing?
+  (lambda (st)
+    (and ($atomic-box-ref (aio-state-closing-box st)) #t)))
+
+(define aio-state-closing?-set!
+  (lambda (st value)
+    ($atomic-box-set! (aio-state-closing-box st) value)))
 
 (define-record-type (aio-req make-aio-req aio-req?)
   (nongenerative)
@@ -332,23 +342,23 @@
                  (begin
                    (aio-state-commands-set! st
                      (cons command (aio-state-commands st)))
+                   ($atomic-box-set! (aio-state-command-pending-box st) #t)
                    #t)))])
       (when accepted?
-        (let ([status (aio-wakeup-send (aio-state-loop st))])
-          (when (fx< status 0)
-            ($oops 'async-io "cannot wake the owning libuv loop: ~s"
-              status))))
+        ($async-wake-scheduler (aio-state-owner st)))
       accepted?)))
 
 (define aio-drain-commands!
   (lambda (st)
     (aio-debug-check-owner! st)
-    (let ([commands
-           (with-aio-mutex (aio-state-command-mutex st)
-             (let ([commands (reverse (aio-state-commands st))])
-               (aio-state-commands-set! st '())
-               commands))])
-      (for-each (lambda (command) (command)) commands))))
+    (when ($atomic-box-ref (aio-state-command-pending-box st))
+      (let ([commands
+             (with-aio-mutex (aio-state-command-mutex st)
+               (let ([commands (reverse (aio-state-commands st))])
+                 (aio-state-commands-set! st '())
+                 ($atomic-box-set! (aio-state-command-pending-box st) #f)
+                 commands))])
+        (for-each (lambda (command) (command)) commands)))))
 
 (define aio-run-on-owner!
   (lambda (st command)
@@ -361,9 +371,15 @@
 
 (define aio-atomic-box-ref
   (lambda (b)
-    (let loop ()
-      (let ([v (unbox b)])
-        (if (box-cas! b v v) v (loop))))))
+    ($atomic-box-ref b)))
+
+(define aio-submit-stop!
+  (lambda (st handle)
+    (with-aio-mutex (aio-state-stop-mutex st)
+      (aio-state-stop-set-set! st
+        (cons handle (aio-state-stop-set st)))
+      ($atomic-box-set! (aio-state-stop-pending-box st) #t))
+    ($async-wake-scheduler (aio-state-owner st))))
 
 (define aio-atomic-box-set-once!
   (lambda (b v)
@@ -738,25 +754,27 @@
 ;;; off the scheduler thread, drained by the poll hook on the scheduler thread
 (define aio-drain-stop-set!
   (lambda (st)
-    (let ([hs (with-aio-mutex (aio-state-stop-mutex st)
-                (let ([hs (aio-state-stop-set st)])
-                  (aio-state-stop-set-set! st '())
-                  hs))])
-      (for-each
-        (lambda (h)
-          (with-aio-mutex (aio-handle-mutex h)
-            (when (and (aio-handle-reading? h)
-                       (aio-queue-empty? (aio-handle-read-queue h)))
-              (aio-handle-reading?-set! h #f)
-              ((case (aio-handle-kind h)
-                 [(udp) aio-udp-recv-stop]
-                 [(poll) aio-poll-stop]
-                 [(signal) aio-signal-stop]
-                 [(fs-event) aio-fs-event-stop]
-                 [(fs-poll) aio-fs-poll-stop]
-                 [else aio-read-stop])
-               (aio-handle-handle h)))))
-        hs))))
+    (when ($atomic-box-ref (aio-state-stop-pending-box st))
+      (let ([hs (with-aio-mutex (aio-state-stop-mutex st)
+                  (let ([hs (aio-state-stop-set st)])
+                    (aio-state-stop-set-set! st '())
+                    ($atomic-box-set! (aio-state-stop-pending-box st) #f)
+                    hs))])
+        (for-each
+          (lambda (h)
+            (with-aio-mutex (aio-handle-mutex h)
+              (when (and (aio-handle-reading? h)
+                         (aio-queue-empty? (aio-handle-read-queue h)))
+                (aio-handle-reading?-set! h #f)
+                ((case (aio-handle-kind h)
+                   [(udp) aio-udp-recv-stop]
+                   [(poll) aio-poll-stop]
+                   [(signal) aio-signal-stop]
+                   [(fs-event) aio-fs-event-stop]
+                   [(fs-poll) aio-fs-poll-stop]
+                   [else aio-read-stop])
+                 (aio-handle-handle h)))))
+          hs)))))
 
 (define aio-drain-guardian-objects!
   (lambda (guardian finalize!)
@@ -835,10 +853,23 @@
     (let ([st ($async-scheduler-io-state sched)])
       (when (and st (not (aio-state-closing? st)))
         (aio-debug-check-owner! st)
-        (let* ([old-count (aio-state-poll-count st)]
-               [count (if (fx= old-count (most-positive-fixnum))
-                          0
-                          (fx+ old-count 1))])
+        (if (not (or ($atomic-box-ref (aio-state-command-pending-box st))
+                     ($atomic-box-ref (aio-state-stop-pending-box st))
+                     (fx> (hashtable-size (aio-state-requests st)) 0)
+                     (fx> (hashtable-size (aio-state-handles st)) 0)
+                     (fx> (hashtable-size (aio-state-files st)) 0)
+                     (fx> (hashtable-size (aio-state-directories st)) 0)))
+            (when block?
+              ($async-scheduler-idle-wait sched
+                (lambda ()
+                  (or ($atomic-box-ref
+                        (aio-state-command-pending-box st))
+                      ($atomic-box-ref
+                        (aio-state-stop-pending-box st))))))
+            (let* ([old-count (aio-state-poll-count st)]
+                   [count (if (fx= old-count (most-positive-fixnum))
+                              0
+                              (fx+ old-count 1))])
           (aio-state-poll-count-set! st count)
           ;; Event dispatch advances on every scheduler turn because a libuv
           ;; operation can require multiple nonblocking uv_run transitions
@@ -857,7 +888,7 @@
               (when (fx< status 0)
                 ($oops 'async-io
                   "cannot disarm the libuv scheduler bridge: ~s" status))))
-          (aio-drain-completions! st))))))
+              (aio-drain-completions! st)))))))
 
 ;;; ------------------------------------------------------------ shutdown
 
@@ -982,18 +1013,23 @@
                         1 (make-eq-hashtable) (make-aio-os-mutex)
                         (make-eq-hashtable) (make-eq-hashtable)
                         (make-eq-hashtable)
-                        (make-bytevector 32) '() (make-aio-os-mutex)
-                        '() (make-aio-os-mutex) 0 #f
+                        (make-bytevector 32) '() (make-aio-os-mutex) (box #f)
+                        '() (make-aio-os-mutex) (box #f) 0 (box #f)
                         (make-guardian) (make-guardian) (make-guardian))])
                   ($async-scheduler-io-state-set! sched st)
                   ($async-scheduler-poll-proc-set! sched aio-poll)
                   ($async-scheduler-wake-proc-set! sched
                     (lambda ()
-                      (with-aio-mutex (aio-state-command-mutex st)
-                        (unless (aio-state-closing? st)
-                          (let ([status (aio-wakeup-send loop)])
-                            (when (fx< status 0)
-                              ($oops 'async-io
-                                "cannot wake the libuv scheduler: ~s"
-                                status)))))))
+                      ;; The atomic check avoids taking the mutex after
+                      ;; shutdown.  Recheck under the mutex so close cannot
+                      ;; destroy the native wakeup handle between this test
+                      ;; and aio-wakeup-send.
+                      (unless (aio-state-closing? st)
+                        (with-aio-mutex (aio-state-command-mutex st)
+                          (unless (aio-state-closing? st)
+                            (let ([status (aio-wakeup-send loop)])
+                              (when (fx< status 0)
+                                ($oops 'async-io
+                                  "cannot wake the libuv scheduler: ~s"
+                                  status))))))))
                   st))))))))

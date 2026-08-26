@@ -31,7 +31,15 @@
     (syntax-case x ()
       [(_ mutex body1 body2 ...)
        (if-feature pthreads
-         #'(critical-section (with-mutex mutex body1 body2 ...))
+         #'(let ([lock mutex])
+             (dynamic-wind
+               (lambda ()
+                 (disable-interrupts)
+                 (mutex-acquire lock))
+               (lambda () body1 body2 ...)
+               (lambda ()
+                 (mutex-release lock)
+                 (enable-interrupts))))
          #'(begin body1 body2 ...))])))
 
 (define make-aio-os-mutex

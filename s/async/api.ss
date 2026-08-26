@@ -802,7 +802,9 @@
   (lambda (seconds)
     (unless (async-valid-seconds? seconds)
       ($oops who "~s is not a nonnegative real number" seconds))
-    (perform-operation (sleep-operation seconds))
+    (if (<= seconds 0)
+        (async-check-operation-entry! (async-current-task/required who))
+        (perform-operation (sleep-operation seconds)))
     (void)))
 
 (set-who! make-future
@@ -1420,8 +1422,12 @@
 (set! $async-scheduler-poll-proc-set!
   (lambda (sched v) (async-scheduler-poll-proc-set! sched v)))
 
+(set! $async-scheduler-idle-wait async-thread-idle-wait)
+
 (set! $async-scheduler-wake-proc-set!
   (lambda (sched v) (async-scheduler-wake-proc-set! sched v)))
+
+(set! $async-wake-scheduler async-wake-scheduler)
 
 (set! $async-scheduler-timers
   (lambda (sched)

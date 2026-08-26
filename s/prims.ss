@@ -1494,8 +1494,19 @@
 
 ; not safe
 (define $record-cas!
-   (lambda (v i old-x new-x)
+  (lambda (v i old-x new-x)
       (#3%$record-cas! v i old-x new-x)))
+
+;; Acquire/release box accesses are internal publication primitives.  They
+;; avoid using a read-modify-write instruction for an atomic observation and
+;; retain the ordinary heap write barrier for a published Scheme pointer.
+(define $atomic-box-ref
+  (lambda (b)
+    (#3%$atomic-box-ref b)))
+
+(define $atomic-box-set!
+  (lambda (b x)
+    (#3%$atomic-box-set! b x)))
 
 (define cons (lambda (x y) (cons x y)))
 
@@ -1962,6 +1973,7 @@
 (define $native-fiber-create)
 (define $native-fiber-try-claim!)
 (define $native-fiber-release-claim!)
+(define $native-fiber-claim-and-switch)
 (define $native-fiber-preempt)
 (define $native-fiber-service-preemption)
 (define $native-fiber-switch)
@@ -2961,6 +2973,35 @@
 (set! $native-fiber-switch
   (lambda (current target payload)
     (native-fiber-exchange '$native-fiber-switch current target payload #f)))
+
+;; Scheduler runtimes use claim-and-switch when a failed claim is an internal
+;; scheduling error instead of a recoverable race.  Validate every caller
+;; controlled precondition before claiming the target.  Once the claim is
+;; acquired, native-fiber-exchange can fail only through a runtime invariant;
+;; the transition itself consumes the claim atomically.
+(set! $native-fiber-claim-and-switch
+  (lambda (current target payload)
+    (unless (and ($native-fiber? current) ($native-fiber? target))
+      ($oops '$native-fiber-claim-and-switch
+        "invalid native fibers ~s and ~s" current target))
+    (unless (eq? current ($current-native-fiber))
+      ($oops '$native-fiber-claim-and-switch
+        "native fiber ~s is not the running native fiber"
+        (native-fiber-id current)))
+    (when (native-fiber-switch-prohibited?)
+      ($oops '$native-fiber-claim-and-switch
+        "native-fiber switching is prohibited in this runtime region"))
+    (when ($native-fiber-transition)
+      ($oops '$native-fiber-claim-and-switch
+        "a native-fiber transition is already active"))
+    (unless (fx= (#3%$tc-field 'disable-count (#3%$tc)) 0)
+      ($oops '$native-fiber-claim-and-switch
+        "native-fiber switching requires interrupts to be enabled"))
+    (unless ($native-fiber-try-claim! target)
+      ($oops '$native-fiber-claim-and-switch
+        "native fiber ~s is not claimable" (native-fiber-id target)))
+    (native-fiber-exchange '$native-fiber-claim-and-switch
+      current target payload #f)))
 
 (set! $native-fiber-preempt
   (lambda (target payload)

@@ -167,9 +167,7 @@
               (with-aio-mutex (aio-handle-mutex s)
                 (aio-queue-remove! (aio-handle-read-queue s) node))))
           (let ([st (aio-handle-state s)])
-            (with-aio-mutex (aio-state-stop-mutex st)
-              (aio-state-stop-set-set! st
-                (cons s (aio-state-stop-set st))))))))))
+            (aio-submit-stop! st s)))))))
 
 (define %stream-write-operation
   (lambda (s bv . allow-owned-option)
@@ -660,9 +658,7 @@
             (with-aio-mutex (aio-handle-mutex socket)
               (aio-queue-remove! (aio-handle-read-queue socket) node))))
         (let ([st (aio-handle-state socket)])
-          (with-aio-mutex (aio-state-stop-mutex st)
-            (aio-state-stop-set-set! st
-              (cons socket (aio-state-stop-set st))))))))))
+          (aio-submit-stop! st socket)))))))
 
 (define %udp-send-operation
   (case-lambda
@@ -918,9 +914,7 @@
               (with-aio-mutex (aio-handle-mutex poll)
                 (aio-queue-remove! (aio-handle-read-queue poll) node))))
           (let ([st (aio-handle-state poll)])
-            (with-aio-mutex (aio-state-stop-mutex st)
-              (aio-state-stop-set-set! st
-                (cons poll (aio-state-stop-set st))))))))))
+            (aio-submit-stop! st poll)))))))
 
 ;;; ---------------------------------------------------------- processes
 
@@ -1179,9 +1173,7 @@
             (with-aio-mutex (aio-handle-mutex watcher)
               (aio-queue-remove! (aio-handle-read-queue watcher) node))))
         (let ([st (aio-handle-state watcher)])
-          (with-aio-mutex (aio-state-stop-mutex st)
-            (aio-state-stop-set-set! st
-              (cons watcher (aio-state-stop-set st))))))))))
+          (aio-submit-stop! st watcher)))))))
 
 (define %signal-open
   (lambda (signum)

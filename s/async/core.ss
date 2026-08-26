@@ -126,8 +126,14 @@
                            (with-mutex lock e1 e2 ...))
                          (lambda () (async-debug-lock-pop! lock))))
                      (critical-section (with-mutex lock e1 e2 ...)))
-                 (critical-section
-                   (with-mutex lock e1 e2 ...))))
+                 (dynamic-wind
+                   (lambda ()
+                     (disable-interrupts)
+                     (mutex-acquire lock))
+                   (lambda () e1 e2 ...)
+                   (lambda ()
+                     (mutex-release lock)
+                     (enable-interrupts)))))
          #'(begin e1 e2 ...))])))
 
 (define async-debug-runnable-mutex
@@ -303,16 +309,27 @@
 
 (define async-atomic-box-set!
   (lambda (b new)
-    (let loop ([old (unbox b)])
-      (unless (box-cas! b old new)
-        (loop (unbox b))))))
+    ($atomic-box-set! b new)))
 
 (define async-atomic-box-ref
   (lambda (b)
-    (let loop ([value (unbox b)])
+    ($atomic-box-ref b)))
+
+;; The deque's proof relies on sequentially consistent index publication.
+;; Keep that stronger protocol local to Chase--Lev; unrelated async state uses
+;; the acquire/release helpers above without cache-line-writing reads.
+(define async-work-atomic-box-ref
+  (lambda (b)
+    (let loop ([value ($atomic-box-ref b)])
       (if (box-cas! b value value)
           value
-          (loop (unbox b))))))
+          (loop ($atomic-box-ref b))))))
+
+(define async-work-atomic-box-set!
+  (lambda (b new)
+    (let loop ([old ($atomic-box-ref b)])
+      (unless (box-cas! b old new)
+        (loop ($atomic-box-ref b))))))
 
 (define async-atomic-box-add!
   (lambda (b delta)
@@ -334,7 +351,7 @@
             (vector-ref old-slots (fxand i old-mask)))
           (loop (fx+ i 1))))
       (let ([ring (make-async-work-ring new-slots new-mask)])
-        (async-atomic-box-set! (async-work-deque-ring deque) ring)
+        (async-work-atomic-box-set! (async-work-deque-ring deque) ring)
         ring))))
 
 (define async-work-deque-distance
@@ -342,9 +359,9 @@
 
 (define async-work-deque-push/raw!
   (lambda (deque value)
-    (let* ([bottom (async-atomic-box-ref (async-work-deque-bottom deque))]
-           [top (async-atomic-box-ref (async-work-deque-top deque))]
-           [ring0 (async-atomic-box-ref (async-work-deque-ring deque))]
+    (let* ([bottom (async-work-atomic-box-ref (async-work-deque-bottom deque))]
+           [top (async-work-atomic-box-ref (async-work-deque-top deque))]
+           [ring0 (async-work-atomic-box-ref (async-work-deque-ring deque))]
            [distance (async-work-deque-distance bottom top)]
            [ring
             (if (fx>= distance (async-work-ring-mask ring0))
@@ -356,35 +373,35 @@
         (fxand bottom (async-work-ring-mask ring)) value)
       (async-thread-sanitizer-release!
         (async-work-deque-sanitizer-token deque))
-      (async-atomic-box-set! (async-work-deque-bottom deque)
+      (async-work-atomic-box-set! (async-work-deque-bottom deque)
         (fx+ bottom 1)))))
 
 (define async-work-deque-pop/raw!
   (lambda (deque)
-    (let* ([bottom0 (async-atomic-box-ref (async-work-deque-bottom deque))]
+    (let* ([bottom0 (async-work-atomic-box-ref (async-work-deque-bottom deque))]
            [bottom (fx- bottom0 1)])
-      (async-atomic-box-set! (async-work-deque-bottom deque) bottom)
-      (let* ([top (async-atomic-box-ref (async-work-deque-top deque))]
+      (async-work-atomic-box-set! (async-work-deque-bottom deque) bottom)
+      (let* ([top (async-work-atomic-box-ref (async-work-deque-top deque))]
              [distance (async-work-deque-distance bottom top)])
         (cond
           [(fx< distance 0)
-           (async-atomic-box-set! (async-work-deque-bottom deque) top)
+           (async-work-atomic-box-set! (async-work-deque-bottom deque) top)
            #f]
           [else
-           (let* ([ring (async-atomic-box-ref (async-work-deque-ring deque))]
+           (let* ([ring (async-work-atomic-box-ref (async-work-deque-ring deque))]
                   [slot (fxand bottom (async-work-ring-mask ring))]
                   [value (vector-ref (async-work-ring-slots ring) slot)])
              (if (and (fx= distance 0)
                       (not (box-cas! (async-work-deque-top deque)
                              top (fx+ top 1))))
                  (begin
-                   (async-atomic-box-set! (async-work-deque-bottom deque)
+                   (async-work-atomic-box-set! (async-work-deque-bottom deque)
                      (fx+ top 1))
                    #f)
                  (begin
                    (vector-set! (async-work-ring-slots ring) slot #f)
                    (when (fx= distance 0)
-                     (async-atomic-box-set! (async-work-deque-bottom deque)
+                     (async-work-atomic-box-set! (async-work-deque-bottom deque)
                        (fx+ top 1)))
                    (unless value
                      ($oops 'async-work-deque-pop/raw!
@@ -393,13 +410,14 @@
 
 (define async-work-deque-steal/raw!
   (lambda (deque)
-    (let* ([top (async-atomic-box-ref (async-work-deque-top deque))]
-           [bottom (async-atomic-box-ref (async-work-deque-bottom deque))])
+    (let* ([top (async-work-atomic-box-ref (async-work-deque-top deque))]
+           [bottom (async-work-atomic-box-ref
+                     (async-work-deque-bottom deque))])
       (and (fx> (async-work-deque-distance bottom top) 0)
            (begin
              (async-thread-sanitizer-acquire!
                (async-work-deque-sanitizer-token deque))
-             (let* ([ring (async-atomic-box-ref (async-work-deque-ring deque))]
+             (let* ([ring (async-work-atomic-box-ref (async-work-deque-ring deque))]
                     [slot (fxand top (async-work-ring-mask ring))]
                     [value (vector-ref (async-work-ring-slots ring) slot)])
                (and (box-cas! (async-work-deque-top deque) top
@@ -413,9 +431,9 @@
 
 (define async-debug-work-deque-check!
   (lambda (deque expected)
-    (let* ([top (async-atomic-box-ref (async-work-deque-top deque))]
-           [bottom (async-atomic-box-ref (async-work-deque-bottom deque))]
-           [ring (async-atomic-box-ref (async-work-deque-ring deque))]
+    (let* ([top (async-work-atomic-box-ref (async-work-deque-top deque))]
+           [bottom (async-work-atomic-box-ref (async-work-deque-bottom deque))]
+           [ring (async-work-atomic-box-ref (async-work-deque-ring deque))]
            [slots (async-work-ring-slots ring)]
            [mask (async-work-ring-mask ring)])
       (unless (and (fx= (async-work-deque-distance bottom top)
@@ -517,9 +535,9 @@
                 [value (record! value) (loop)]
                 [(or (async-atomic-box-ref pushing?)
                      (fx> (async-work-deque-distance
-                            (async-atomic-box-ref
+                            (async-work-atomic-box-ref
                               (async-work-deque-bottom deque))
-                            (async-atomic-box-ref
+                            (async-work-atomic-box-ref
                               (async-work-deque-top deque)))
                           0))
                  (sleep (make-time 'time-duration 1000 0))
@@ -622,41 +640,59 @@
 ;;;
 ;;; Completion, cancellation, and failure compete with box-cas!.
 
+(define async-sync-slot-empty (list 'async-sync-slot-empty))
+
 (define-record-type (async-sync-state make-async-sync-state% async-sync-state?)
-  (nongenerative async-sync-state-layer7)
+  (nongenerative async-sync-state-layer9)
   (sealed #t)
   (fields
-    (immutable state)               ; atomic box: waiting | claimed | (done . payload)
-    (immutable mutex-box)           ; lazily allocated registration mutex
+    (mutable state-box)             ; atomic box after blocking publication
+    ;; Allocated before an operation publishes its delivery closure.
+    (mutable mutex async-sync-state-raw-mutex
+      async-sync-state-raw-mutex-set!)
     (mutable registration-phase)    ; new | registering | registered
     (mutable cancel-pending?)
     (mutable nack)
-    (mutable slots)))               ; lazily allocated token -> per-perform state
+    (mutable inline-token)
+    (mutable inline-value)
+    (mutable slots)))               ; overflow token -> per-perform state
 
 (define make-async-sync-state
   (lambda ()
-    (make-async-sync-state% (box 'waiting) (box #f)
-      'new #f #f #f)))
+    (make-async-sync-state% #f #f
+      'new #f #f async-sync-slot-empty #f #f)))
+
+(define async-sync-state-prepare!
+  (lambda (ss)
+    ;; Before registration the sync state belongs exclusively to the current
+    ;; task.  Publish its atomic state and mutex together before any operation
+    ;; can expose a delivery closure to another thread.
+    (unless (async-sync-state-state-box ss)
+      (let ([state-box (box 'waiting)]
+            [mutex (make-async-os-mutex)])
+        (async-sync-state-raw-mutex-set! ss mutex)
+        (async-sync-state-state-box-set! ss state-box)))))
 
 (define async-sync-state-mutex
   (lambda (ss)
-    (let ([mutex-box (async-sync-state-mutex-box ss)])
-      (or (async-atomic-box-ref mutex-box)
-          (let ([mutex (make-async-os-mutex)])
-            (if (box-cas! mutex-box #f mutex)
-                mutex
-                (async-atomic-box-ref mutex-box)))))))
+    (async-sync-state-prepare! ss)
+    (async-sync-state-raw-mutex ss)))
 
 (define async-sync-state-live?
-  (lambda (ss) (eq? (unbox (async-sync-state-state ss)) 'waiting)))
+  (lambda (ss)
+    (let ([state-box (async-sync-state-state-box ss)])
+      (or (not state-box)
+          (eq? (async-atomic-box-ref state-box) 'waiting)))))
 
 (define async-sync-state-claim!
   (lambda (ss)
-    (box-cas! (async-sync-state-state ss) 'waiting 'claimed)))
+    (async-sync-state-prepare! ss)
+    (box-cas! (async-sync-state-state-box ss) 'waiting 'claimed)))
 
 (define async-sync-state-complete!
   (lambda (ss payload)
-    (set-box! (async-sync-state-state ss) (cons 'done payload))))
+    (async-atomic-box-set!
+      (async-sync-state-state-box ss) (cons 'done payload))))
 
 ;;; Registration is a handshake with cancellation.  A cancellation arriving
 ;;; before or during block publication is deferred until block has returned,
@@ -690,23 +726,35 @@
 (define async-sync-slot-set!
   (lambda (ss token value)
     (with-async-mutex (async-sync-state-mutex ss)
-      (let ([slots (or (async-sync-state-slots ss)
-                       (let ([slots (make-eq-hashtable)])
-                         (async-sync-state-slots-set! ss slots)
-                         slots))])
-        (hashtable-set! slots token value)))))
+      (let ([inline-token (async-sync-state-inline-token ss)])
+        (if (or (eq? inline-token async-sync-slot-empty)
+                (eq? inline-token token))
+            (begin
+              (async-sync-state-inline-token-set! ss token)
+              (async-sync-state-inline-value-set! ss value))
+            (let ([slots (or (async-sync-state-slots ss)
+                             (let ([slots (make-eq-hashtable)])
+                               (async-sync-state-slots-set! ss slots)
+                               slots))])
+              (hashtable-set! slots token value)))))))
 
 (define async-sync-slot-ref
   (lambda (ss token default)
     (with-async-mutex (async-sync-state-mutex ss)
-      (let ([slots (async-sync-state-slots ss)])
-        (if slots (hashtable-ref slots token default) default)))))
+      (if (eq? (async-sync-state-inline-token ss) token)
+          (async-sync-state-inline-value ss)
+          (let ([slots (async-sync-state-slots ss)])
+            (if slots (hashtable-ref slots token default) default))))))
 
 (define async-sync-slot-delete!
   (lambda (ss token)
     (with-async-mutex (async-sync-state-mutex ss)
-      (let ([slots (async-sync-state-slots ss)])
-        (when slots (hashtable-delete! slots token))))))
+      (if (eq? (async-sync-state-inline-token ss) token)
+          (begin
+            (async-sync-state-inline-token-set! ss async-sync-slot-empty)
+            (async-sync-state-inline-value-set! ss #f))
+          (let ([slots (async-sync-state-slots ss)])
+            (when slots (hashtable-delete! slots token)))))))
 
 ;;; ------------------------------------------------------------ records
 
@@ -1377,6 +1425,22 @@
             ($async-scheduler-group victim)) -1))
       task)))
 
+;; A task moved directly from a victim deque to the thief's deque remains
+;; published work.  Keep the group count unchanged across that transfer.
+(define async-work-steal-transfer-one!
+  (lambda (victim)
+    (let ([task
+           (async-work-deque-steal/raw!
+             (async-scheduler-work-deque victim))])
+      (when task (async-debug-queue-release! task))
+      task)))
+
+(define async-work-push-transferred!
+  (lambda (sched task)
+    (async-debug-check-owner! sched)
+    (async-debug-queue-claim! task 'work)
+    (async-work-deque-push/raw! (async-scheduler-work-deque sched) task)))
+
 ;;; Repeated single-item claims preserve the Chase--Lev last-item race while
 ;;; still amortizing victim selection and wakeup costs across a batch.
 (define async-work-steal-batch!
@@ -1386,15 +1450,15 @@
            (let* ([deque (async-scheduler-work-deque victim)]
                   [available
                    (async-work-deque-distance
-                     (async-atomic-box-ref (async-work-deque-bottom deque))
-                     (async-atomic-box-ref (async-work-deque-top deque)))]
+                     (async-work-atomic-box-ref (async-work-deque-bottom deque))
+                     (async-work-atomic-box-ref (async-work-deque-top deque)))]
                   [extra (if (fx> available 1)
                              (fxquotient available 2)
                              available)])
              (let loop ([remaining extra] [tasks (list first)])
                (if (fx= remaining 0)
                    (reverse tasks)
-                   (let ([task (async-work-steal-one! victim)])
+                   (let ([task (async-work-steal-transfer-one! victim)])
                      (if task
                          (loop (fx- remaining 1) (cons task tasks))
                          (reverse tasks))))))))))
@@ -1436,7 +1500,7 @@
                                     ;; publishing the remainder locally.
                                     (for-each
                                       (lambda (task)
-                                        (async-work-push! sched
+                                        (async-work-push-transferred! sched
                                           (async-adopt-work! sched task)))
                                       (cdr batch))
                                     (async-adopt-work! sched
@@ -1642,7 +1706,7 @@
   (lambda (reservation)
     (and (box-cas! (async-delivery-reservation-active-box reservation) #t #f)
          (box-cas!
-           (async-sync-state-state
+           (async-sync-state-state-box
              (async-delivery-reservation-sync-state reservation))
            'claimed 'waiting))))
 

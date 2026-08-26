@@ -3281,6 +3281,26 @@
       [(e1 e2 e3)
        (bind #t (e2)
          (build-dirty-store e1 %zero (constant box-ref-disp) e3 (make-build-cas e2) build-cas-seq))])
+    (define-inline 3 $atomic-box-ref
+      [(e-box)
+       (bind #t ([value (%mref ,e-box ,(constant box-ref-disp))])
+         (if-feature pthreads
+           (constant-case architecture
+             [(arm32 arm64 riscv64 loongarch64 ppc32 pb)
+              (%seq ,(%inline acquire-fence) ,value)]
+             [else value])
+           value))])
+    (define-inline 3 $atomic-box-set!
+      [(e-box e-new)
+       (bind #t (e-new)
+         (if-feature pthreads
+           (constant-case architecture
+             [(arm32 arm64 riscv64 loongarch64 ppc32 pb)
+              (%seq
+                ,(%inline release-fence)
+                ,(build-dirty-store e-box (constant box-ref-disp) e-new))]
+             [else (build-dirty-store e-box (constant box-ref-disp) e-new)])
+           (build-dirty-store e-box (constant box-ref-disp) e-new)))])
     (define-inline 3 $set-symbol-name!
       [(e1 e2) (build-dirty-store e1 (constant symbol-name-disp) e2)])
     (define-inline 3 $set-symbol-property-list!

@@ -1562,6 +1562,20 @@
    (check (box 0) unbox box-cas!))
  (check (vector 1 0 2) (lambda (v) (vector-ref v 1)) (lambda (v o n) (vector-cas! v 1 o n))))
 
+(mat atomic-box-publication
+  (let ([published (box #f)])
+    (let ([writer
+           (fork-thread
+             (lambda ()
+               (#3%$atomic-box-set! published (list 'ready 42))))])
+      (let loop ()
+        (let ([value (#3%$atomic-box-ref published)])
+          (if value
+              (begin
+                (thread-join writer)
+                (equal? value '(ready 42)))
+              (loop)))))))
+
 (mat rendezvous-in-main
   ;; make sure that every collect rendezvous triggers the handler in the
   ;; main thread
