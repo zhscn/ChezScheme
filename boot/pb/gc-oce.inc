@@ -949,7 +949,9 @@ static void sweep(thread_gc *tgc, ptr p, IGEN from_g)
               {
                 {
                   iptr clength = ((uptr)(SFP(tc))) - ((uptr)old_stack);
-                  SCHEMESTACK(tc) = copy_stack(tgc, old_stack, &(SCHEMESTACKSIZE(tc)), clength + (sizeof(ptr)));
+                  SCHEMESTACK(tc) = (((CURRENTNATIVEFIBER(tc)) != Sfalse)
+                                     ? copy_stack_preserve_capacity(tgc, old_stack, &(SCHEMESTACKSIZE(tc)), clength + (sizeof(ptr)))
+                                     : copy_stack(tgc, old_stack, &(SCHEMESTACKSIZE(tc)), clength + (sizeof(ptr))));
                   SFP(tc) = (ptr)(((uptr)(SCHEMESTACK(tc))) + clength);
                   ESP(tc) = (ptr)((((uptr)(SCHEMESTACK(tc))) + (SCHEMESTACKSIZE(tc))) - stack_slop);
                 }
@@ -1175,7 +1177,9 @@ static void sweep(thread_gc *tgc, ptr p, IGEN from_g)
               }
               else
               {
-                CONTSTACK(p) = copy_stack(tgc, CONTSTACK(p), &(CONTLENGTH(p)), CONTCLENGTH(p));
+                CONTSTACK(p) = ((code == S_G.native_fiber_context_code)
+                                ? copy_stack_preserve_capacity(tgc, CONTSTACK(p), &(CONTLENGTH(p)), CONTCLENGTH(p))
+                                : copy_stack(tgc, CONTSTACK(p), &(CONTLENGTH(p)), CONTCLENGTH(p)));
               }
             }
             relocate_pure(&CONTLINK(p));
@@ -2456,7 +2460,9 @@ static void sweep_thread(thread_gc *tgc, ptr p)
           {
             {
               iptr clength = ((uptr)(SFP(tc))) - ((uptr)old_stack);
-              SCHEMESTACK(tc) = copy_stack(tgc, old_stack, &(SCHEMESTACKSIZE(tc)), clength + (sizeof(ptr)));
+              SCHEMESTACK(tc) = (((CURRENTNATIVEFIBER(tc)) != Sfalse)
+                                 ? copy_stack_preserve_capacity(tgc, old_stack, &(SCHEMESTACKSIZE(tc)), clength + (sizeof(ptr)))
+                                 : copy_stack(tgc, old_stack, &(SCHEMESTACKSIZE(tc)), clength + (sizeof(ptr))));
               SFP(tc) = (ptr)(((uptr)(SCHEMESTACK(tc))) + clength);
               ESP(tc) = (ptr)((((uptr)(SCHEMESTACK(tc))) + (SCHEMESTACKSIZE(tc))) - stack_slop);
             }
@@ -2683,6 +2689,7 @@ static void sweep_continuation(thread_gc *tgc, ptr p, IGEN from_g)
   PUSH_BACKREFERENCE(p)
   {
     {
+      ptr code = CLOSCODE(p);
       relocate_pure(&CONTWINDERS(p));
       relocate_impure(&CONTATTACHMENTS(p), from_g);
       if ((CONTLENGTH(p)) == scaled_shot_1_shot_flag)
@@ -2701,7 +2708,9 @@ static void sweep_continuation(thread_gc *tgc, ptr p, IGEN from_g)
             }
             else
             {
-              CONTSTACK(p) = copy_stack(tgc, CONTSTACK(p), &(CONTLENGTH(p)), CONTCLENGTH(p));
+              CONTSTACK(p) = ((code == S_G.native_fiber_context_code)
+                              ? copy_stack_preserve_capacity(tgc, CONTSTACK(p), &(CONTLENGTH(p)), CONTCLENGTH(p))
+                              : copy_stack(tgc, CONTSTACK(p), &(CONTLENGTH(p)), CONTCLENGTH(p)));
             }
           }
           relocate_pure(&CONTLINK(p));

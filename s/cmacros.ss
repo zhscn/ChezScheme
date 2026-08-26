@@ -2243,6 +2243,12 @@
 ;; this type --- used by garbage collector).
 (define-constant default-stack-size
   (- (* 4 (constant bytes-per-segment)) (* 2 (constant ptr-bytes))))
+;; Native task fibers are numerous and begin with an empty stack.  Keep their
+;; initial allocation independent of the legacy stack-segment size so ordinary
+;; fiber growth can resize the active stack without changing continuation
+;; overflow policy for threads and engines.
+(define-constant native-fiber-initial-stack-size
+  (- (constant bytes-per-segment) (* 2 (constant ptr-bytes))))
 (define-constant stack-slop (ceiling (/ (constant default-stack-size) 64)))
 (define-constant stack-frame-limit (fxsrl (constant stack-slop) 1))
 ;; one-shot-headroom must include stack-slop so min factor below is 2

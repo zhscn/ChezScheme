@@ -5613,7 +5613,8 @@
             `(lambda ,(make-named-info-lambda '$native-fiber-make-context '(1)) 0 ()
                ,(%seq
                   (set! ,(ref-reg %cp) ,(make-arg-opnd 1))
-                  (set! ,%xp ,(%constant-alloc type-untyped (constant default-stack-size)))
+                  (set! ,%xp ,(%constant-alloc type-untyped
+                                (constant native-fiber-initial-stack-size)))
                   (set! ,(%mref ,%xp 0)
                     (literal ,(make-info-literal #f 'library-code
                                 (lookup-libspec dounderflow)
@@ -5629,7 +5630,7 @@
                                 (constant code-data-disp))))
                   (set! ,(%mref ,%xp ,(constant continuation-stack-disp)) ,%ac0)
                   (set! ,(%mref ,%xp ,(constant continuation-stack-length-disp))
-                    (immediate ,(constant default-stack-size)))
+                    (immediate ,(constant native-fiber-initial-stack-size)))
                   (set! ,(%mref ,%xp ,(constant continuation-stack-clength-disp)) (immediate 0))
                   (set! ,(%mref ,%xp ,(constant continuation-link-disp)) ,(ref-reg %cp))
                   (set! ,(%mref ,%xp ,(constant continuation-return-address-disp))

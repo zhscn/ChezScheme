@@ -254,89 +254,97 @@
               (async-queue-push! (async-scheduler-next-queue sched) task))
             (loop)))))))
 
+(define async-poll-ready-to-block?
+  (lambda (sched)
+    (let ([group ($async-scheduler-group sched)])
+      ;; Keep the order consistent with the condition-wait path.  A producer
+      ;; publishes group work before taking the remote mutex to wake a worker,
+      ;; so the worker must take the remote mutex before inspecting group work.
+      (with-async-mutex (async-scheduler-remote-mutex sched)
+        (and (async-queue-empty? (async-scheduler-remote-queue sched))
+             (or (not (async-group-parallel? group))
+                 (with-async-mutex (async-scheduler-group-mutex group)
+                   (and
+                     (async-queue-empty?
+                       (async-scheduler-group-ready-queue group))
+                     (not (async-group-has-work? group))))))))))
+
+(define async-sleep-until-next-timer
+  (lambda (sched)
+    (let ([timer (async-timer-heap-peek (async-scheduler-timers sched))])
+      (if (not timer)
+          ($oops 'run-async
+            "async deadlock: no runnable tasks and no pending timers")
+          (let* ([deadline (async-timer-deadline timer)]
+                 [delta (max 0 (- deadline (async-monotonic-us)))])
+            (sleep (make-time 'time-duration
+                     (* (remainder delta 1000000) 1000)
+                     (quotient delta 1000000))))))))
+
+(define async-thread-idle-wait
+  (if-feature pthreads
+    (lambda (sched)
+      (let ([group ($async-scheduler-group sched)]
+            [timer (async-timer-heap-peek (async-scheduler-timers sched))])
+        (with-mutex (async-scheduler-remote-mutex sched)
+          (when
+            (and
+              (async-queue-empty? (async-scheduler-remote-queue sched))
+              (or
+                (not (async-group-parallel? group))
+                (with-mutex (async-scheduler-group-mutex group)
+                  (and
+                    (async-queue-empty?
+                      (async-scheduler-group-ready-queue group))
+                    (not (async-group-has-work? group))
+                    (not (async-scheduler-group-shutdown? group))))))
+            (if (not timer)
+                (condition-wait (async-scheduler-remote-cond sched)
+                                (async-scheduler-remote-mutex sched))
+                (let* ([deadline (async-timer-deadline timer)]
+                       [delta (max 0 (- deadline (async-monotonic-us)))]
+                       [timeout (add-duration (current-time)
+                                  (make-time 'time-duration
+                                    (* (remainder delta 1000000) 1000)
+                                    (quotient delta 1000000)))])
+                  (condition-wait (async-scheduler-remote-cond sched)
+                                  (async-scheduler-remote-mutex sched)
+                                  timeout)))))))
+    (lambda (sched)
+      ($oops 'run-async
+        "thread idle wait requires thread support"))))
+
 (define async-idle-wait
   (lambda (sched)
     (dynamic-wind
       (lambda () (async-group-mark-idle! sched))
       (lambda ()
         (cond
-      [(async-scheduler-virtual? sched)
-       (let ([timer (async-timer-heap-peek (async-scheduler-timers sched))])
-         (if (not timer)
-             ($oops 'run-async
-               "async deadlock: no runnable tasks and no pending timers")
-             (async-scheduler-vtime-set! sched (async-timer-deadline timer))))]
-      [(async-scheduler-poll-proc sched)
-       => (lambda (poll)
-            ;; The preceding nonblocking poll may consume a remote wakeup
-            ;; that arrived after the scheduler drained its queues.  Recheck
-            ;; under the queue locks before entering a blocking event-loop
-            ;; poll.  A submission after this check leaves uv_async pending.
-            (let ([group ($async-scheduler-group sched)])
-              (if (async-group-parallel? group)
-                  (let ([idle?
-                         (with-mutex (async-scheduler-group-mutex group)
-                           (and
-                             (async-queue-empty?
-                               (async-scheduler-group-ready-queue group))
-                             (not (async-group-has-work? group))
-                             (with-mutex
-                               (async-scheduler-remote-mutex sched)
-                               (async-queue-empty?
-                                 (async-scheduler-remote-queue sched)))))])
-                    (when idle? (poll sched #t)))
-                  (let ([idle?
-                         (with-mutex (async-scheduler-remote-mutex sched)
-                           (async-queue-empty?
-                             (async-scheduler-remote-queue sched)))])
-                    (when idle? (poll sched #t))))))]
-      [(async-group-parallel? ($async-scheduler-group sched))
-       (let ([group ($async-scheduler-group sched)]
-             [timer (async-timer-heap-peek (async-scheduler-timers sched))])
-         (with-mutex (async-scheduler-remote-mutex sched)
-           (when (and (async-queue-empty? (async-scheduler-remote-queue sched))
-                      (with-mutex (async-scheduler-group-mutex group)
-                        (and
-                          (async-queue-empty?
-                            (async-scheduler-group-ready-queue group))
-                          (not (async-group-has-work? group))
-                          (not (async-scheduler-group-shutdown? group)))))
+          [(async-scheduler-virtual? sched)
+           (let ([timer
+                  (async-timer-heap-peek (async-scheduler-timers sched))])
              (if (not timer)
-                 (condition-wait (async-scheduler-remote-cond sched)
-                                 (async-scheduler-remote-mutex sched))
-                 (let* ([deadline (async-timer-deadline timer)]
-                        [delta (max 0 (- deadline (async-monotonic-us)))]
-                        [timeout (add-duration (current-time)
-                                   (make-time 'time-duration
-                                     (* (remainder delta 1000000) 1000)
-                                     (quotient delta 1000000)))])
-                   (condition-wait (async-scheduler-remote-cond sched)
-                                   (async-scheduler-remote-mutex sched)
-                                   timeout))))))]
-      [else
-       (if-feature pthreads
-         (let ([timer (async-timer-heap-peek (async-scheduler-timers sched))])
-           (with-mutex (async-scheduler-remote-mutex sched)
-             (when (async-queue-empty? (async-scheduler-remote-queue sched))
-               (if (not timer)
-                   (condition-wait (async-scheduler-remote-cond sched)
-                                   (async-scheduler-remote-mutex sched))
-                   (let* ([deadline (async-timer-deadline timer)]
-                          [delta (max 0 (fx- deadline (async-monotonic-us)))]
-                          [timeout (add-duration (current-time)
-                                     (make-time 'time-duration
-                                       (* (remainder delta 1000000) 1000)
-                                       (quotient delta 1000000)))])
-                     (condition-wait (async-scheduler-remote-cond sched)
-                                     (async-scheduler-remote-mutex sched)
-                                     timeout))))))
-         (let ([timer (async-timer-heap-peek (async-scheduler-timers sched))])
-           (when timer
-             (let* ([deadline (async-timer-deadline timer)]
-                    [delta (max 0 (fx- deadline (async-monotonic-us)))])
-               (sleep (make-time 'time-duration
-                        (* (remainder delta 1000000) 1000)
-                        (quotient delta 1000000)))))))]))
+                 ($oops 'run-async
+                   "async deadlock: no runnable tasks and no pending timers")
+                 (async-scheduler-vtime-set! sched
+                   (async-timer-deadline timer))))]
+          [(async-scheduler-poll-proc sched)
+           => (lambda (poll)
+                ;; The preceding nonblocking poll may consume a remote wakeup
+                ;; that arrived after the scheduler drained its queues.  A
+                ;; submission after this locked recheck leaves uv_async
+                ;; pending, so entering the blocking poll remains safe.
+                (when (async-poll-ready-to-block? sched)
+                  (poll sched #t)))]
+          [(async-group-parallel? ($async-scheduler-group sched))
+           (if-feature pthreads
+             (async-thread-idle-wait sched)
+             ($oops 'run-async
+               "parallel scheduler groups require thread support"))]
+          [else
+           (if-feature pthreads
+             (async-thread-idle-wait sched)
+             (async-sleep-until-next-timer sched))]))
       (lambda () (async-group-unmark-idle! sched)))))
 
 (define async-preemption-token (list 'async-preempted))

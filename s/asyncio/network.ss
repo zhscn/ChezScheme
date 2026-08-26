@@ -24,7 +24,7 @@
 (define aio-cancel-handle-requests!
   (lambda (w operation)
     (let ([deliveries '()])
-      (with-mutex (aio-state-requests-mutex (aio-handle-state w))
+      (with-aio-mutex (aio-state-requests-mutex (aio-handle-state w))
         (let-values ([(ids reqs)
                       (hashtable-entries
                         (aio-state-requests (aio-handle-state w)))])
@@ -45,7 +45,7 @@
   (lambda (w operation)
     (aio-debug-check-owner! (aio-handle-state w))
     (let-values ([(close? waiters)
-                  (with-mutex (aio-handle-mutex w)
+                  (with-aio-mutex (aio-handle-mutex w)
                     (if (aio-handle-closing? w)
                         (values #f '())
                         (begin
@@ -76,7 +76,7 @@
 (define aio-check-stream-unowned
   (lambda (who s)
     (aio-check-stream who s)
-    (with-mutex (aio-handle-mutex s)
+    (with-aio-mutex (aio-handle-mutex s)
       (when (aio-handle-port-owned? s)
         ($oops who "async stream ownership has been transferred to a port")))))
 
@@ -94,7 +94,7 @@
     (aio-check-stream who s)
     (aio-check-handle-scope! who s)
     (unless allow-owned?
-      (with-mutex (aio-handle-mutex s)
+      (with-aio-mutex (aio-handle-mutex s)
         (when (aio-handle-port-owned? s)
           ($oops who "async stream ownership has been transferred to a port"))))))
 
@@ -102,7 +102,7 @@
   (lambda (who s)
     (aio-check-stream who s)
     (aio-check-handle-scope! who s)
-    (with-mutex (aio-handle-mutex s)
+    (with-aio-mutex (aio-handle-mutex s)
       (when (aio-handle-port-owned? s)
         ($oops who "async stream ownership has already been transferred to a port"))
       (when (aio-handle-closing? s)
@@ -118,7 +118,7 @@
 
 (define aio-start-stream-read!
   (lambda (s)
-    (with-mutex (aio-handle-mutex s)
+    (with-aio-mutex (aio-handle-mutex s)
       (when (and (not (aio-handle-reading? s))
                  (not (aio-handle-closing? s))
                  (not (aio-handle-eof? s))
@@ -135,7 +135,7 @@
       (aio-make-operation
         (lambda (ss)
           (aio-check-stream-access! 'stream-read-operation s allow-owned?)
-        (with-mutex (aio-handle-mutex s)
+        (with-aio-mutex (aio-handle-mutex s)
           (cond
             [(aio-handle-eof? s) (cons 'values (list #!eof))]
             [(aio-handle-closing? s)
@@ -144,7 +144,7 @@
         (lambda (ss deliver)
           (aio-check-stream-access! 'stream-read-operation s allow-owned?)
           (let ([result
-                 (with-mutex (aio-handle-mutex s)
+                 (with-aio-mutex (aio-handle-mutex s)
                    (cond
                      [(aio-handle-eof? s)
                       (cons 'immediate (cons 'values (list #!eof)))]
@@ -168,10 +168,10 @@
           (let ([node ($async-sync-slot-ref ss token #f)])
             (when node
               ($async-sync-slot-delete! ss token)
-              (with-mutex (aio-handle-mutex s)
+              (with-aio-mutex (aio-handle-mutex s)
                 (aio-queue-remove! (aio-handle-read-queue s) node))))
           (let ([st (aio-handle-state s)])
-            (with-mutex (aio-state-stop-mutex st)
+            (with-aio-mutex (aio-state-stop-mutex st)
               (aio-state-stop-set-set! st
                 (cons s (aio-state-stop-set st))))))))))
 
@@ -186,12 +186,12 @@
       (aio-make-operation
         (lambda (ss)
           (aio-check-stream-access! 'stream-write-operation s allow-owned?)
-          (with-mutex (aio-handle-mutex s)
+          (with-aio-mutex (aio-handle-mutex s)
             (and (aio-handle-closing? s)
                  (cons 'raise (aio-closed-condition 'write s)))))
         (lambda (ss deliver)
           (aio-check-stream-access! 'stream-write-operation s allow-owned?)
-          (if (with-mutex (aio-handle-mutex s)
+          (if (with-aio-mutex (aio-handle-mutex s)
                 (aio-handle-closing? s))
               (begin
                 (deliver (cons 'raise (aio-closed-condition 'write s)))
@@ -208,7 +208,7 @@
                           [(or (aio-atomic-box-ref canceled-box)
                                (aio-waiter-dead? ss))
                            (void)]
-                          [(with-mutex (aio-handle-mutex s)
+                          [(with-aio-mutex (aio-handle-mutex s)
                              (aio-handle-closing? s))
                            (deliver
                              (cons 'raise (aio-closed-condition 'write s)))]
@@ -250,12 +250,12 @@
       (aio-make-operation
         (lambda (ss)
           (aio-check-stream-access! 'stream-shutdown s #f)
-          (with-mutex (aio-handle-mutex s)
+          (with-aio-mutex (aio-handle-mutex s)
             (and (aio-handle-closing? s)
                  (cons 'raise (aio-closed-condition 'shutdown s)))))
         (lambda (ss deliver)
           (aio-check-stream-access! 'stream-shutdown s #f)
-          (if (with-mutex (aio-handle-mutex s)
+          (if (with-aio-mutex (aio-handle-mutex s)
                 (aio-handle-closing? s))
               (begin
                 (deliver (cons 'raise (aio-closed-condition 'shutdown s)))
@@ -271,7 +271,7 @@
                           [(or (aio-atomic-box-ref canceled-box)
                                (aio-waiter-dead? ss))
                            (void)]
-                          [(with-mutex (aio-handle-mutex s)
+                          [(with-aio-mutex (aio-handle-mutex s)
                              (aio-handle-closing? s))
                            (deliver
                              (cons 'raise (aio-closed-condition 'shutdown s)))]
@@ -342,7 +342,7 @@
        (when (= h 0)
          ($oops 'tcp-listen "cannot allocate a tcp handle"))
        (let ([w (make-aio-handle id h 'tcp-listener st
-                  (format "~a:~a" host port) #f (make-mutex)
+                  (format "~a:~a" host port) #f (make-aio-os-mutex)
                   #f #f (make-aio-queue) #f #f (make-aio-queue) #f)])
          (define (fail r)
            (aio-handle-close h)
@@ -363,7 +363,7 @@
       (aio-make-operation
         (lambda (ss)
           (aio-check-handle-scope! 'tcp-accept-operation listener)
-          (with-mutex (aio-handle-mutex listener)
+          (with-aio-mutex (aio-handle-mutex listener)
             (cond
               [(aio-handle-closing? listener)
                (cons 'raise (aio-closed-condition 'accept listener))]
@@ -371,7 +371,7 @@
         (lambda (ss deliver)
           (aio-check-handle-scope! 'tcp-accept-operation listener)
           (let ([payload
-                 (with-mutex (aio-handle-mutex listener)
+                 (with-aio-mutex (aio-handle-mutex listener)
                    (if (aio-handle-closing? listener)
                        (cons 'raise (aio-closed-condition 'accept listener))
                        (begin
@@ -394,7 +394,7 @@
           (let ([node ($async-sync-slot-ref ss token #f)])
             (when node
               ($async-sync-slot-delete! ss token)
-              (with-mutex (aio-handle-mutex listener)
+              (with-aio-mutex (aio-handle-mutex listener)
                 (aio-queue-remove!
                   (aio-handle-accept-queue listener) node)))))))))
 
@@ -416,7 +416,7 @@
                       (aio-io-condition 'connect #f (format "~a:~a" host port) -12)))
                   #f)
                 (let ([w (make-aio-handle id h 'tcp-stream st
-                           (format "~a:~a" host port) #f (make-mutex)
+                           (format "~a:~a" host port) #f (make-aio-os-mutex)
                            #f #f (make-aio-queue) #f #f (make-aio-queue) #f)])
                   (aio-register-handle! st w)
                   (let ([r (aio-tcp-connect h host port id)])
@@ -463,7 +463,7 @@
             [h (aio-pipe-init (aio-state-loop st) id)])
        (when (= h 0)
          ($oops 'pipe-listen "cannot allocate a pipe handle"))
-       (let ([w (make-aio-handle id h 'pipe-listener st path #f (make-mutex)
+       (let ([w (make-aio-handle id h 'pipe-listener st path #f (make-aio-os-mutex)
                   #f #f (make-aio-queue) #f #f (make-aio-queue) #f)])
          (define (fail r)
            (aio-handle-close h)
@@ -492,7 +492,7 @@
                   (deliver
                     (cons 'raise (aio-io-condition 'connect #f path -12)))
                   #f)
-                (let ([w (make-aio-handle id h 'pipe-stream st path #f (make-mutex)
+                (let ([w (make-aio-handle id h 'pipe-stream st path #f (make-aio-os-mutex)
                            #f #f (make-aio-queue) #f #f (make-aio-queue) #f)])
                   (aio-register-handle! st w)
                   (aio-register-request! st id
@@ -575,7 +575,7 @@
   (lambda (who socket)
     (aio-check-udp who socket)
     (aio-check-handle-scope! who socket)
-    (when (with-mutex (aio-handle-mutex socket)
+    (when (with-aio-mutex (aio-handle-mutex socket)
             (aio-handle-closing? socket))
       (raise (aio-closed-condition who socket)))))
 
@@ -599,7 +599,7 @@
             [h (aio-udp-init (aio-state-loop st) id)])
        (when (= h 0) ($oops 'udp-open "cannot allocate a UDP handle"))
        (let ([socket
-              (make-aio-handle id h 'udp st #f #f (make-mutex)
+              (make-aio-handle id h 'udp st #f #f (make-aio-os-mutex)
                 #f #f (make-aio-queue) #f #f (make-aio-queue) #f)])
          (aio-register-handle! st socket)
          socket))]
@@ -619,7 +619,7 @@
 (define aio-start-udp-recv!
   (lambda (socket)
     (let ([delivery #f])
-      (with-mutex (aio-handle-mutex socket)
+      (with-aio-mutex (aio-handle-mutex socket)
         (when (and (not (aio-handle-reading? socket))
                    (not (aio-handle-closing? socket))
                    (not (aio-queue-empty? (aio-handle-read-queue socket))))
@@ -648,7 +648,7 @@
       (lambda (ss deliver)
         (aio-check-udp-open! 'udp-receive-operation socket)
         (let ([payload
-               (with-mutex (aio-handle-mutex socket)
+               (with-aio-mutex (aio-handle-mutex socket)
                  (if (aio-handle-closing? socket)
                      (cons 'raise
                        (aio-closed-condition 'udp-receive socket))
@@ -668,10 +668,10 @@
         (let ([node ($async-sync-slot-ref ss token #f)])
           (when node
             ($async-sync-slot-delete! ss token)
-            (with-mutex (aio-handle-mutex socket)
+            (with-aio-mutex (aio-handle-mutex socket)
               (aio-queue-remove! (aio-handle-read-queue socket) node))))
         (let ([st (aio-handle-state socket)])
-          (with-mutex (aio-state-stop-mutex st)
+          (with-aio-mutex (aio-state-stop-mutex st)
             (aio-state-stop-set-set! st
               (cons socket (aio-state-stop-set st))))))))))
 
@@ -884,7 +884,7 @@
       (when (= h 0)
         (raise (aio-io-condition 'fd-poll-open #f #f 'init-failed)))
       (let ([poll (make-aio-handle id h 'poll st (format "fd ~a" fd)
-                    #f (make-mutex) #f #f (make-aio-queue) #f #f
+                    #f (make-aio-os-mutex) #f #f (make-aio-queue) #f #f
                     (make-aio-queue) #f)])
         (aio-register-handle! st poll)
         poll))))
@@ -898,7 +898,7 @@
       (aio-make-operation
         (lambda (ss)
           (aio-check-handle-scope! 'fd-poll-operation poll)
-          (with-mutex (aio-handle-mutex poll)
+          (with-aio-mutex (aio-handle-mutex poll)
             (cond
               [(aio-handle-closing? poll)
                (cons 'raise (aio-closed-condition 'fd-poll poll))]
@@ -910,7 +910,7 @@
         (lambda (ss deliver)
           (aio-check-handle-scope! 'fd-poll-operation poll)
           (let ([result
-                 (with-mutex (aio-handle-mutex poll)
+                 (with-aio-mutex (aio-handle-mutex poll)
                    (cond
                      [(aio-handle-closing? poll)
                       (cons 'immediate
@@ -941,10 +941,10 @@
           (let ([node ($async-sync-slot-ref ss token #f)])
             (when node
               ($async-sync-slot-delete! ss token)
-              (with-mutex (aio-handle-mutex poll)
+              (with-aio-mutex (aio-handle-mutex poll)
                 (aio-queue-remove! (aio-handle-read-queue poll) node))))
           (let ([st (aio-handle-state poll)])
-            (with-mutex (aio-state-stop-mutex st)
+            (with-aio-mutex (aio-state-stop-mutex st)
               (aio-state-stop-set-set! st
                 (cons poll (aio-state-stop-set st))))))))))
 
@@ -1069,21 +1069,21 @@
                    (close-pipes)
                    (raise (aio-io-condition 'process-spawn #f file ph)))
                  (let ([process (make-aio-handle process-id ph 'process st file
-                                  #f (make-mutex) #f #f (make-aio-queue) #f #f
+                                  #f (make-aio-os-mutex) #f #f (make-aio-queue) #f #f
                                   (make-aio-queue) #f)]
                        [stdin (and in-pipe?
                                 (make-aio-handle in-id in-h 'pipe-stream st
-                                  "process stdin" #f (make-mutex)
+                                  "process stdin" #f (make-aio-os-mutex)
                                   #f #f (make-aio-queue) #f #f
                                   (make-aio-queue) #f))]
                        [stdout (and out-pipe?
                                  (make-aio-handle out-id out-h 'pipe-stream st
-                                   "process stdout" #f (make-mutex)
+                                   "process stdout" #f (make-aio-os-mutex)
                                    #f #f (make-aio-queue) #f #f
                                    (make-aio-queue) #f))]
                        [stderr (and err-pipe?
                                  (make-aio-handle err-id err-h 'pipe-stream st
-                                   "process stderr" #f (make-mutex)
+                                   "process stderr" #f (make-aio-os-mutex)
                                    #f #f (make-aio-queue) #f #f
                                    (make-aio-queue) #f))])
                    (aio-register-handle! st process)
@@ -1101,7 +1101,7 @@
       (aio-make-operation
       (lambda (ss)
         (aio-check-handle-scope! 'process-wait-operation process)
-        (with-mutex (aio-handle-mutex process)
+        (with-aio-mutex (aio-handle-mutex process)
           (let ([result (aio-handle-result process)])
             (cond
               [result (cons 'values (list (car result) (cdr result)))]
@@ -1111,7 +1111,7 @@
       (lambda (ss deliver)
         (aio-check-handle-scope! 'process-wait-operation process)
         (let ([payload
-               (with-mutex (aio-handle-mutex process)
+               (with-aio-mutex (aio-handle-mutex process)
                  (let ([result (aio-handle-result process)])
                    (cond
                      [result
@@ -1132,7 +1132,7 @@
         (let ([node ($async-sync-slot-ref ss token #f)])
           (when node
             ($async-sync-slot-delete! ss token)
-            (with-mutex (aio-handle-mutex process)
+            (with-aio-mutex (aio-handle-mutex process)
               (aio-queue-remove!
                 (aio-handle-accept-queue process) node)))))))))
 
@@ -1145,7 +1145,7 @@
            [native (init (aio-state-loop st) id)])
       (when (= native 0) ($oops who "cannot allocate a native watcher"))
       (let ([watcher (make-aio-handle id native kind st path #f
-                       (make-mutex) #f #f (make-aio-queue) #f #f
+                       (make-aio-os-mutex) #f #f (make-aio-queue) #f #f
                        (make-aio-queue) config)])
         (aio-register-handle! st watcher)
         watcher))))
@@ -1162,7 +1162,7 @@
       (aio-make-operation
       (lambda (ss)
         (aio-check-handle-scope! who watcher)
-        (with-mutex (aio-handle-mutex watcher)
+        (with-aio-mutex (aio-handle-mutex watcher)
           (cond
             [(aio-handle-closing? watcher)
              (cons 'raise (aio-closed-condition who watcher))]
@@ -1173,7 +1173,7 @@
       (lambda (ss deliver)
         (aio-check-handle-scope! who watcher)
         (let ([result
-               (with-mutex (aio-handle-mutex watcher)
+               (with-aio-mutex (aio-handle-mutex watcher)
                  (cond
                    [(aio-handle-closing? watcher)
                     (cons 'immediate
@@ -1209,10 +1209,10 @@
         (let ([node ($async-sync-slot-ref ss token #f)])
           (when node
             ($async-sync-slot-delete! ss token)
-            (with-mutex (aio-handle-mutex watcher)
+            (with-aio-mutex (aio-handle-mutex watcher)
               (aio-queue-remove! (aio-handle-read-queue watcher) node))))
         (let ([st (aio-handle-state watcher)])
-          (with-mutex (aio-state-stop-mutex st)
+          (with-aio-mutex (aio-state-stop-mutex st)
             (aio-state-stop-set-set! st
               (cons watcher (aio-state-stop-set st))))))))))
 
@@ -1290,7 +1290,7 @@
         (raise (aio-io-condition 'tty-open #f (format "fd ~a" fd)
                  'init-failed)))
       (let ([tty (make-aio-handle id native 'tty-stream st
-                   (format "tty fd ~a" fd) #f (make-mutex)
+                   (format "tty fd ~a" fd) #f (make-aio-os-mutex)
                    #f #f (make-aio-queue) #f #f (make-aio-queue) #f)])
         (aio-register-handle! st tty)
         tty))))

@@ -35,7 +35,7 @@
 ;;; ------------------------------------------------------- shim loading
 
 (define aio-loaded? (box #f))
-(define aio-load-mutex (make-mutex))
+(define aio-load-mutex (make-aio-os-mutex))
 
 (define aio-loaded?/acquire
   (lambda ()
@@ -366,7 +366,7 @@
 (define aio-resolve-kernel!
   (lambda ()
     (unless (aio-loaded?/acquire)
-      (with-mutex aio-load-mutex
+      (with-aio-mutex aio-load-mutex
         (unless (aio-loaded?/acquire)
           ;; Publish the initialized procedure slots only after every foreign
           ;; entry point has been resolved.

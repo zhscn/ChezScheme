@@ -1,7 +1,7 @@
 ;;; ppc32osx.def
 
 (define-constant machine-type (constant machine-type-ppc32osx))
-(features iconv expeditor)
+(features iconv expeditor libuv)
 (define-constant max-float-alignment 4)
 (define-constant max-integer-alignment 4)
 (define-constant special-initial-field-alignment? #t)

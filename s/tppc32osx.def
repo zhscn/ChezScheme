@@ -1,7 +1,7 @@
 ;;; tppc32le.def
 
 (define-constant machine-type (constant machine-type-tppc32osx))
-(features iconv expeditor pthreads)
+(features iconv expeditor pthreads libuv)
 (define-constant max-float-alignment 4)
 (define-constant max-integer-alignment 4)
 (define-constant special-initial-field-alignment? #t)

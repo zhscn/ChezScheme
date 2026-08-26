@@ -14,7 +14,7 @@
 ;;; limitations under the License.
 
 (define-constant machine-type (constant machine-type-i3qnx))
-(features iconv expeditor)
+(features iconv expeditor libuv)
 (define-constant max-integer-alignment 8)
 (define-constant segment-table-levels 2)
 (include "i3.def")

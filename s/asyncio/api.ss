@@ -68,7 +68,7 @@
 (set! stream-closed?
   (lambda (s)
     (and (aio-handle? s)
-         (with-mutex (aio-handle-mutex s)
+         (with-aio-mutex (aio-handle-mutex s)
            (or (aio-handle-closing? s) (aio-handle-closed? s))))))
 (set-who! stream-read
   (lambda (s)
@@ -596,7 +596,7 @@
 (record-writer (type-descriptor aio-handle)
   (lambda (r p wr)
     (let ([closed?
-           (with-mutex (aio-handle-mutex r)
+           (with-aio-mutex (aio-handle-mutex r)
              (aio-handle-closed? r))])
       (fprintf p "#<async-~a ~a~a>"
         (aio-handle-kind r)
@@ -606,7 +606,7 @@
 (record-writer (type-descriptor async-file)
   (lambda (r p wr)
     (let ([closed?
-           (with-mutex (async-file-mutex r)
+           (with-aio-mutex (async-file-mutex r)
              (async-file-closed? r))])
       (fprintf p "#<async-file ~a~a>"
         (async-file-path r)

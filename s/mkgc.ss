@@ -260,10 +260,17 @@
                    (RECORD_REMOTE s_si)]
                   [else
                    (set! (continuation-stack _)
-                         (copy_stack _tgc_
-                                     (continuation-stack _)
-                                     (& (continuation-stack-length _))
-                                     (continuation-stack-clength _)))]))]
+                         (cond
+                           [(== code S_G.native_fiber_context_code)
+                            (copy_stack_preserve_capacity _tgc_
+                              (continuation-stack _)
+                              (& (continuation-stack-length _))
+                              (continuation-stack-clength _))]
+                           [else
+                            (copy_stack _tgc_
+                              (continuation-stack _)
+                              (& (continuation-stack-length _))
+                              (continuation-stack-clength _))]))]))]
              [else])
             (count countof-stack (continuation-stack-length _) 1 [measure])
             (trace-pure continuation-link)
@@ -994,10 +1001,18 @@
           (when (OLDSPACE old_stack)
             (let* ([clength : iptr (- (cast uptr (SFP tc)) (cast uptr old_stack))])
               ;; Include SFP[0], which contains the return address
-              (set! (tc-scheme-stack tc) (copy_stack _tgc_
-                                                     old_stack
-                                                     (& (tc-scheme-stack-size tc))
-                                                     (+ clength (sizeof ptr))))
+              (set! (tc-scheme-stack tc)
+                    (cond
+                      [(!= (tc-current-native-fiber tc) Sfalse)
+                       (copy_stack_preserve_capacity _tgc_
+                         old_stack
+                         (& (tc-scheme-stack-size tc))
+                         (+ clength (sizeof ptr)))]
+                      [else
+                       (copy_stack _tgc_
+                         old_stack
+                         (& (tc-scheme-stack-size tc))
+                         (+ clength (sizeof ptr)))]))
               (set! (tc-sfp tc) (cast ptr (+ (cast uptr (tc-scheme-stack tc)) clength)))
               (set! (tc-esp tc) (cast ptr (- (+ (cast uptr (tc-scheme-stack tc))
                                                 (tc-scheme-stack-size tc))

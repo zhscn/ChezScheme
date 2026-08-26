@@ -456,6 +456,70 @@ void S_handle_apply_overflood() {
     S_overflow(tc, ((iptr)AC0(tc) + 1) * sizeof(ptr));
 }
 
+/* Grow the uniquely owned active stack of a native fiber without turning
+ * ordinary call frames into continuation segments.  Explicit continuation
+ * capture remains responsible for creating and linking continuation storage.
+ * Return false only when the current execution context is not a native
+ * fiber.  An unrepresentable fiber stack size is an allocation failure, not
+ * a reason to change the fiber's stack-growth model. */
+static IBOOL grow_native_fiber_stack(ptr tc, iptr frame_request) {
+    iptr signed_old_size;
+    uptr old_size, sfp_offset, required_size, new_size, max_iptr;
+    ptr old_stack, new_stack;
+
+    if (CURRENTNATIVEFIBER(tc) == Sfalse) return 0;
+    if (frame_request < 0) S_error_abort("native-fiber stack request is negative");
+    if (((uptr)frame_request & (ptr_bytes - 1)) != 0)
+      S_error_abort("native-fiber stack request is misaligned");
+
+    old_stack = SCHEMESTACK(tc);
+    signed_old_size = SCHEMESTACKSIZE(tc);
+    if (old_stack == (ptr)0
+        || ((uptr)old_stack & (ptr_bytes - 1)) != 0
+        || signed_old_size < stack_slop
+        || ((uptr)signed_old_size & (ptr_bytes - 1)) != 0)
+      S_error_abort("native-fiber stack size is invalid before growth");
+    old_size = (uptr)signed_old_size;
+    sfp_offset = (uptr)SFP(tc) - (uptr)old_stack;
+    max_iptr = ((uptr)-1) >> 1;
+
+    if (sfp_offset >= old_size || (sfp_offset & (ptr_bytes - 1)) != 0)
+      S_error_abort("native-fiber stack geometry is invalid before growth");
+
+    if ((uptr)frame_request > max_iptr - old_size
+        || old_size + (uptr)frame_request
+             > max_iptr - (uptr)(one_shot_headroom >> 1)) {
+      S_error_abort("native-fiber stack size overflow");
+      return 1;
+    }
+
+    required_size = old_size + (uptr)frame_request
+                  + (uptr)(one_shot_headroom >> 1);
+    if (old_size <= max_iptr / 2)
+      new_size = old_size * 2;
+    else
+      new_size = required_size;
+    if (new_size < required_size) new_size = required_size;
+    if (new_size > max_iptr - (byte_alignment - 1)) {
+      S_error_abort("native-fiber stack size overflow");
+      return 1;
+    }
+    new_size = (uptr)ptr_align(new_size);
+    if (new_size <= old_size || new_size > max_iptr) {
+      S_error_abort("native-fiber stack size overflow");
+      return 1;
+    }
+
+    S_reset_native_fiber_stack(tc, (iptr)new_size);
+    new_stack = SCHEMESTACK(tc);
+    if (new_stack == old_stack || SCHEMESTACKSIZE(tc) <= (iptr)old_size)
+      S_error_abort("native-fiber stack growth did not allocate distinct storage");
+
+    memcpy(TO_VOIDP(new_stack), TO_VOIDP(old_stack), old_size);
+    SFP(tc) = (ptr)((uptr)new_stack + sfp_offset);
+    return 1;
+}
+
 /* allocates a new stack
  * --the old stack below the sfp is turned into a continuation
  * --the old stack above the sfp is copied to the new stack
@@ -469,6 +533,8 @@ void S_overflow(ptr tc, iptr frame_request) {
     ptr *split_point, *guard, *other_guard;
     iptr split_stack_length, split_stack_clength;
     ptr nuate;
+
+    if (grow_native_fiber_stack(tc, frame_request)) return;
 
     sfp = TO_VOIDP(SFP(tc));
     nuate = SYMVAL(S_G.nuate_id);

@@ -14,7 +14,7 @@
 ;;; limitations under the License.
 
 (define-constant machine-type (constant machine-type-ta6nt))
-(features iconv expeditor pthreads windows)
+(features iconv expeditor pthreads libuv windows)
 (include "a6.def")
 (include "nt.def")
 (include "default.def")

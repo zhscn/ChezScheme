@@ -543,6 +543,7 @@ typedef uint64_t U64;
 #define native_fiber_id_disp 0x69
 #define native_fiber_incoming_payload_disp 0x41
 #define native_fiber_incoming_source_disp 0x39
+#define native_fiber_initial_stack_size 0x3FF0
 #define native_fiber_on_return_disp 0x29
 #define native_fiber_pinned_next_disp 0x71
 #define native_fiber_starter_disp 0x31

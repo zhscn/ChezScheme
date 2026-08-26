@@ -14,7 +14,7 @@
 ;;; limitations under the License.
 
 (define-constant machine-type (constant machine-type-i3nt))
-(features iconv expeditor windows)
+(features iconv expeditor libuv windows)
 (include "i3.def")
 (include "nt.def")
 (include "default.def")

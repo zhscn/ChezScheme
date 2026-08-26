@@ -2,6 +2,6 @@
 ;; by the `machine.def` script
 
 (define-constant machine-type (constant machine-type-$(M)))
-(features iconv expeditor pthreads)
+(features iconv expeditor pthreads libuv)
 (include "$(March).def")
 (include "default.def")

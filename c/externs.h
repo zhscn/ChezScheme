@@ -63,6 +63,7 @@ off64_t lseek64(int,off64_t,int);
 extern void S_alloc_init(void);
 extern void S_protect(ptr *p);
 extern void S_reset_scheme_stack(ptr tc, iptr n);
+extern void S_reset_native_fiber_stack(ptr tc, iptr n);
 extern void S_reset_allocation_pointer(ptr tc); /* call S_maybe_fire_collector afterward outside alloc mutex */
 extern void S_maybe_fire_collector(thread_gc *tgc);
 extern ptr S_compute_bytes_allocated(ptr xg, ptr xs);

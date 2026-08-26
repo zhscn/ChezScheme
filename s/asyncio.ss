@@ -21,12 +21,25 @@
 ;;; by the scheduler poll hook; a libuv worker callback never runs Scheme code,
 ;;; and the trampoline never raises.
 
-(let ()  ; private scope: public names are assigned to their declared globals
+(if-feature libuv
+  (let ()  ; private scope: public names are assigned to their declared globals
 
 (define-syntax aio-trace (syntax-rules () [(_ e ...) (void)]))
+
+(define-syntax with-aio-mutex
+  (lambda (x)
+    (syntax-case x ()
+      [(_ mutex body1 body2 ...)
+       (if-feature pthreads
+         #'(critical-section (with-mutex mutex body1 body2 ...))
+         #'(begin body1 body2 ...))])))
+
+(define make-aio-os-mutex
+  (lambda () (if-feature pthreads (make-mutex) #f)))
 
   (include "asyncio/ffi.ss")
   (include "asyncio/core.ss")
   (include "asyncio/network.ss")
   (include "asyncio/filesystem.ss")
   (include "asyncio/api.ss"))
+  (void))

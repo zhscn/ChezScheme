@@ -101,17 +101,15 @@ void S_protect(ptr *p) {
     S_G.protected[S_G.protect_next++] = p;
 }
 
-void S_reset_scheme_stack(ptr tc, iptr n) {
+static void reset_scheme_stack(ptr tc, iptr n, iptr minimum_size) {
     ptr *x; iptr m;
 
-  /* we allow less than one_shot_headroom here for no truly justifiable
-     reason */
-    n = ptr_align(n + (one_shot_headroom >> 1));
+    n = ptr_align(n);
+    if (n < minimum_size) n = minimum_size;
 
     x = &STACKCACHE(tc);
     for (;;) {
         if (*x == snil) {
-            if (n < default_stack_size) n = default_stack_size;
           /* stacks are untyped objects */
             find_room(tc, space_new, 0, type_untyped, n, SCHEMESTACK(tc));
             break;
@@ -134,6 +132,18 @@ void S_reset_scheme_stack(ptr tc, iptr n) {
     SCHEMESTACKSIZE(tc) = n;
     ESP(tc) = (ptr)((uptr)SCHEMESTACK(tc) + n - stack_slop);
     SFP(tc) = (ptr)SCHEMESTACK(tc);
+}
+
+void S_reset_scheme_stack(ptr tc, iptr n) {
+  /* we allow less than one_shot_headroom here for no truly justifiable
+     reason */
+    reset_scheme_stack(tc,
+                       ptr_align(n + (one_shot_headroom >> 1)),
+                       default_stack_size);
+}
+
+void S_reset_native_fiber_stack(ptr tc, iptr n) {
+    reset_scheme_stack(tc, n, bytes_per_segment - (2 * ptr_bytes));
 }
 
 ptr S_compute_bytes_allocated(ptr xg, ptr xs) {

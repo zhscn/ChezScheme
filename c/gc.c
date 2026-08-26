@@ -201,6 +201,8 @@ static void sweep_in_old(thread_gc *tgc, ptr p);
 static void sweep_object_in_old(thread_gc *tgc, ptr p);
 static IBOOL object_directly_refers_to_self(ptr p);
 static ptr copy_stack(thread_gc *tgc, ptr old, iptr *length, iptr clength);
+static ptr copy_stack_preserve_capacity(thread_gc *tgc, ptr old,
+                                        iptr *length, iptr clength);
 static void resweep_weak_pairs(thread_gc *tgc, seginfo *oldweakspacesegments);
 static void forward_or_bwp(thread_gc *tgc, IGEN from_g, ptr *pp, ptr p);
 static void sweep_generation(thread_gc *tgc);
@@ -838,7 +840,8 @@ static void sweep_dirty_object_if_space_new(thread_gc *tgc, ptr p) {
     (void)sweep_dirty_object(tgc, p, 0);
 }
 
-static ptr copy_stack(thread_gc *tgc, ptr old, iptr *length, iptr clength) {
+static ptr copy_stack_help(thread_gc *tgc, ptr old, iptr *length,
+                           iptr clength, IBOOL preserve_capacity) {
   iptr n, m; ptr new; IGEN newg;
   seginfo *si = SegInfo(ptr_get_segment(old));
 
@@ -867,7 +870,10 @@ static ptr copy_stack(thread_gc *tgc, ptr old, iptr *length, iptr clength) {
 #endif
 
   /* reduce headroom created for excessively large frames (typically resulting from apply with long lists) */
-  if (n != clength && n > default_stack_size && n > (m = clength + one_shot_headroom)) {
+  if (!preserve_capacity
+      && n != clength
+      && n > default_stack_size
+      && n > (m = clength + one_shot_headroom)) {
     *length = n = m;
   }
 
@@ -891,6 +897,15 @@ static ptr copy_stack(thread_gc *tgc, ptr old, iptr *length, iptr clength) {
     /* also returning possibly updated value in *length */
     return new;
   }
+}
+
+static ptr copy_stack(thread_gc *tgc, ptr old, iptr *length, iptr clength) {
+  return copy_stack_help(tgc, old, length, clength, 0);
+}
+
+static ptr copy_stack_preserve_capacity(thread_gc *tgc, ptr old,
+                                        iptr *length, iptr clength) {
+  return copy_stack_help(tgc, old, length, clength, 1);
 }
 
 #define NONSTATICINHEAP(si, x) (!FIXMEDIATE(x) && (si = MaybeSegInfo(ptr_get_segment(x))) != NULL && si->generation != static_generation)

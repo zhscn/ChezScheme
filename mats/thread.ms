@@ -3393,6 +3393,46 @@
                        (list-ref result 3) "stack-shape-backtrace")))
               (eq? (#3%$native-fiber-state task) 'finished))]))))
 
+(mat native-fiber-contiguous-growth-and-continuation
+  (parameterize ([#3%$enable-check-heap #t])
+    (let* ([scheduler
+            (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+           [current-scheduler scheduler]
+           [task #f]
+           [saved #f]
+           [invocations 0]
+           [growth-link-clean? #f])
+      (define (deep depth baseline-link)
+        (if (fx= depth 0)
+            (begin
+              ;; Ordinary stack growth must not manufacture an overflow
+              ;; continuation.  Explicit capture below remains fully supported.
+              (set! growth-link-clean?
+                (eq? (#3%$tc-field 'stack-link (#3%$tc)) baseline-link))
+              (call/cc
+                (lambda (k)
+                  (set! saved k)
+                  0)))
+            (fx+ 1 (deep (fx- depth 1) baseline-link))))
+      (set! task
+        (#3%$native-fiber-create
+          (lambda ()
+            (let* ([baseline-link (#3%$tc-field 'stack-link (#3%$tc))]
+                   [value (deep 6000 baseline-link)])
+              (if (fx< invocations 2)
+                  (begin
+                    (set! invocations (fx+ invocations 1))
+                    (collect (collect-maximum-generation))
+                    (saved invocations))
+                  (list value growth-link-clean?
+                    (eq? (#3%$tc-field 'stack-link (#3%$tc)) baseline-link)))))
+          (native-fiber-dynamic-return-handler (lambda () current-scheduler))
+          #b100))
+      (#3%$native-fiber-try-claim! task)
+      (let ([transfer (#3%$native-fiber-switch scheduler task 'start)])
+        (and (equal? transfer '(return 6002 #t #t))
+             (eq? (#3%$native-fiber-state task) 'finished))))))
+
 (mat native-fiber-profile-observer-migration
   (let* ([scheduler
           (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]

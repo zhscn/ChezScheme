@@ -81,7 +81,7 @@
                        (lambda ()
                          (when serial-resource
                            (let ([next
-                                  (with-mutex (aio-serial-mutex serial-resource)
+                                  (with-aio-mutex (aio-serial-mutex serial-resource)
                                     (let ([entry
                                            (aio-queue-pop!
                                              (aio-serial-queue serial-resource))])
@@ -99,7 +99,7 @@
                            (lambda () (void))
                            (lambda ()
                              (if serial-resource
-                                 (with-mutex (aio-serial-mutex serial-resource)
+                                 (with-aio-mutex (aio-serial-mutex serial-resource)
                                    (gen ss status aux))
                                  (gen ss status aux)))
                            release!))]
@@ -109,7 +109,7 @@
                            (lambda () (void))
                            (lambda ()
                              (if serial-resource
-                                 (with-mutex (aio-serial-mutex serial-resource)
+                                 (with-aio-mutex (aio-serial-mutex serial-resource)
                                    (canceled-gen ss status aux))
                                  (canceled-gen ss status aux)))
                            release!))]
@@ -140,7 +140,7 @@
                            (let ([result
                                   (guard (c [else (cons 'exception c)])
                                     (if serial-resource
-                                        (with-mutex
+                                        (with-aio-mutex
                                           (aio-serial-mutex serial-resource)
                                           (if (or (aio-atomic-box-ref canceled?)
                                                   (aio-waiter-dead? ss))
@@ -174,7 +174,7 @@
              (if serial-resource
                  (let ([entry (list ss started? submit)] [start-now? #f])
                    (set-box! entry-box entry)
-                   (with-mutex (aio-serial-mutex serial-resource)
+                   (with-aio-mutex (aio-serial-mutex serial-resource)
                      (if (aio-serial-busy? serial-resource)
                          (set-box! entry-box
                            (aio-queue-push!
@@ -197,7 +197,7 @@
                      [nack-started? (not serial-resource)])
                  (aio-atomic-box-flag! (vector-ref attempt 4))
                  (when serial-resource
-                   (with-mutex (aio-serial-mutex serial-resource)
+                   (with-aio-mutex (aio-serial-mutex serial-resource)
                      (if (unbox started?)
                          (set! nack-started? #t)
                          (let ([node (unbox entry-box)])
@@ -231,7 +231,7 @@
                  (let ([f
                         (make-async-file% status path st #f
                           (if (fxlogtest bits 16) -1 0) ; append: track end lazily
-                          #f (make-mutex) #f (make-aio-queue))])
+                          #f (make-aio-os-mutex) #f (make-aio-queue))])
                    (cons 'values (list (aio-register-file! st f)))))
                (cons 'raise (aio-io-condition 'open #f path status))))
          (lambda (ss status aux)
@@ -247,14 +247,14 @@
   (lambda (who f)
     (unless (%async-file? f)
       ($oops who "~s is not an async file" f))
-    (with-mutex (async-file-mutex f)
+    (with-aio-mutex (async-file-mutex f)
       (aio-check-file/raw who f))))
 
 (define aio-check-file-unowned
   (lambda (who f)
     (unless (%async-file? f)
       ($oops who "~s is not an async file" f))
-    (with-mutex (async-file-mutex f)
+    (with-aio-mutex (async-file-mutex f)
       (aio-check-file/raw who f)
       (when (async-file-port-owned? f)
         ($oops who "async file ownership has been transferred to a port")))))
@@ -279,7 +279,7 @@
     (unless (%async-file? f)
       ($oops who "~s is not an async file" f))
     (aio-check-file-scope! who f)
-    (with-mutex (async-file-mutex f)
+    (with-aio-mutex (async-file-mutex f)
       (aio-check-file/raw who f)
       (when (async-file-port-owned? f)
         ($oops who "async file ownership has already been transferred to a port"))
@@ -458,15 +458,15 @@
 
 (define aio-file-port-position-procedures
   (lambda (f)
-    (if (with-mutex (async-file-mutex f)
+    (if (with-aio-mutex (async-file-mutex f)
           (fx>= (async-file-offset f) 0))
         (values
           (lambda ()
-            (with-mutex (async-file-mutex f)
+            (with-aio-mutex (async-file-mutex f)
               (aio-check-file/raw 'port-position f)
               (async-file-offset f)))
           (lambda (position)
-            (with-mutex (async-file-mutex f)
+            (with-aio-mutex (async-file-mutex f)
               (aio-check-file/raw 'set-port-position! f)
               (async-file-offset-set! f position))))
         (values #f #f))))
@@ -625,7 +625,7 @@
                              aio-fs-result-path-length aio-fs-result-path-copy
                              'mkstemp pattern)]
                      [f (make-async-file% status path st #f 0 #f
-                          (make-mutex) #f (make-aio-queue))])
+                          (make-aio-os-mutex) #f (make-aio-queue))])
                 (cons 'values (list (aio-register-file! st f) path)))
               (cons 'raise (aio-io-condition 'mkstemp #f pattern status))))
         (lambda (ss status aux)
@@ -675,7 +675,7 @@
   (lambda (who directory)
     (unless (%async-directory? directory)
       ($oops who "~s is not an async directory" directory))
-    (with-mutex (async-directory-mutex directory)
+    (with-aio-mutex (async-directory-mutex directory)
       (aio-check-directory/raw who directory))))
 
 (define %directory-open-operation
@@ -691,7 +691,7 @@
               (let* ([st ($async-sync-slot-ref ss token #f)]
                      [directory
                       (make-async-directory% (aio-fs-result-ptr aux) path st
-                        #f (make-mutex) #f (make-aio-queue))])
+                        #f (make-aio-os-mutex) #f (make-aio-queue))])
                 (cons 'values
                   (list (aio-register-directory! st directory))))
               (cons 'raise (aio-io-condition 'opendir #f path status))))
@@ -795,7 +795,7 @@
     (aio-fs-request-operation 'sendfile output (async-file-path input)
       (lambda (ss st id)
         (aio-check-file-scope! 'file-send-operation input)
-        (with-mutex (async-file-mutex input)
+        (with-aio-mutex (async-file-mutex input)
           (aio-check-file-unowned/raw 'file-send-operation input)
           (aio-fs-sendfile (aio-state-loop st)
             (async-file-fd output) (async-file-fd input) offset length id)))

@@ -199,7 +199,7 @@
   (lambda (h queue payload)
     (let loop ()
       (let ([waiter
-             (with-mutex (aio-handle-mutex h)
+             (with-aio-mutex (aio-handle-mutex h)
                (aio-queue-pop-live! queue))])
         (and waiter
              (or ((cdr waiter) payload) (loop)))))))
@@ -289,7 +289,7 @@
 (define aio-register-request!
   (lambda (st id req)
     (aio-debug-check-owner! st)
-    (with-mutex (aio-state-requests-mutex st)
+    (with-aio-mutex (aio-state-requests-mutex st)
       (aio-invariant (not (hashtable-ref (aio-state-requests st) id #f))
         "native request id was registered twice" id)
       (let ([handle (aio-req-handle req)])
@@ -307,7 +307,7 @@
 (define aio-submit-command!
   (lambda (st command)
     (let ([accepted?
-           (with-mutex (aio-state-command-mutex st)
+           (with-aio-mutex (aio-state-command-mutex st)
              (if (aio-state-closing? st)
                  #f
                  (begin
@@ -325,7 +325,7 @@
   (lambda (st)
     (aio-debug-check-owner! st)
     (let ([commands
-           (with-mutex (aio-state-command-mutex st)
+           (with-aio-mutex (aio-state-command-mutex st)
              (let ([commands (reverse (aio-state-commands st))])
                (aio-state-commands-set! st '())
                commands))])
@@ -392,7 +392,7 @@
 (define aio-cancel-request!
   (lambda (st id)
     (let ([found?
-           (with-mutex (aio-state-requests-mutex st)
+           (with-aio-mutex (aio-state-requests-mutex st)
              (let ([req (hashtable-ref (aio-state-requests st) id #f)])
                (when req (aio-req-canceled?-set! req #t))
                (and req #t)))])
@@ -402,7 +402,7 @@
             ;; Completion and this command are both dispatched by the loop
             ;; owner, so cancel-data cannot be freed between lookup and use.
             (let ([req
-                   (with-mutex (aio-state-requests-mutex st)
+                   (with-aio-mutex (aio-state-requests-mutex st)
                      (hashtable-ref (aio-state-requests st) id #f))])
               (when req
                 (let ([cd (aio-req-cancel-data req)])
@@ -435,7 +435,7 @@
 (define aio-on-request
   (lambda (st id status aux)
     (let ([req
-           (with-mutex (aio-state-requests-mutex st)
+           (with-aio-mutex (aio-state-requests-mutex st)
              (let ([req (hashtable-ref (aio-state-requests st) id #f)])
                (when req (hashtable-delete! (aio-state-requests st) id))
                req))])
@@ -468,7 +468,7 @@
         [(not h) (when (fx> status 0) (aio-free aux))]
         [else
          (let ([deliveries '()] [free-aux? #f])
-           (with-mutex (aio-handle-mutex h)
+           (with-aio-mutex (aio-handle-mutex h)
              (aio-handle-reading?-set! h #f)
              (let ([queue (aio-handle-read-queue h)])
                (cond
@@ -532,7 +532,7 @@
       (if (not h)
           (when aux (aio-udp-recv-free aux))
           (let ([delivery #f] [free? #f])
-            (with-mutex (aio-handle-mutex h)
+            (with-aio-mutex (aio-handle-mutex h)
               (aio-handle-reading?-set! h #f)
               (let ([waiter (aio-queue-pop-live! (aio-handle-read-queue h))])
                 (if (or (aio-handle-closing? h) (not waiter))
@@ -563,7 +563,7 @@
     (let ([h (aio-lookup-handle st id)])
       (when h
         (let ([waiter #f])
-          (with-mutex (aio-handle-mutex h)
+          (with-aio-mutex (aio-handle-mutex h)
             (aio-handle-reading?-set! h #f)
             (set! waiter (aio-queue-pop-live! (aio-handle-read-queue h))))
           (when (and waiter (not (aio-waiter-dead? (car waiter))))
@@ -580,7 +580,7 @@
         (when aux (aio-process-result-free aux))
         (when process
           (let ([waiters '()] [result (cons status term-signal)])
-            (with-mutex (aio-handle-mutex process)
+            (with-aio-mutex (aio-handle-mutex process)
               (aio-handle-result-set! process result)
               (set! waiters
                 (aio-queue-drain! (aio-handle-accept-queue process))))
@@ -626,7 +626,7 @@
   (lambda (st id kind status aux)
     (let ([h (aio-lookup-handle st id)] [waiter #f])
       (when h
-        (with-mutex (aio-handle-mutex h)
+        (with-aio-mutex (aio-handle-mutex h)
           (aio-handle-reading?-set! h #f)
           (set! waiter (aio-queue-pop-live! (aio-handle-read-queue h)))))
       (let ([payload (and h waiter (aio-watch-payload h kind status aux))])
@@ -652,7 +652,7 @@
                           (if (eq? (aio-handle-kind h) 'pipe-listener)
                               'pipe-stream
                               'tcp-stream)
-                          st #f #f (make-mutex) #f #f (make-aio-queue) #f #f
+                          st #f #f (make-aio-os-mutex) #f #f (make-aio-queue) #f #f
                           (make-aio-queue) #f)])
                  (aio-register-handle! st w)
                  (cons 'values (list w)))]
@@ -668,7 +668,7 @@
     (let ([h (aio-lookup-handle st id)])
       (when (and h (not (aio-state-closing? st)))
         (let ([delivery #f])
-          (with-mutex (aio-handle-mutex h)
+          (with-aio-mutex (aio-handle-mutex h)
             (let ([waiter (aio-queue-peek-live (aio-handle-accept-queue h))])
               (when waiter
                 (let ([payload
@@ -696,7 +696,7 @@
   (lambda (st id)
     (let ([h (aio-lookup-handle st id)])
       (when h
-        (with-mutex (aio-handle-mutex h)
+        (with-aio-mutex (aio-handle-mutex h)
           (aio-handle-closed?-set! h #t)))
       (hashtable-delete! (aio-state-handles st) id))))
 
@@ -719,13 +719,13 @@
 ;;; off the scheduler thread, drained by the poll hook on the scheduler thread
 (define aio-drain-stop-set!
   (lambda (st)
-    (let ([hs (with-mutex (aio-state-stop-mutex st)
+    (let ([hs (with-aio-mutex (aio-state-stop-mutex st)
                 (let ([hs (aio-state-stop-set st)])
                   (aio-state-stop-set-set! st '())
                   hs))])
       (for-each
         (lambda (h)
-          (with-mutex (aio-handle-mutex h)
+          (with-aio-mutex (aio-handle-mutex h)
             (when (and (aio-handle-reading? h)
                        (aio-queue-empty? (aio-handle-read-queue h)))
               (aio-handle-reading?-set! h #f)
@@ -751,7 +751,7 @@
 (define aio-finalize-file!
   (lambda (f)
     (let ([close?
-           (with-mutex (async-file-mutex f)
+           (with-aio-mutex (async-file-mutex f)
              (if (async-file-closed? f)
                  #f
                  (begin
@@ -773,7 +773,7 @@
 (define aio-finalize-directory!
   (lambda (d)
     (let ([close?
-           (with-mutex (async-directory-mutex d)
+           (with-aio-mutex (async-directory-mutex d)
              (if (async-directory-closed? d)
                  #f
                  (begin
@@ -856,7 +856,7 @@
     (let ([st ($async-scheduler-io-state sched)])
       (when (and st (not (aio-state-closing? st)))
         (aio-debug-check-owner! st)
-        (with-mutex (aio-state-command-mutex st)
+        (with-aio-mutex (aio-state-command-mutex st)
           (aio-state-closing?-set! st #t))
         (aio-drain-commands! st)
         ;; Guardians close wrappers that became unreachable before or during
@@ -875,7 +875,7 @@
                     (aio-handle-close (aio-handle-handle w))))))
             vs))
         (aio-drain-guardian! st)
-        (with-mutex (aio-state-requests-mutex st)
+        (with-aio-mutex (aio-state-requests-mutex st)
           (let-values ([(ks vs) (hashtable-entries (aio-state-requests st))])
             (vector-for-each
               (lambda (req)
@@ -964,17 +964,17 @@
                   (aio-loop-destroy loop)
                   ($oops who "cannot initialize the libuv timer handle"))
                 (let ([st (make-aio-state sched loop wakeup bridge
-                        1 (make-eq-hashtable) (make-mutex)
+                        1 (make-eq-hashtable) (make-aio-os-mutex)
                         (make-eq-hashtable) (make-eq-hashtable)
                         (make-eq-hashtable)
-                        (make-bytevector 32) '() (make-mutex)
-                        '() (make-mutex) 0 #f
+                        (make-bytevector 32) '() (make-aio-os-mutex)
+                        '() (make-aio-os-mutex) 0 #f
                         (make-guardian) (make-guardian) (make-guardian))])
                   ($async-scheduler-io-state-set! sched st)
                   ($async-scheduler-poll-proc-set! sched aio-poll)
                   ($async-scheduler-wake-proc-set! sched
                     (lambda ()
-                      (with-mutex (aio-state-command-mutex st)
+                      (with-aio-mutex (aio-state-command-mutex st)
                         (unless (aio-state-closing? st)
                           (let ([status (aio-wakeup-send loop)])
                             (when (fx< status 0)
