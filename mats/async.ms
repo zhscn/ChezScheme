@@ -763,6 +763,19 @@
           'parallelism 4)
         #t))
 
+  ;; Compare owner-pop and thief-steal operations against a simple FIFO model
+  ;; across repeated ring growth and mixed operation sequences.
+  (#3%$async-debug-work-deque-model-test 4000)
+
+  ;; Multiple native thieves race with owner push/pop while the deque grows.
+  ;; Every published integer must be claimed exactly once.
+  (or (not (threaded?))
+      (#3%$async-debug-work-deque-contention-test 10000 6))
+
+  ;; The lock hierarchy checker is enabled by the invariant stress runner.
+  ;; In ordinary builds the hook reports that the debug-only check is dormant.
+  (and (memq (#3%$async-debug-lock-rank-test) '(#t disabled)) #t)
+
   ;; A blocked operation applies its wrapper with the resumed task's ambient
   ;; context, not in the thread that completes the operation.
   (equal? (run-async

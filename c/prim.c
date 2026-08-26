@@ -212,6 +212,14 @@ static void register_runtime_test_symbols(void) {
                     (void *)S_native_fiber_test_hook_saw_exit);
     Sforeign_symbol("(cs)native_fiber_test_hook_reset",
                     (void *)S_native_fiber_test_hook_reset);
+    Sforeign_symbol("(cs)native_fiber_stack_growth_reset",
+                    (void *)S_native_fiber_stack_growth_reset);
+    Sforeign_symbol("(cs)native_fiber_stack_growth_count",
+                    (void *)S_native_fiber_stack_growth_count);
+    Sforeign_symbol("(cs)native_fiber_stack_growth_old_size",
+                    (void *)S_native_fiber_stack_growth_old_size);
+    Sforeign_symbol("(cs)native_fiber_stack_growth_new_size",
+                    (void *)S_native_fiber_stack_growth_new_size);
 }
 
 void S_prim_init(void) {

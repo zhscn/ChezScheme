@@ -1,23 +1,125 @@
 ;;; ----------------------------------------------------------- utilities
 
 
+(define async-debug-invariants?
+  (let ([v (getenv "CHEZ_ASYNC_CHECK_INVARIANTS")])
+    (and v (not (member v '("" "0" "false" "no"))))))
+
+;;; The invariant self-test exercises rank ordering and recursive-acquisition
+;;; detection without adding metadata or ancestry tracking to ordinary locks.
+(define async-debug-lock-rank-active? #f)
+(define async-debug-lock-metadata (box '()))
+
+(define async-debug-register-lock!
+  (lambda (lock rank name)
+    (let loop ()
+      (let ([state (async-atomic-box-ref async-debug-lock-metadata)])
+        (unless (box-cas! async-debug-lock-metadata state
+                  (cons (list lock rank name) state))
+          (loop))))))
+
+(define make-async-os-mutex
+  (lambda () (if-feature pthreads (make-mutex) #f)))
+
+(define make-async-debug-ranked-mutex
+  (lambda (rank name)
+    (let ([lock (make-async-os-mutex)])
+      (async-debug-register-lock! lock rank name)
+      lock)))
+
+(define async-debug-lock-info
+  (lambda (lock)
+    (let loop ([state (async-atomic-box-ref async-debug-lock-metadata)])
+      (cond
+        [(null? state) #f]
+        [(eq? (caar state) lock) (car state)]
+        [else (loop (cdr state))]))))
+
+(define async-debug-lock-state (box '()))
+
+(define async-debug-lock-state-without
+  (lambda (state id)
+    (let loop ([state state])
+      (cond
+        [(null? state) '()]
+        [(eqv? (caar state) id) (cdr state)]
+        [else (cons (car state) (loop (cdr state)))]))))
+
+(define async-debug-lock-push!
+  (lambda (lock)
+    (let ([id (get-thread-id)] [info (async-debug-lock-info lock)])
+      (unless info
+        ($oops 'with-async-mutex "unregistered ranked async mutex ~s" lock))
+      (let loop ()
+        (let* ([state (async-atomic-box-ref async-debug-lock-state)]
+               [entry (assv id state)]
+               [held (if entry (cdr entry) '())])
+          (when (memq lock held)
+            ($oops 'with-async-mutex "recursive async mutex acquisition: ~s"
+              (caddr info)))
+          (when (pair? held)
+            (let* ([outer (car held)]
+                   [outer-info (async-debug-lock-info outer)])
+              (when (fx< (cadr info) (cadr outer-info))
+                ($oops 'with-async-mutex
+                  "async lock rank inversion: ~s (~s) after ~s (~s)"
+                  (caddr info) (cadr info)
+                  (caddr outer-info) (cadr outer-info)))))
+          (unless (box-cas! async-debug-lock-state state
+                    (cons (cons id (cons lock held))
+                      (async-debug-lock-state-without state id)))
+            (loop)))))))
+
+(define async-debug-lock-pop!
+  (lambda (lock)
+    (let ([id (get-thread-id)])
+      (let loop ()
+        (let* ([state (async-atomic-box-ref async-debug-lock-state)]
+               [entry (assv id state)]
+               [held (if entry (cdr entry) '())])
+          (unless (and (pair? held) (eq? (car held) lock))
+            ($oops 'with-async-mutex "async mutex release order is invalid: ~s"
+              (caddr (async-debug-lock-info lock))))
+          (let* ([rest (async-debug-lock-state-without state id)]
+                 [new-state
+                  (if (null? (cdr held))
+                      rest
+                      (cons (cons id (cdr held)) rest))])
+            (unless (box-cas! async-debug-lock-state state new-state)
+              (loop))))))))
+
 (define-syntax with-async-mutex
   (lambda (x)
     (syntax-case x ()
       [(_ m e1 e2 ...)
        (if-feature pthreads
-         #'(critical-section (with-mutex m e1 e2 ...))
+         #'(let ([lock m])
+             (if (and async-debug-invariants?
+                      async-debug-lock-rank-active?)
+                 (if (async-debug-lock-info lock)
+                     (critical-section
+                       (dynamic-wind
+                         (lambda () (async-debug-lock-push! lock))
+                         (lambda ()
+                           (with-mutex lock e1 e2 ...))
+                         (lambda () (async-debug-lock-pop! lock))))
+                     (critical-section (with-mutex lock e1 e2 ...)))
+                 (critical-section
+                   (with-mutex lock e1 e2 ...))))
          #'(begin e1 e2 ...))])))
 
-(define make-async-os-mutex
-  (lambda () (if-feature pthreads (make-mutex) #f)))
-
-(define async-debug-invariants?
-  (let ([v (getenv "CHEZ_ASYNC_CHECK_INVARIANTS")])
-    (and v (not (member v '("" "0" "false" "no"))))))
-
-(define async-debug-runnable-mutex (make-async-os-mutex))
+(define async-debug-runnable-mutex
+  (if-feature pthreads (make-mutex) #f))
 (define async-debug-runnable (make-eq-hashtable))
+
+(define-syntax with-async-debug-runnable-mutex
+  (lambda (x)
+    (syntax-case x ()
+      [(_ e1 e2 ...)
+       (if-feature pthreads
+         #'(critical-section
+             (with-mutex async-debug-runnable-mutex e1 e2 ...))
+         #'(begin e1 e2 ...))])))
 
 (define-syntax async-invariant
   (syntax-rules ()
@@ -32,7 +134,7 @@
 (define async-debug-queue-claim!
   (lambda (task location)
     (when async-debug-invariants?
-      (with-async-mutex async-debug-runnable-mutex
+      (with-async-debug-runnable-mutex
         (async-invariant
           (not (hashtable-ref async-debug-runnable task #f))
           "task is present in more than one runnable queue" task)
@@ -43,7 +145,7 @@
 (define async-debug-queue-release!
   (lambda (task)
     (when async-debug-invariants?
-      (with-async-mutex async-debug-runnable-mutex
+      (with-async-debug-runnable-mutex
         (async-invariant (hashtable-ref async-debug-runnable task #f)
           "dequeued task was not registered as runnable" task)
         (hashtable-delete! async-debug-runnable task)))))
@@ -209,6 +311,235 @@
       (let ([ring (make-async-work-ring new-slots new-mask)])
         (async-atomic-box-set! (async-work-deque-ring deque) ring)
         ring))))
+
+(define async-work-deque-distance
+  (lambda (bottom top) (fx- bottom top)))
+
+(define async-work-deque-push/raw!
+  (lambda (deque value)
+    (let* ([bottom (async-atomic-box-ref (async-work-deque-bottom deque))]
+           [top (async-atomic-box-ref (async-work-deque-top deque))]
+           [ring0 (async-atomic-box-ref (async-work-deque-ring deque))]
+           [distance (async-work-deque-distance bottom top)]
+           [ring
+            (if (fx>= distance (async-work-ring-mask ring0))
+                (async-work-deque-grow! deque top bottom ring0)
+                ring0)])
+      (async-invariant (fx>= distance 0)
+        "work-deque indices describe a negative occupancy" deque)
+      (vector-set! (async-work-ring-slots ring)
+        (fxand bottom (async-work-ring-mask ring)) value)
+      (async-atomic-box-set! (async-work-deque-bottom deque)
+        (fx+ bottom 1)))))
+
+(define async-work-deque-pop/raw!
+  (lambda (deque)
+    (let* ([bottom0 (async-atomic-box-ref (async-work-deque-bottom deque))]
+           [bottom (fx- bottom0 1)])
+      (async-atomic-box-set! (async-work-deque-bottom deque) bottom)
+      (let* ([top (async-atomic-box-ref (async-work-deque-top deque))]
+             [distance (async-work-deque-distance bottom top)])
+        (cond
+          [(fx< distance 0)
+           (async-atomic-box-set! (async-work-deque-bottom deque) top)
+           #f]
+          [else
+           (let* ([ring (async-atomic-box-ref (async-work-deque-ring deque))]
+                  [slot (fxand bottom (async-work-ring-mask ring))]
+                  [value (vector-ref (async-work-ring-slots ring) slot)])
+             (if (and (fx= distance 0)
+                      (not (box-cas! (async-work-deque-top deque)
+                             top (fx+ top 1))))
+                 (begin
+                   (async-atomic-box-set! (async-work-deque-bottom deque)
+                     (fx+ top 1))
+                   #f)
+                 (begin
+                   (vector-set! (async-work-ring-slots ring) slot #f)
+                   (when (fx= distance 0)
+                     (async-atomic-box-set! (async-work-deque-bottom deque)
+                       (fx+ top 1)))
+                   (unless value
+                     ($oops 'async-work-deque-pop/raw!
+                       "published work-deque slot is empty"))
+                   value)))])))))
+
+(define async-work-deque-steal/raw!
+  (lambda (deque)
+    (let* ([top (async-atomic-box-ref (async-work-deque-top deque))]
+           [bottom (async-atomic-box-ref (async-work-deque-bottom deque))])
+      (and (fx> (async-work-deque-distance bottom top) 0)
+           (let* ([ring (async-atomic-box-ref (async-work-deque-ring deque))]
+                  [slot (fxand top (async-work-ring-mask ring))]
+                  [value (vector-ref (async-work-ring-slots ring) slot)])
+             (and (box-cas! (async-work-deque-top deque) top
+                    (fx+ top 1))
+                  (begin
+                    (unless value
+                      ($oops 'async-work-deque-steal/raw!
+                        "published work-deque slot is empty"))
+                    (vector-set! (async-work-ring-slots ring) slot #f)
+                    value)))))))
+
+(define async-debug-work-deque-check!
+  (lambda (deque expected)
+    (let* ([top (async-atomic-box-ref (async-work-deque-top deque))]
+           [bottom (async-atomic-box-ref (async-work-deque-bottom deque))]
+           [ring (async-atomic-box-ref (async-work-deque-ring deque))]
+           [slots (async-work-ring-slots ring)]
+           [mask (async-work-ring-mask ring)])
+      (unless (and (fx= (async-work-deque-distance bottom top)
+                        (length expected))
+                   (fx= mask (fx- (vector-length slots) 1))
+                   (fx= (fxand (vector-length slots) mask) 0))
+        ($oops 'async-work-deque-model-test
+          "work-deque geometry disagrees with the reference model"))
+      (let loop ([i top] [expected expected])
+        (unless (null? expected)
+          (unless (eqv? (vector-ref slots (fxand i mask)) (car expected))
+            ($oops 'async-work-deque-model-test
+              "work-deque contents disagree with the reference model"))
+          (loop (fx+ i 1) (cdr expected)))))))
+
+(define async-debug-work-deque-model-test
+  (lambda (rounds)
+    (unless (and (fixnum? rounds) (fx> rounds 0))
+      ($oops 'async-work-deque-model-test "invalid round count ~s" rounds))
+    (let ([deque (make-async-work-deque)]
+          [expected '()]
+          [next-value 0]
+          [seed 324508639])
+      (define (push!)
+        (let ([value next-value])
+          (set! next-value (fx+ next-value 1))
+          (async-work-deque-push/raw! deque value)
+          (set! expected (append expected (list value)))))
+      (define (pop!)
+        (let ([actual (async-work-deque-pop/raw! deque)])
+          (if (null? expected)
+              (unless (not actual)
+                ($oops 'async-work-deque-model-test
+                  "owner pop returned work from an empty deque"))
+              (let ([wanted (car (reverse expected))])
+                (unless (eqv? actual wanted)
+                  ($oops 'async-work-deque-model-test
+                    "owner pop disagrees with the reference model"))
+                (set! expected (reverse (cdr (reverse expected))))))))
+      (define (steal!)
+        (let ([actual (async-work-deque-steal/raw! deque)])
+          (if (null? expected)
+              (unless (not actual)
+                ($oops 'async-work-deque-model-test
+                  "steal returned work from an empty deque"))
+              (begin
+                (unless (eqv? actual (car expected))
+                  ($oops 'async-work-deque-model-test
+                    "steal disagrees with the reference model"))
+                (set! expected (cdr expected))))))
+      (do ([i 0 (fx+ i 1)]) ((fx= i 96)) (push!))
+      (async-debug-work-deque-check! deque expected)
+      (do ([i 0 (fx+ i 1)]) ((fx= i rounds))
+        (set! seed
+          (fxand (fx+/wraparound (fx*/wraparound seed 1103515245) 12345)
+                 (greatest-fixnum)))
+        (case (fxmod seed 5)
+          [(0 1) (push!)]
+          [(2) (pop!)]
+          [else (steal!)])
+        (async-debug-work-deque-check! deque expected))
+      (let drain ([owner? #t])
+        (unless (null? expected)
+          (if owner? (pop!) (steal!))
+          (async-debug-work-deque-check! deque expected)
+          (drain (not owner?))))
+      (pop!)
+      (steal!)
+      (async-debug-work-deque-check! deque '())
+      #t)))
+
+(define async-debug-work-deque-contention-test
+  (lambda (count thief-count)
+    (unless (and (fixnum? count) (fx> count 0)
+                 (fixnum? thief-count) (fx> thief-count 0))
+      ($oops 'async-work-deque-contention-test
+        "invalid contention dimensions ~s ~s" count thief-count))
+    (if-feature pthreads
+      (let ([deque (make-async-work-deque)]
+            [seen (make-bytevector count 0)]
+            [seen-count 0]
+            [seen-mutex (make-mutex)]
+            [pushing? (box #t)]
+            [failure (box #f)])
+        (define (record! value)
+          (with-mutex seen-mutex
+            (if (or (not (fixnum? value)) (fx< value 0) (fx>= value count))
+                (set-box! failure (list 'invalid value))
+                (let ([n (bytevector-u8-ref seen value)])
+                  (if (fx> n 0)
+                      (set-box! failure (list 'duplicate value))
+                      (begin
+                        (bytevector-u8-set! seen value 1)
+                        (set! seen-count (fx+ seen-count 1))))))))
+        (define (thief)
+          (let loop ()
+            (let ([value (async-work-deque-steal/raw! deque)])
+              (cond
+                [value (record! value) (loop)]
+                [(or (async-atomic-box-ref pushing?)
+                     (fx> (async-work-deque-distance
+                            (async-atomic-box-ref
+                              (async-work-deque-bottom deque))
+                            (async-atomic-box-ref
+                              (async-work-deque-top deque)))
+                          0))
+                 (sleep (make-time 'time-duration 1000 0))
+                 (loop)]))))
+        (let ([threads
+               (let loop ([i 0] [threads '()])
+                 (if (fx= i thief-count)
+                     threads
+                     (loop (fx+ i 1) (cons (fork-thread thief) threads))))])
+          (do ([i 0 (fx+ i 1)]) ((fx= i count))
+            (async-work-deque-push/raw! deque i)
+            (when (fx= (fxand i 7) 7)
+              (let ([value (async-work-deque-pop/raw! deque)])
+                (when value (record! value)))))
+          (async-atomic-box-set! pushing? #f)
+          (let drain ()
+            (let ([value (async-work-deque-pop/raw! deque)])
+              (when value (record! value) (drain))))
+          (for-each thread-join threads)
+          (unless (and (not (unbox failure)) (fx= seen-count count))
+            ($oops 'async-work-deque-contention-test
+              "work-deque contention lost or duplicated work: ~s/~s ~s"
+              seen-count count (unbox failure)))
+          #t))
+      #t)))
+
+(define async-debug-lock-rank-test
+  (lambda ()
+    (if (not async-debug-invariants?)
+        'disabled
+        (dynamic-wind
+          (lambda () (set! async-debug-lock-rank-active? #t))
+          (lambda ()
+            (let ([low (make-async-debug-ranked-mutex 1 'rank-test-low)]
+                  [high (make-async-debug-ranked-mutex 2 'rank-test-high)])
+              (let ([ordered?
+                     (with-async-mutex low
+                       (with-async-mutex high #t))]
+                    [inversion?
+                     (guard (condition [else #t])
+                       (with-async-mutex high
+                         (with-async-mutex low #f))
+                       #f)]
+                    [recursive?
+                     (guard (condition [else #t])
+                       (with-async-mutex low
+                         (with-async-mutex low #f))
+                       #f)])
+                (and ordered? inversion? recursive?))))
+          (lambda () (set! async-debug-lock-rank-active? #f))))))
 
 ;;; Monotonic time in microseconds.
 (define async-monotonic-us
@@ -911,14 +1242,14 @@
 (define async-debug-check-group-quiescent!
   (lambda (group)
     (when async-debug-invariants?
-      (with-async-mutex (async-scheduler-group-mutex group)
+      (with-mutex (async-scheduler-group-mutex group)
         (async-invariant
           (and (fx= (async-scheduler-group-task-count group) 0)
                (fx= (hashtable-size (async-scheduler-group-tasks group)) 0))
           "scheduler group retained terminal tasks" group)
         (async-invariant (not (async-group-has-work? group))
           "scheduler group retained stealable work" group))
-      (with-async-mutex async-debug-runnable-mutex
+      (with-async-debug-runnable-mutex
         (let-values ([(tasks locations)
                       (hashtable-entries async-debug-runnable)])
           (vector-for-each
@@ -985,85 +1316,35 @@
 (define async-work-push!
   (lambda (sched task)
     (async-debug-check-owner! sched)
-    (let* ([deque (async-scheduler-work-deque sched)]
-           [bottom (async-atomic-box-ref (async-work-deque-bottom deque))]
-           [top (async-atomic-box-ref (async-work-deque-top deque))]
-           [ring0 (async-atomic-box-ref (async-work-deque-ring deque))]
-           [ring
-            (if (fx>= (fx- bottom top) (async-work-ring-mask ring0))
-                (async-work-deque-grow! deque top bottom ring0)
-                ring0)])
-      (async-debug-queue-claim! task 'work)
-      (vector-set! (async-work-ring-slots ring)
-        (fxand bottom (async-work-ring-mask ring)) task)
-      ;; Publish only after the ring slot is visible to thieves.
-      (async-atomic-box-set! (async-work-deque-bottom deque) (fx+ bottom 1))
-      (async-atomic-box-add!
-        (async-scheduler-group-work-count-box
-          ($async-scheduler-group sched)) 1))))
+    (async-debug-queue-claim! task 'work)
+    (async-work-deque-push/raw! (async-scheduler-work-deque sched) task)
+    (async-atomic-box-add!
+      (async-scheduler-group-work-count-box
+        ($async-scheduler-group sched)) 1)))
 
 (define async-work-pop!
   (lambda (sched)
     (async-debug-check-owner! sched)
-    (let* ([deque (async-scheduler-work-deque sched)]
-           [bottom0 (async-atomic-box-ref (async-work-deque-bottom deque))]
-           [bottom (fx- bottom0 1)])
-      (async-atomic-box-set! (async-work-deque-bottom deque) bottom)
-      (let* ([top (async-atomic-box-ref (async-work-deque-top deque))]
-             [task
-              (cond
-                [(fx< bottom top)
-                 (async-atomic-box-set! (async-work-deque-bottom deque) top)
-                 #f]
-                [else
-                 (let* ([ring (async-atomic-box-ref (async-work-deque-ring deque))]
-                        [slot (fxand bottom (async-work-ring-mask ring))]
-                        [task (vector-ref (async-work-ring-slots ring) slot)])
-                   (if (and (fx= top bottom)
-                            (not (box-cas! (async-work-deque-top deque)
-                                          top (fx+ top 1))))
-                       (begin
-                         (async-atomic-box-set!
-                           (async-work-deque-bottom deque) (fx+ top 1))
-                         #f)
-                       (begin
-                         (vector-set! (async-work-ring-slots ring) slot #f)
-                         (when (fx= top bottom)
-                           (async-atomic-box-set!
-                             (async-work-deque-bottom deque) (fx+ top 1)))
-                         (unless task
-                           ($oops 'async-work-pop!
-                             "published work-deque slot is empty"))
-                         (async-debug-queue-release! task)
-                         task)))])])
-        (when task
-          (async-atomic-box-add!
-            (async-scheduler-group-work-count-box
-              ($async-scheduler-group sched)) -1))
-        task))))
+    (let ([task
+           (async-work-deque-pop/raw!
+             (async-scheduler-work-deque sched))])
+      (when task
+        (async-debug-queue-release! task)
+        (async-atomic-box-add!
+          (async-scheduler-group-work-count-box
+            ($async-scheduler-group sched)) -1))
+      task)))
 
 (define async-work-steal-one!
   (lambda (victim)
-    (let* ([deque (async-scheduler-work-deque victim)]
-           [top (async-atomic-box-ref (async-work-deque-top deque))]
-           [bottom (async-atomic-box-ref (async-work-deque-bottom deque))]
-           [task
-            (and (fx< top bottom)
-                 (let* ([ring (async-atomic-box-ref
-                                (async-work-deque-ring deque))]
-                        [slot (fxand top (async-work-ring-mask ring))]
-                        [task (vector-ref (async-work-ring-slots ring) slot)])
-                   (and (box-cas! (async-work-deque-top deque) top (fx+ top 1))
-                        (begin
-                          (unless task
-                            ($oops 'async-work-steal-one!
-                              "published work-deque slot is empty"))
-                          (vector-set! (async-work-ring-slots ring) slot #f)
-                          (async-debug-queue-release! task)
-                          (async-atomic-box-add!
-                            (async-scheduler-group-work-count-box
-                              ($async-scheduler-group victim)) -1)
-                          task))))])
+    (let ([task
+           (async-work-deque-steal/raw!
+             (async-scheduler-work-deque victim))])
+      (when task
+        (async-debug-queue-release! task)
+        (async-atomic-box-add!
+          (async-scheduler-group-work-count-box
+            ($async-scheduler-group victim)) -1))
       task)))
 
 ;;; Repeated single-item claims preserve the Chase--Lev last-item race while
@@ -1074,8 +1355,9 @@
       (and first
            (let* ([deque (async-scheduler-work-deque victim)]
                   [available
-                   (fx- (async-atomic-box-ref (async-work-deque-bottom deque))
-                        (async-atomic-box-ref (async-work-deque-top deque)))]
+                   (async-work-deque-distance
+                     (async-atomic-box-ref (async-work-deque-bottom deque))
+                     (async-atomic-box-ref (async-work-deque-top deque)))]
                   [extra (if (fx> available 1)
                              (fxquotient available 2)
                              available)])
@@ -1148,7 +1430,7 @@
 (define async-group-wake!
   (lambda (group)
     (if-feature pthreads
-      (with-mutex (async-scheduler-group-mutex group)
+      (with-async-mutex (async-scheduler-group-mutex group)
         (condition-broadcast (async-scheduler-group-condition group)))
       (void))
     (vector-for-each

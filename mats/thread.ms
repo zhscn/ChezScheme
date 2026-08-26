@@ -1716,6 +1716,14 @@
   (foreign-procedure "(cs)native_fiber_test_hook_saw_exit" () iptr))
 (define native-fiber-test-hook-reset
   (foreign-procedure "(cs)native_fiber_test_hook_reset" () void))
+(define native-fiber-stack-growth-reset
+  (foreign-procedure "(cs)native_fiber_stack_growth_reset" () void))
+(define native-fiber-stack-growth-count
+  (foreign-procedure "(cs)native_fiber_stack_growth_count" () iptr))
+(define native-fiber-stack-growth-old-size
+  (foreign-procedure "(cs)native_fiber_stack_growth_old_size" () iptr))
+(define native-fiber-stack-growth-new-size
+  (foreign-procedure "(cs)native_fiber_stack_growth_new_size" () iptr))
 (define native-fiber-gc-test-phase-reset
   (foreign-procedure "(cs)gc_test_phase_reset" () void))
 (define native-fiber-gc-test-phase-arm
@@ -3432,6 +3440,139 @@
       (let ([transfer (#3%$native-fiber-switch scheduler task 'start)])
         (and (equal? transfer '(return 6002 #t #t))
              (eq? (#3%$native-fiber-state task) 'finished))))))
+
+(mat native-fiber-stack-growth-boundary-matrix
+  (parameterize ([#3%$enable-check-heap #t])
+    (let* ([main-scheduler
+           (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+           [current-scheduler main-scheduler]
+           [task #f]
+           [growth-count 0]
+           [roots-valid? #t])
+      (define (yield-growth event)
+        (#3%$native-fiber-try-claim! current-scheduler)
+        (#3%$native-fiber-switch task current-scheduler event))
+      (define (deep depth)
+        (let* ([root
+                (vector 'stack-growth-boundary depth
+                  (make-bytevector 48 (fxand depth 255)))]
+               [count (native-fiber-stack-growth-count)])
+          (when (fx> count growth-count)
+            (let ([old-size (native-fiber-stack-growth-old-size)]
+                  [new-size (native-fiber-stack-growth-new-size)])
+              (set! growth-count count)
+              (collect (collect-maximum-generation))
+              (yield-growth
+                (vector 'growth growth-count depth old-size new-size))))
+          (let ([result
+                 (if (fx= growth-count 5)
+                     0
+                     (fx+ 1 (deep (fx+ depth 1))))])
+            (unless (and (eq? (vector-ref root 0) 'stack-growth-boundary)
+                         (fx= (vector-ref root 1) depth)
+                         (fx= (bytevector-u8-ref (vector-ref root 2)
+                                (fxmod depth 48))
+                              (fxand depth 255)))
+              (set! roots-valid? #f))
+            result)))
+      (set! task
+        (#3%$native-fiber-create
+          (lambda ()
+            (let ([depth (deep 0)])
+              (list 'done depth growth-count
+                (native-fiber-stack-growth-new-size) roots-valid?)))
+          (native-fiber-dynamic-return-handler (lambda () current-scheduler))
+          #b100))
+      (native-fiber-stack-growth-reset)
+      (#3%$native-fiber-try-claim! task)
+      (let loop ([event (#3%$native-fiber-switch main-scheduler task 'start)]
+                 [last-depth -1]
+                 [last-size #f]
+                 [events 0])
+        (cond
+          [(and (vector? event) (eq? (vector-ref event 0) 'growth))
+           (let ([ordinal (vector-ref event 1)]
+                 [depth (vector-ref event 2)]
+                 [old-size (vector-ref event 3)]
+                 [new-size (vector-ref event 4)])
+             (unless (and (fx= ordinal (fx+ events 1))
+                          (fx> depth last-depth)
+                          (fx= new-size (fx* old-size 2)))
+               (error 'native-fiber-stack-growth-boundary-matrix
+                 "invalid growth transition" event last-depth last-size events))
+             (collect (collect-maximum-generation))
+             (loop
+               (native-fiber-resume-on-new-thread task ordinal
+                 (lambda (scheduler)
+                   (set! current-scheduler scheduler)))
+               depth new-size (fx+ events 1)))]
+          [else
+           (or (and (pair? event)
+                    (eq? (car event) 'return)
+                    (let ([result (cdr event)])
+                      (and (pair? result)
+                           (eq? (car result) 'done)
+                           (fx> (list-ref result 1) 0)
+                           (fx= (list-ref result 2) 5)
+                           (fx= (list-ref result 3) last-size)
+                           (list-ref result 4)))
+                    (fx= events 5)
+                    (eq? (#3%$native-fiber-state task) 'finished))
+               (error 'native-fiber-stack-growth-boundary-matrix
+                 (format "invalid terminal state: ~a"
+                   (if (and (pair? event) (eq? (car event) 'exception))
+                       (with-output-to-string
+                         (lambda () (display-condition (cdr event))))
+                       event))
+                 last-depth last-size events
+                 (#3%$native-fiber-state task)))])))))
+
+(mat native-fiber-wide-apply-growth
+  (let* ([scheduler
+          (or (#3%$current-native-fiber) (#3%$native-fiber-adopt 0))]
+         [task #f]
+         [argument-count 12000]
+         [root (vector 'wide-apply-root (make-bytevector 1024 77))])
+    (set! task
+      (#3%$native-fiber-create
+        (lambda ()
+          (let* ([arguments (make-list argument-count root)]
+                 [length
+                  (apply (lambda values
+                           (collect (collect-maximum-generation))
+                           (unless (andmap (lambda (value) (eq? value root))
+                                     values)
+                             (error 'native-fiber-wide-apply-growth
+                               "wide apply corrupted an argument"))
+                           (length values))
+                    arguments)])
+            (list length
+              (native-fiber-stack-growth-count)
+              (native-fiber-stack-growth-old-size)
+              (native-fiber-stack-growth-new-size)
+              (eq? (vector-ref root 0) 'wide-apply-root)
+              (fx= (bytevector-u8-ref (vector-ref root 1) 511) 77))))
+        (native-fiber-return-handler scheduler)
+        #b100))
+    (native-fiber-stack-growth-reset)
+    (#3%$native-fiber-try-claim! task)
+    (let ([outcome (#3%$native-fiber-switch scheduler task 'start)])
+      (or (and (pair? outcome)
+               (eq? (car outcome) 'return)
+               (let ([result (cdr outcome)])
+                 (and (fx= (list-ref result 0) argument-count)
+                      (fx> (list-ref result 1) 0)
+                      (fx> (list-ref result 3) (list-ref result 2))
+                      (list-ref result 4)
+                      (list-ref result 5)))
+               (eq? (#3%$native-fiber-state task) 'finished))
+          (error 'native-fiber-wide-apply-growth
+            (format "invalid wide-apply outcome: ~a"
+              (if (and (pair? outcome) (eq? (car outcome) 'exception))
+                  (with-output-to-string
+                    (lambda () (display-condition (cdr outcome))))
+                  outcome))
+            (#3%$native-fiber-state task))))))
 
 (mat native-fiber-profile-observer-migration
   (let* ([scheduler

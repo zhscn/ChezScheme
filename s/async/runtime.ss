@@ -361,21 +361,19 @@
                  (async-scheduler-current-task sched))]
            [scheduler-fiber
             (and task (async-scheduler-native-fiber sched))])
-      (unless (and task
-                   scheduler-fiber
-                   (eq? (async-task-state task) 'running)
-                   (async-scheduler-preemption-ticks sched))
-        ($oops 'async-preemption-handler
-          "timer interrupt outside a running preemptive task"))
-      ;; Timer delivery is a cancellation point for CPU-bound tasks.  Async
-      ;; runtime critical sections defer Scheme events, so an exception is
-      ;; raised only at a task-safe VM event boundary.
-      (async-check-cancellation! task)
-      ($call-with-native-fiber-preemption-window
-        (lambda ()
-          (unless ($native-fiber-preempt scheduler-fiber
-                    async-preemption-token)
-            (set-timer (async-scheduler-preemption-ticks sched))))))))
+      (when (and task
+                 scheduler-fiber
+                 (eq? (async-task-state task) 'running)
+                 (async-scheduler-preemption-ticks sched))
+        ;; Timer delivery is a cancellation point for CPU-bound tasks.  Async
+        ;; runtime critical sections defer Scheme events, so an exception is
+        ;; raised only at a task-safe VM event boundary.
+        (async-check-cancellation! task)
+        ($call-with-native-fiber-preemption-window
+          (lambda ()
+            (unless ($native-fiber-preempt scheduler-fiber
+                      async-preemption-token)
+              (set-timer (async-scheduler-preemption-ticks sched)))))))))
 
 ;;; Install the handler once for a scheduler worker.  Individual dispatches
 ;;; only arm and disarm the timer, avoiding parameter and handler churn on

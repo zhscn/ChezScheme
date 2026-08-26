@@ -42,6 +42,10 @@ typedef struct {
   iptr saw_gc;
   iptr exit_requested;
   iptr saw_exit;
+  iptr stack_growth_active;
+  iptr stack_growth_count;
+  iptr stack_growth_old_size;
+  iptr stack_growth_new_size;
 } native_fiber_test_state;
 
 enum {
@@ -149,6 +153,39 @@ void S_native_fiber_test_hook_reset(void) {
   native_fiber_test_lock();
   native_fiber_test_reset_unlocked();
   native_fiber_test_unlock();
+}
+
+void S_native_fiber_stack_growth_reset(void) {
+  native_fiber_test_lock();
+  S_native_fiber_test_state.stack_growth_active = 1;
+  S_native_fiber_test_state.stack_growth_count = 0;
+  S_native_fiber_test_state.stack_growth_old_size = 0;
+  S_native_fiber_test_state.stack_growth_new_size = 0;
+  native_fiber_test_unlock();
+}
+
+iptr S_native_fiber_stack_growth_count(void) {
+  iptr count;
+  native_fiber_test_lock();
+  count = S_native_fiber_test_state.stack_growth_count;
+  native_fiber_test_unlock();
+  return count;
+}
+
+iptr S_native_fiber_stack_growth_old_size(void) {
+  iptr size;
+  native_fiber_test_lock();
+  size = S_native_fiber_test_state.stack_growth_old_size;
+  native_fiber_test_unlock();
+  return size;
+}
+
+iptr S_native_fiber_stack_growth_new_size(void) {
+  iptr size;
+  native_fiber_test_lock();
+  size = S_native_fiber_test_state.stack_growth_new_size;
+  native_fiber_test_unlock();
+  return size;
 }
 
 #ifdef tc_native_fiber_transition_disp
@@ -517,6 +554,13 @@ static IBOOL grow_native_fiber_stack(ptr tc, iptr frame_request) {
 
     memcpy(TO_VOIDP(new_stack), TO_VOIDP(old_stack), old_size);
     SFP(tc) = (ptr)((uptr)new_stack + sfp_offset);
+    native_fiber_test_lock();
+    if (S_native_fiber_test_state.stack_growth_active) {
+      S_native_fiber_test_state.stack_growth_old_size = (iptr)old_size;
+      S_native_fiber_test_state.stack_growth_new_size = (iptr)new_size;
+      S_native_fiber_test_state.stack_growth_count += 1;
+    }
+    native_fiber_test_unlock();
     return 1;
 }
 

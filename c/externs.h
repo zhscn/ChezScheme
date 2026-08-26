@@ -426,6 +426,10 @@ extern iptr S_native_fiber_test_hook_saw_gc(void);
 extern void S_native_fiber_test_hook_request_exit(void);
 extern iptr S_native_fiber_test_hook_saw_exit(void);
 extern void S_native_fiber_test_hook_reset(void);
+extern void S_native_fiber_stack_growth_reset(void);
+extern iptr S_native_fiber_stack_growth_count(void);
+extern iptr S_native_fiber_stack_growth_old_size(void);
+extern iptr S_native_fiber_stack_growth_new_size(void);
 #ifdef DEFINE_MATHERR
 #include <math.h>
 extern INT matherr(struct exception *x);
