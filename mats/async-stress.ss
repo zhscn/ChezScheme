@@ -38,8 +38,7 @@
   (let ([v (getenv "CHEZ_ASYNC_STRESS_IO")])
     (not (and v (member v '("" "0" "false" "no"))))))
 (define stress-invariants?
-  (let ([v (getenv "CHEZ_ASYNC_CHECK_INVARIANTS")])
-    (and v (not (member v '("" "0" "false" "no"))))))
+  (#3%$async-debug-invariants?))
 (define stress-scenario (or (getenv "CHEZ_ASYNC_STRESS_SCENARIO") "all"))
 (define stress-trace? (and (getenv "CHEZ_ASYNC_STRESS_TRACE") #t))
 (define stress-scenario?
@@ -298,7 +297,11 @@
                  (let ([canceled
                         (spawn-task/async-wait-group workers-done
                           (lambda () (set! scoped-finished? 'unexpected))
-                          'migratable? #t)])
+                          ;; Keep the task on the scheduler currently running
+                          ;; this scope so cancellation wins before its first
+                          ;; dispatch; a migratable task may legitimately be
+                          ;; stolen and start before task-cancel! runs.
+                          'migratable? #f)])
                    (task-cancel! canceled 'before-start)
                    (guard (c [else (void)]) (task-join canceled))
                    (async-wait-group-wait workers-done))

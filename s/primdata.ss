@@ -2235,6 +2235,7 @@
   ($assert-continuation [sig [(ptr) -> (void)] [(ptr ptr) -> (void)]] [flags])
   ($as-time-goes-by [flags])
   ($async-io-shutdown [flags])
+  ($async-debug-invariants? [sig [() -> (boolean)]] [flags single-valued])
   ($async-debug-lock-rank-test [flags])
   ($async-debug-work-deque-contention-test [flags])
   ($async-debug-work-deque-model-test [flags])

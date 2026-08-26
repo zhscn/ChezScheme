@@ -2020,6 +2020,19 @@
    (make-native-fiber-record
      0 1 2 3 4 5 6 7 8 9 10 11 12 13)))
 
+;; Full structural checks run for heap verification or when any participant
+;; carries the debug flag.  The recursive syntax keeps the disabled fast path
+;; allocation-free and gives every transition one shared policy decision.
+(define-syntax native-fiber-full-checks?
+  (syntax-rules ()
+    [(_) ($enable-check-heap)]
+    [(_ fiber rest ...)
+     (or (and fiber
+              (not (fx= (fxlogand (native-fiber-flags fiber)
+                           (constant native-fiber-flag-debug))
+                         0)))
+         (native-fiber-full-checks? rest ...))]))
+
 (define native-fiber-next-id (box 0))
 
 (define native-fiber-switch-prohibited?
@@ -2658,31 +2671,27 @@
         [else
          ($oops who "native fiber ~s is externally visible in transient state ~s"
            (native-fiber-id fiber) state)])
-      (native-fiber-check-worker! who))))
+      (void))))
 
 (set! native-fiber-check-stable!
   (lambda (who fiber)
-    (when (or ($enable-check-heap)
-              (not (fx= (fxlogand (native-fiber-flags fiber)
-                           (constant native-fiber-flag-debug))
-                         0)))
-      (native-fiber-check-stable/full! who fiber))))
+    (when (native-fiber-full-checks? fiber)
+      (native-fiber-check-stable/full! who fiber)
+      (native-fiber-check-worker! who))))
 
 (set! native-fiber-check-stable-internal!
   (lambda (who fiber)
     ;; Once ownership or stack publication has committed, an invariant
     ;; failure cannot be delivered as a recoverable Scheme exception: doing
     ;; so would expose a half-transitioned fiber to user code.
-    (when (or ($enable-check-heap)
-              (not (fx= (fxlogand (native-fiber-flags fiber)
-                           (constant native-fiber-flag-debug))
-                         0)))
+    (when (native-fiber-full-checks? fiber)
       (guard (condition
                [else
                 (display-condition condition (current-error-port))
                 (newline (current-error-port))
                 (native-fiber-invariant-failure)])
-        (native-fiber-check-stable/full! who fiber)))))
+        (native-fiber-check-stable/full! who fiber)
+        (native-fiber-check-worker! who)))))
 
 (set! $native-fiber-create
   (lambda (entry on-return flags)
@@ -2706,7 +2715,8 @@
   (lambda (fiber)
     (unless ($native-fiber? fiber)
       ($oops '$native-fiber-try-claim! "~s is not a native fiber" fiber))
-    (native-fiber-check-worker! '$native-fiber-try-claim!)
+    (when (native-fiber-full-checks? fiber ($current-native-fiber))
+      (native-fiber-check-worker! '$native-fiber-try-claim!))
     (if ($native-fiber-claimed)
         #f
         (let ([owner (native-fiber-current-owner)])
@@ -2844,11 +2854,14 @@
       ($oops who "a native-fiber transition is already active"))
     (unless (fx= (#3%$tc-field 'disable-count (#3%$tc)) 0)
       ($oops who "native-fiber switching requires interrupts to be enabled"))
-    (native-fiber-check-stable! who current)
-    (native-fiber-check-stable! who target)
-    (let ([owner (native-fiber-current-owner)]
+    (let ([full-checks? (native-fiber-full-checks? current target)]
+          [owner (native-fiber-current-owner)]
           [current-control (native-fiber-read-control current)]
           [target-control (native-fiber-read-control target)])
+      (when full-checks?
+        (native-fiber-check-stable/full! who current)
+        (native-fiber-check-stable/full! who target)
+        (native-fiber-check-worker! who))
       (unless (and (fx= (native-fiber-control-state current-control)
                         (constant native-fiber-state-running))
                    (fx= (native-fiber-control-owner current-control) owner)
@@ -2859,7 +2872,7 @@
                    (fx= (native-fiber-control-owner target-control) owner))
         ($oops who "target fiber ~s is not claimed by the current native thread"
           (native-fiber-id target)))
-      owner)))
+      (values owner full-checks?))))
 
 (set! native-fiber-check-exchange-plan!
   (lambda (who current target source-context source-switch-control
@@ -2884,10 +2897,12 @@
 
 (set! native-fiber-exchange
   (lambda (who current target payload finish?)
-    (let* ([owner (native-fiber-check-transfer who current target)]
-           ;; Allocate the descriptor after all checks. The remaining bindings
-           ;; and operations before the raw switch are nonallocating.
-           [source-context (and (not finish?) (#3%$native-fiber-allocate-descriptor))]
+    (let-values ([(owner full-checks?)
+                  (native-fiber-check-transfer who current target)])
+      ;; Allocate the descriptor after all checks. The remaining bindings and
+      ;; operations before the raw switch are nonallocating.
+      (let* ([source-context
+              (and (not finish?) (#3%$native-fiber-allocate-descriptor))]
            [source-switch-control
             (native-fiber-pack-control
               (if finish?
@@ -2910,9 +2925,10 @@
               (constant native-fiber-state-running) owner)]
            [cache-context?
             (fx= (#3%$generation (native-fiber-context target)) 0)])
-      (native-fiber-check-exchange-plan! who current target source-context
-        source-switch-control source-commit-control target-switch-control
-        finish?)
+      (when full-checks?
+        (native-fiber-check-exchange-plan! who current target source-context
+          source-switch-control source-commit-control target-switch-control
+          finish?))
       ;; The target-side return path balances this call. No Scheme event may
       ;; observe the transition fields between here and the hand-coded entry.
       (disable-interrupts)
@@ -2940,7 +2956,7 @@
         ;; root has been cleared.
         (enable-interrupts)
         (native-fiber-check-stable-internal! who ($current-native-fiber))
-        payload))))
+        payload)))))
 
 (set! $native-fiber-switch
   (lambda (current target payload)

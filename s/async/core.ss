@@ -5,6 +5,28 @@
   (let ([v (getenv "CHEZ_ASYNC_CHECK_INVARIANTS")])
     (and v (not (member v '("" "0" "false" "no"))))))
 
+;;; Scheme-generated compare-and-swap instructions provide the acquire and
+;;; release ordering used by the work deque, but those instructions are not
+;;; compiled by the C thread-sanitizer pass.  A stable, deque-private token
+;;; describes the same publication edge to TSan without changing the deque's
+;;; synchronization protocol in ordinary builds.
+(define async-thread-sanitizer-enabled?
+  ((foreign-procedure "(cs)thread_sanitizer_enabledp" () boolean)))
+(define async-thread-sanitizer-acquire
+  (foreign-procedure "(cs)thread_sanitizer_acquire" (scheme-object) void))
+(define async-thread-sanitizer-release
+  (foreign-procedure "(cs)thread_sanitizer_release" (scheme-object) void))
+
+(define-syntax async-thread-sanitizer-acquire!
+  (syntax-rules ()
+    [(_ token)
+     (when token (async-thread-sanitizer-acquire token))]))
+
+(define-syntax async-thread-sanitizer-release!
+  (syntax-rules ()
+    [(_ token)
+     (when token (async-thread-sanitizer-release token))]))
+
 ;;; The invariant self-test exercises rank ordering and recursive-acquisition
 ;;; detection without adding metadata or ancestry tracking to ordinary locks.
 (define async-debug-lock-rank-active? #f)
@@ -267,14 +289,17 @@
   (fields
     (immutable top)                 ; atomic box
     (immutable bottom)              ; atomic box; written only by owner
-    (immutable ring)))              ; atomic box of async-work-ring
+    (immutable ring)                ; atomic box of async-work-ring
+    (immutable sanitizer-token)))   ; stable TSan publication identity
 
 (define make-async-work-deque
   (lambda ()
     (let ([slots (make-vector 32 #f)])
       (make-async-work-deque%
         (box 0) (box 0)
-        (box (make-async-work-ring slots (fx- (vector-length slots) 1)))))))
+        (box (make-async-work-ring slots (fx- (vector-length slots) 1)))
+        (and async-thread-sanitizer-enabled?
+             (make-immobile-bytevector 1))))))
 
 (define async-atomic-box-set!
   (lambda (b new)
@@ -329,6 +354,8 @@
         "work-deque indices describe a negative occupancy" deque)
       (vector-set! (async-work-ring-slots ring)
         (fxand bottom (async-work-ring-mask ring)) value)
+      (async-thread-sanitizer-release!
+        (async-work-deque-sanitizer-token deque))
       (async-atomic-box-set! (async-work-deque-bottom deque)
         (fx+ bottom 1)))))
 
@@ -369,17 +396,20 @@
     (let* ([top (async-atomic-box-ref (async-work-deque-top deque))]
            [bottom (async-atomic-box-ref (async-work-deque-bottom deque))])
       (and (fx> (async-work-deque-distance bottom top) 0)
-           (let* ([ring (async-atomic-box-ref (async-work-deque-ring deque))]
-                  [slot (fxand top (async-work-ring-mask ring))]
-                  [value (vector-ref (async-work-ring-slots ring) slot)])
-             (and (box-cas! (async-work-deque-top deque) top
-                    (fx+ top 1))
-                  (begin
-                    (unless value
-                      ($oops 'async-work-deque-steal/raw!
-                        "published work-deque slot is empty"))
-                    (vector-set! (async-work-ring-slots ring) slot #f)
-                    value)))))))
+           (begin
+             (async-thread-sanitizer-acquire!
+               (async-work-deque-sanitizer-token deque))
+             (let* ([ring (async-atomic-box-ref (async-work-deque-ring deque))]
+                    [slot (fxand top (async-work-ring-mask ring))]
+                    [value (vector-ref (async-work-ring-slots ring) slot)])
+               (and (box-cas! (async-work-deque-top deque) top
+                      (fx+ top 1))
+                    (begin
+                      (unless value
+                        ($oops 'async-work-deque-steal/raw!
+                          "published work-deque slot is empty"))
+                      (vector-set! (async-work-ring-slots ring) slot #f)
+                      value))))))))
 
 (define async-debug-work-deque-check!
   (lambda (deque expected)

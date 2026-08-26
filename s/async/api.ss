@@ -1436,6 +1436,9 @@
 (set! $async-monotonic-us
   (lambda () (async-monotonic-us)))
 
+(set! $async-debug-invariants?
+  (lambda () async-debug-invariants?))
+
 (set! $async-debug-lock-rank-test async-debug-lock-rank-test)
 (set! $async-debug-work-deque-model-test async-debug-work-deque-model-test)
 (set! $async-debug-work-deque-contention-test

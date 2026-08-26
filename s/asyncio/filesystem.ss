@@ -3,17 +3,10 @@
 ;;; flag bits mirrored by aio_map_open_flags in c/asyncio.c
 (define aio-open-flag-bits
   (lambda (flags)
-    (fold-left
-      (lambda (bits f)
-        (case f
-          [(read) (fxlogior bits 1)]
-          [(write) (fxlogior bits 2)]
-          [(create) (fxlogior bits 4)]
-          [(truncate) (fxlogior bits 8)]
-          [(append) (fxlogior bits 16)]
-          [(exclusive) (fxlogior bits 32)]
-          [else ($oops 'file-open "~s is not a file-open flag" f)]))
-      0 flags)))
+    (aio-symbols->flag-bits 'file-open flags
+      "file-open flags" "a file-open flag"
+      '((read . 1) (write . 2) (create . 4) (truncate . 8)
+        (append . 16) (exclusive . 32)))))
 
 (define aio-serial-state
   (lambda (resource)
@@ -47,15 +40,10 @@
 
 (define aio-check-serial-scope!
   (lambda (who resource)
-    (if (%async-file? resource)
-        (aio-check-file-scope! who resource)
-        (let ([sched (current-async-scheduler)])
-          (unless (and sched
-                       (eq? ($async-scheduler-group-token sched)
-                            ($async-scheduler-group-token
-                              (aio-state-owner
-                                (async-directory-state resource)))))
-            ($oops who "async directory belongs to another scheduler group"))))))
+    (aio-check-state-scope! who (aio-serial-state resource)
+      (if (%async-file? resource)
+          "async file belongs to another scheduler group"
+          "async directory belongs to another scheduler group"))))
 
 (define aio-fs-request-operation
   (case-lambda
@@ -267,12 +255,8 @@
 
 (define aio-check-file-scope!
   (lambda (who f)
-    (let ([sched (current-async-scheduler)])
-      (unless (and sched
-                   (eq? ($async-scheduler-group-token sched)
-                        ($async-scheduler-group-token
-                          (aio-state-owner (async-file-state f)))))
-        ($oops who "async file belongs to another scheduler group")))))
+    (aio-check-state-scope! who (async-file-state f)
+      "async file belongs to another scheduler group")))
 
 (define aio-claim-file-for-port!
   (lambda (who f)
@@ -576,16 +560,8 @@
 
 (define aio-copy-flag-bits
   (lambda (who flags)
-    (unless (and (list? flags) (for-all symbol? flags))
-      ($oops who "~s is not a list of copy flags" flags))
-    (fold-left
-      (lambda (bits flag)
-        (case flag
-          [(exclusive) (fxlogior bits 1)]
-          [(clone) (fxlogior bits 2)]
-          [(clone-force) (fxlogior bits 4)]
-          [else ($oops who "~s is not a copy flag" flag)]))
-      0 flags)))
+    (aio-symbols->flag-bits who flags "copy flags" "a copy flag"
+      '((exclusive . 1) (clone . 2) (clone-force . 4)))))
 
 (define %file-copy-operation
   (case-lambda
@@ -812,17 +788,8 @@
 
 (define aio-access-mode-bits
   (lambda (who modes)
-    (unless (and (list? modes) (for-all symbol? modes))
-      ($oops who "~s is not a list of access modes" modes))
-    (fold-left
-      (lambda (bits mode)
-        (case mode
-          [(exists) bits]
-          [(read) (fxlogior bits 1)]
-          [(write) (fxlogior bits 2)]
-          [(execute) (fxlogior bits 4)]
-          [else ($oops who "~s is not an access mode" mode)]))
-      0 modes)))
+    (aio-symbols->flag-bits who modes "access modes" "an access mode"
+      '((exists . 0) (read . 1) (write . 2) (execute . 4)))))
 
 (define %file-access-operation
   (lambda (path modes)
@@ -892,14 +859,9 @@
     (aio-check-path 'file-link-operation from)
     (aio-check-path 'file-link-operation to)
     (let ([bits
-           (fold-left
-             (lambda (bits flag)
-               (case flag
-                 [(directory) (fxlogior bits 1)]
-                 [(junction) (fxlogior bits 2)]
-                 [else ($oops 'file-link-operation
-                         "~s is not a symbolic-link flag" flag)]))
-             0 flags)])
+           (aio-symbols->flag-bits 'file-link-operation flags
+             "symbolic-link flags" "a symbolic-link flag"
+             '((directory . 1) (junction . 2)))])
       (aio-fs-void-operation (if symbolic? 'symlink 'link) #f from
         (lambda (ss st id)
           (aio-fs-link (aio-state-loop st) from to

@@ -1356,7 +1356,8 @@
 (mat native-fiber-invariant-rejection
   ;; The record mutation primitives are intentionally unsafe. Use them here
   ;; to ensure corrupted lifecycle and root metadata is rejected at the same
-  ;; boundaries where the VM would otherwise acquire stack ownership.
+  ;; boundaries where the VM would otherwise acquire stack ownership. Cases
+  ;; that exercise the full worker snapshot use the native-fiber debug flag.
   (let ([fiber (#3%$native-fiber-create values values #b100)])
     ;; state=new with a nonzero owner
     (#3%$record-set! fiber native-fiber-control-field-index #b1000)
@@ -1394,7 +1395,7 @@
         (set! rejected?
           (guard (condition [else #t])
             (#3%$native-fiber-try-claim!
-              (#3%$native-fiber-create values values #b100))
+              (#3%$native-fiber-create values values #b1100))
             #f)))
       (lambda ()
         (#3%$tc-field 'fiber-switch-prohibited-depth tc old)))
@@ -1409,7 +1410,7 @@
         (set! rejected?
           (guard (condition [else #t])
             (#3%$native-fiber-try-claim!
-              (#3%$native-fiber-create values values #b100))
+              (#3%$native-fiber-create values values #b1100))
             #f)))
       (lambda ()
         (#3%$tc-field 'current-native-fiber tc old)))
@@ -1424,7 +1425,7 @@
         (set! rejected?
           (guard (condition [else #t])
             (#3%$native-fiber-try-claim!
-              (#3%$native-fiber-create values values #b100))
+              (#3%$native-fiber-create values values #b1100))
             #f)))
       (lambda ()
         (#3%$tc-field 'native-fiber-transition tc old)))
@@ -1438,7 +1439,7 @@
       (lambda ()
         (set! rejected?
           (guard (condition [else #t])
-            (#3%$native-fiber-create values values #b100)
+            (#3%$native-fiber-create values values #b1100)
             #f)))
       (lambda ()
         (#3%$tc-field 'native-fiber-preempt-active tc old)))
@@ -1451,7 +1452,7 @@
       (lambda ()
         (set! rejected?
           (guard (condition [else #t])
-            (#3%$native-fiber-create values values #b100)
+            (#3%$native-fiber-create values values #b1100)
             #f)))
       (lambda ()
         (#3%$tc-field 'native-fiber-preempt-target tc #f)

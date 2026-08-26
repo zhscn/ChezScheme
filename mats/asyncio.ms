@@ -564,23 +564,19 @@
         (run-async
           (lambda ()
             (let ([tasks (make-vector 2)]
-                  [mutex (make-mutex)]
-                  [condition (make-condition)]
-                  [started 0])
+                  [started (make-async-wait-group 2)])
               (do ([i 0 (fx+ i 1)]) ((fx= i 2))
                 (vector-set! tasks i
                   (spawn-task
                     (lambda ()
+                      ;; Suspending the fiber permits both arrivals even if
+                      ;; one scheduler initially owns both tasks.  Record the
+                      ;; owner after the barrier, since the barrier itself is
+                      ;; an allowed migration point.
+                      (async-wait-group-done! started)
+                      (async-wait-group-wait started)
                       (let ([scheduler (current-async-scheduler)]
                             [thread-id (get-thread-id)])
-                        (with-mutex mutex
-                          (set! started (fx+ started 1))
-                          (when (fx= started 2)
-                            (condition-broadcast condition))
-                          (let loop ()
-                            (unless (fx= started 2)
-                              (condition-wait condition mutex)
-                              (loop))))
                         (let ([answers (dns-lookup "localhost" "80")])
                           (list (pair? answers)
                                 (eq? scheduler (current-async-scheduler))

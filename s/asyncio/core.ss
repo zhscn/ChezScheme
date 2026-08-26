@@ -170,8 +170,7 @@
 ;;; --------------------------------------------------------- invariants
 
 (define aio-debug-invariants?
-  (let ([v (getenv "CHEZ_ASYNC_CHECK_INVARIANTS")])
-    (and v (not (member v '("" "0" "false" "no"))))))
+  ($async-debug-invariants?))
 
 (define-syntax aio-invariant
   (syntax-rules ()
@@ -221,6 +220,14 @@
         (aio-invariant ($async-scheduler-owner-thread? owner)
           "libuv loop operation ran on a foreign thread" st)))))
 
+(define aio-check-state-scope!
+  (lambda (who st message)
+    (let ([sched (current-async-scheduler)])
+      (unless (and sched
+                   (eq? ($async-scheduler-group-token sched)
+                        ($async-scheduler-group-token (aio-state-owner st))))
+        ($oops who message)))))
+
 (define bv->cstring
   (lambda (bv)
     (let* ([n (bytevector-length bv)]
@@ -231,6 +238,18 @@
            [s (make-string len)])
       (do ([i 0 (fx+ i 1)]) ((fx= i len) s)
         (string-set! s i (integer->char (bytevector-u8-ref bv i)))))))
+
+(define aio-symbols->flag-bits
+  (lambda (who symbols collection-name element-name mapping)
+    (unless (and (list? symbols) (for-all symbol? symbols))
+      ($oops who "~s is not a list of ~a" symbols collection-name))
+    (fold-left
+      (lambda (bits symbol)
+        (let ([entry (assq symbol mapping)])
+          (unless entry
+            ($oops who "~s is not ~a" symbol element-name))
+          (fxlogior bits (cdr entry))))
+      0 symbols)))
 
 (define aio-register-handle!
   (lambda (st w)
@@ -739,14 +758,18 @@
                (aio-handle-handle h)))))
         hs))))
 
+(define aio-drain-guardian-objects!
+  (lambda (guardian finalize!)
+    (let loop ()
+      (let ([object (guardian)])
+        (when object
+          (finalize! object)
+          (loop))))))
+
 (define aio-drain-guardian!
   (lambda (st)
-    (let ([g (aio-state-guardian st)])
-      (let loop ()
-        (let ([w (g)])
-          (when w
-            (aio-close-handle w 'finalized)
-            (loop)))))))
+    (aio-drain-guardian-objects! (aio-state-guardian st)
+      (lambda (w) (aio-close-handle w 'finalized)))))
 
 (define aio-finalize-file!
   (lambda (f)
@@ -763,12 +786,8 @@
 
 (define aio-drain-file-guardian!
   (lambda (st)
-    (let ([g (aio-state-file-guardian st)])
-      (let loop ()
-        (let ([f (g)])
-          (when f
-            (aio-finalize-file! f)
-            (loop)))))))
+    (aio-drain-guardian-objects! (aio-state-file-guardian st)
+      aio-finalize-file!)))
 
 (define aio-finalize-directory!
   (lambda (d)
@@ -784,12 +803,8 @@
 
 (define aio-drain-directory-guardian!
   (lambda (st)
-    (let ([g (aio-state-directory-guardian st)])
-      (let loop ()
-        (let ([d (g)])
-          (when d
-            (aio-finalize-directory! d)
-            (loop)))))))
+    (aio-drain-guardian-objects! (aio-state-directory-guardian st)
+      aio-finalize-directory!)))
 
 ;;; ------------------------------------------------------- poll and wake
 

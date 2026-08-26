@@ -82,12 +82,8 @@
 
 (define aio-check-handle-scope!
   (lambda (who h)
-    (let ([sched (current-async-scheduler)])
-      (unless (and sched
-                   (eq? ($async-scheduler-group-token sched)
-                        ($async-scheduler-group-token
-                          (aio-state-owner (aio-handle-state h)))))
-        ($oops who "async handle belongs to another scheduler group")))))
+    (aio-check-state-scope! who (aio-handle-state h)
+      "async handle belongs to another scheduler group")))
 
 (define aio-check-stream-access!
   (lambda (who s allow-owned?)
@@ -581,15 +577,8 @@
 
 (define aio-udp-bind-flag-bits
   (lambda (who flags)
-    (unless (and (list? flags) (for-all symbol? flags))
-      ($oops who "~s is not a list of UDP bind flags" flags))
-    (fold-left
-      (lambda (bits flag)
-        (case flag
-          [(ipv6-only) (fxlogior bits 1)]
-          [(reuse-address) (fxlogior bits 2)]
-          [else ($oops who "~s is not a UDP bind flag" flag)]))
-      0 flags)))
+    (aio-symbols->flag-bits who flags "UDP bind flags" "a UDP bind flag"
+      '((ipv6-only . 1) (reuse-address . 2)))))
 
 (define %udp-open
   (case-lambda
@@ -756,16 +745,9 @@
 
 (define aio-nameinfo-flag-bits
   (lambda (who flags)
-    (unless (and (list? flags) (for-all symbol? flags))
-      ($oops who "~s is not a list of reverse-DNS flags" flags))
-    (fold-left
-      (lambda (bits flag)
-        (case flag
-          [(name-required) (fxlogior bits 1)]
-          [(numeric-host) (fxlogior bits 2)]
-          [(numeric-service) (fxlogior bits 4)]
-          [else ($oops who "~s is not a reverse-DNS flag" flag)]))
-      0 flags)))
+    (aio-symbols->flag-bits who flags "reverse-DNS flags"
+      "a reverse-DNS flag"
+      '((name-required . 1) (numeric-host . 2) (numeric-service . 4)))))
 
 (define %dns-reverse-operation
   (case-lambda
@@ -859,18 +841,10 @@
 
 (define aio-poll-event-bits
   (lambda (who events)
-    (unless (and (list? events) (for-all symbol? events))
-      ($oops who "~s is not a list of poll events" events))
     (let ([bits
-           (fold-left
-             (lambda (bits event)
-               (case event
-                 [(readable) (fxlogior bits 1)]
-                 [(writable) (fxlogior bits 2)]
-                 [(disconnect) (fxlogior bits 4)]
-                 [(prioritized) (fxlogior bits 8)]
-                 [else ($oops who "~s is not a poll event" event)]))
-             0 events)])
+           (aio-symbols->flag-bits who events "poll events" "a poll event"
+             '((readable . 1) (writable . 2) (disconnect . 4)
+               (prioritized . 8)))])
       (when (fx= bits 0) ($oops who "poll event list is empty"))
       bits)))
 
@@ -987,16 +961,9 @@
 
 (define aio-process-flags
   (lambda (who flags)
-    (unless (and (list? flags) (for-all symbol? flags))
-      ($oops who "~s is not a list of process flags" flags))
-    (fold-left
-      (lambda (bits flag)
-        (case flag
-          [(detached) (fxlogior bits 1)]
-          [(windows-hide) (fxlogior bits 2)]
-          [(windows-verbatim-arguments) (fxlogior bits 4)]
-          [else ($oops who "~s is not a process flag" flag)]))
-      0 flags)))
+    (aio-symbols->flag-bits who flags "process flags" "a process flag"
+      '((detached . 1) (windows-hide . 2)
+        (windows-verbatim-arguments . 4)))))
 
 (define aio-process-stdio
   (lambda (who value child-reads? inherit-fd)
@@ -1233,16 +1200,9 @@
 
 (define aio-fs-event-flag-bits
   (lambda (who flags)
-    (unless (and (list? flags) (for-all symbol? flags))
-      ($oops who "~s is not a list of filesystem event flags" flags))
-    (fold-left
-      (lambda (bits flag)
-        (case flag
-          [(watch-entry) (fxlogior bits 1)]
-          [(stat) (fxlogior bits 2)]
-          [(recursive) (fxlogior bits 4)]
-          [else ($oops who "~s is not a filesystem event flag" flag)]))
-      0 flags)))
+    (aio-symbols->flag-bits who flags "filesystem event flags"
+      "a filesystem event flag"
+      '((watch-entry . 1) (stat . 2) (recursive . 4)))))
 
 (define %fs-event-open
   (case-lambda

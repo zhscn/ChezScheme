@@ -29,6 +29,9 @@ static uptr s_check_heap_errors(void);
 static void s_native_fiber_invariant_failure(void);
 static iptr s_native_fiber_worker_state_mask(void);
 static ptr s_native_fiber_current_root(void);
+static IBOOL s_thread_sanitizer_enabledp(void);
+static void s_thread_sanitizer_acquire(ptr token);
+static void s_thread_sanitizer_release(ptr token);
 
 static void install_library_entry(ptr n, ptr x) {
     if (!Sfixnump(n) || UNFIX(n) < 0 || UNFIX(n) >= library_entry_vector_size)
@@ -251,6 +254,12 @@ void S_prim_init(void) {
                     (void *)s_native_fiber_worker_state_mask);
     Sforeign_symbol("(cs)native_fiber_current_root",
                     (void *)s_native_fiber_current_root);
+    Sforeign_symbol("(cs)thread_sanitizer_enabledp",
+                    (void *)s_thread_sanitizer_enabledp);
+    Sforeign_symbol("(cs)thread_sanitizer_acquire",
+                    (void *)s_thread_sanitizer_acquire);
+    Sforeign_symbol("(cs)thread_sanitizer_release",
+                    (void *)s_thread_sanitizer_release);
     Sforeign_symbol("(cs)count_size_increments", (void *)S_count_size_increments);
     Sforeign_symbol("(cs)lookup_library_entry", (void *)S_lookup_library_entry);
     Sforeign_symbol("(cs)link_code_object", (void *)s_link_code_object);
@@ -427,4 +436,22 @@ static iptr s_native_fiber_worker_state_mask(void) {
 
 static ptr s_native_fiber_current_root(void) {
   return CURRENTNATIVEFIBER(get_thread_context());
+}
+
+static IBOOL s_thread_sanitizer_enabledp(void) {
+#ifdef THREAD_SANITIZER_ENABLED
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+static void s_thread_sanitizer_acquire(ptr token) {
+  (void)token;
+  THREAD_SANITIZER_ACQUIRE(TO_VOIDP(token));
+}
+
+static void s_thread_sanitizer_release(ptr token) {
+  (void)token;
+  THREAD_SANITIZER_RELEASE(TO_VOIDP(token));
 }
