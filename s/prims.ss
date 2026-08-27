@@ -1969,6 +1969,7 @@
 (define $native-fiber-owner)
 (define $native-fiber-flags)
 (define $native-fiber-id)
+(define $native-fiber-stack-snapshot)
 (define $native-fiber-adopt)
 (define $native-fiber-create)
 (define $native-fiber-try-claim!)
@@ -2157,6 +2158,26 @@
     (unless ($native-fiber? fiber)
       ($oops '$native-fiber-id "~s is not a native fiber" fiber))
     (native-fiber-id fiber)))
+
+;; Return a non-destructive snapshot of the continuation segments owned by a
+;; claimed parked fiber.  Generic continuation inspection splits one-shot
+;; stacks, so observability code must use this representation instead.
+(set! $native-fiber-stack-snapshot
+  (lambda (fiber)
+    (unless (and ($native-fiber? fiber) (eq? fiber ($native-fiber-claimed)))
+      ($oops '$native-fiber-stack-snapshot
+        "native fiber must be claimed by the current native thread"))
+    (let loop ([context (native-fiber-context fiber)] [segments '()])
+      (cond
+        [(not context) (reverse segments)]
+        [(eq? context $null-continuation) (reverse segments)]
+        [else
+         (loop ($continuation-link context)
+           (cons (vector ($continuation-return-code context)
+                   ($continuation-return-offset context)
+                   ($continuation-stack-length context)
+                   ($continuation-stack-clength context))
+             segments))]))))
 
 (set! $native-fiber-adopt
   (lambda (flags)
@@ -2911,8 +2932,9 @@
   (lambda (who current target payload finish?)
     (let-values ([(owner full-checks?)
                   (native-fiber-check-transfer who current target)])
-      ;; Allocate the descriptor after all checks. The remaining bindings and
-      ;; operations before the raw switch are nonallocating.
+      ;; Allocate the descriptor after all checks.  Fiber accounting completes
+      ;; before interrupts are disabled; the transition operations that follow
+      ;; are nonallocating.
       (let* ([source-context
               (and (not finish?) (#3%$native-fiber-allocate-descriptor))]
            [source-switch-control
@@ -2943,6 +2965,7 @@
           finish?))
       ;; The target-side return path balances this call. No Scheme event may
       ;; observe the transition fields between here and the hand-coded entry.
+      ($cost-center-fiber-switch-out! current)
       (disable-interrupts)
       (#3%$tc-field 'native-fiber-test-active (#3%$tc)
         (not (fx= (fxlogand
@@ -2967,6 +2990,7 @@
         ;; the source stable state is release-published, and every transition
         ;; root has been cleared.
         (enable-interrupts)
+        ($cost-center-fiber-switch-in! ($current-native-fiber))
         (native-fiber-check-stable-internal! who ($current-native-fiber))
         payload)))))
 

@@ -60,6 +60,139 @@
            #'(($cost-center-level x) v)
            #'($cost-center-level-set! x v))])))
 
+  (define-syntax with-cost-center-mutex
+    (lambda (x)
+      (syntax-case x ()
+        [(_ cc e0 e1 ...)
+         (if-feature pthreads
+           #'(with-mutex ($cost-center-mutex cc) e0 e1 ...)
+           #'(begin e0 e1 ...))])))
+
+  (define-record-type fiber-cost-frame
+    (nongenerative fiber-cost-frame-layer1)
+    (sealed #t)
+    (fields
+      (immutable cost-center)
+      (immutable timed?)
+      (mutable counting?)
+      (mutable active?)
+      (mutable alloc)
+      (mutable instr)
+      (mutable time)))
+
+  (define-record-type saved
+    (sealed #t)
+    (nongenerative cost-center-saved-layer1)
+    (fields (mutable alloc) (mutable intr) (mutable time)))
+
+  (define fiber-cost-table (make-weak-eq-hashtable))
+  (define fiber-cost-active-count (box 0))
+  (define fiber-cost-table-mutex
+    (if-feature pthreads (make-mutex) #f))
+
+  (define-syntax with-fiber-cost-table
+    (lambda (x)
+      (syntax-case x ()
+        [(_ e0 e1 ...)
+         (if-feature pthreads
+           #'(with-mutex fiber-cost-table-mutex e0 e1 ...)
+           #'(begin e0 e1 ...))])))
+
+  (define counter-mod-
+    (lambda (x y)
+      (let ([r (- x y)])
+        (if (< r 0) (+ (expt 2 64) r) r))))
+
+  (define add-frame-cost!
+    (lambda (frame curr-alloc curr-instr curr-time)
+      (let* ([cc (fiber-cost-frame-cost-center frame)]
+             [alloc-count (counter-mod- curr-alloc (fiber-cost-frame-alloc frame))]
+             [instr-count (counter-mod- curr-instr (fiber-cost-frame-instr frame))])
+        (with-cost-center-mutex cc
+          ($cost-center-alloc-count-set! cc
+            (+ ($cost-center-alloc-count cc) alloc-count))
+          ($cost-center-instr-count-set! cc
+            (+ ($cost-center-instr-count cc) instr-count))
+          (when (fiber-cost-frame-timed? frame)
+            (let* ([saved-time (fiber-cost-frame-time frame)]
+                   [ns (- (time-nanosecond curr-time)
+                          (time-nanosecond saved-time))]
+                   [s (- (time-second curr-time)
+                         (time-second saved-time))]
+                   [s (if (< ns 0) (- s 1) s)]
+                   [ns (if (< ns 0) (+ ns (expt 10 9)) ns)]
+                   [ns (+ ($cost-center-time-ns cc) ns)]
+                   [s (+ ($cost-center-time-s cc) s)]
+                   [s (if (>= ns (expt 10 9)) (+ s 1) s)]
+                   [ns (if (>= ns (expt 10 9)) (- ns (expt 10 9)) ns)])
+              ($cost-center-time-s-set! cc s)
+              ($cost-center-time-ns-set! cc ns)))))))
+
+  (define fiber-frame-start!
+    (lambda (frame)
+      (when (and (fiber-cost-frame-counting? frame)
+                 (not (fiber-cost-frame-active? frame)))
+        (fiber-cost-frame-alloc-set! frame
+          ($object-ref 'unsigned-64 ($tc) (constant tc-alloc-counter-disp)))
+        (fiber-cost-frame-instr-set! frame
+          ($object-ref 'unsigned-64 ($tc) (constant tc-instr-counter-disp)))
+        (when (fiber-cost-frame-timed? frame)
+          (fiber-cost-frame-time-set! frame (current-time 'time-thread)))
+        (fiber-cost-frame-active?-set! frame #t))))
+
+  (define fiber-frame-stop!
+    (lambda (frame)
+      (when (fiber-cost-frame-active? frame)
+        ;; Read time first to exclude as much accounting overhead as possible.
+        (let ([curr-time (and (fiber-cost-frame-timed? frame)
+                              (current-time 'time-thread))]
+              [curr-alloc ($object-ref 'unsigned-64 ($tc)
+                            (constant tc-alloc-counter-disp))]
+              [curr-instr ($object-ref 'unsigned-64 ($tc)
+                            (constant tc-instr-counter-disp))])
+          (fiber-cost-frame-active?-set! frame #f)
+          (add-frame-cost! frame curr-alloc curr-instr curr-time)))))
+
+  (define fiber-frames
+    (lambda (fiber)
+      (if (eqv? ($atomic-box-ref fiber-cost-active-count) 0)
+          '()
+          (with-fiber-cost-table
+            (hashtable-ref fiber-cost-table fiber '())))))
+
+  (define atomic-count-add!
+    (lambda (box delta)
+      (let loop ([old ($atomic-box-ref box)])
+        (unless (box-cas! box old (+ old delta))
+          (loop ($atomic-box-ref box))))))
+
+  (define with-fiber-cost-center
+    (lambda (fiber timed? cc th)
+      (let ([frame (make-fiber-cost-frame cc timed? #f #f 0 0 #f)])
+        (dynamic-wind
+          (lambda ()
+            (with-fiber-cost-table
+              (let ([frames (hashtable-ref fiber-cost-table fiber '())])
+                (fiber-cost-frame-counting?-set! frame
+                  (not (ormap
+                         (lambda (other)
+                           (and (fiber-cost-frame-counting? other)
+                                (eq? (fiber-cost-frame-cost-center other) cc)))
+                         frames)))
+                (hashtable-set! fiber-cost-table fiber (cons frame frames))
+                (atomic-count-add! fiber-cost-active-count 1)))
+            (fiber-frame-start! frame))
+          th
+          (lambda ()
+            (fiber-frame-stop! frame)
+            (with-fiber-cost-table
+              (let ([frames (remq frame
+                              (hashtable-ref fiber-cost-table fiber '()))])
+                (if (null? frames)
+                    (hashtable-delete! fiber-cost-table fiber)
+                    (hashtable-set! fiber-cost-table fiber frames))
+                (atomic-count-add! fiber-cost-active-count -1))))))))
+
   (define $with-cost-center
     (let ()
       (define who 'with-cost-center)
@@ -70,18 +203,13 @@
              (if-feature pthreads
                #'(with-mutex mexp e0 e1 ...)
                #'(begin e0 e1 ...))])))
-      (define mod-
-        (lambda (x y)
-          (let ([r (- x y)])
-            (if (< r 0) (+ (expt 2 64) r) r))))
       (lambda (timed? cc th)
-        (define-record-type saved
-          (sealed #t)
-          (nongenerative)
-          (fields (mutable alloc) (mutable intr) (mutable time)))
         (unless ($cost-center? cc) ($oops who "~s is not a cost center" cc))
         (unless (procedure? th) ($oops who "~s is not a procedure" th))
-        (let ([saved (make-saved 0 0 #f)])
+        (let ([fiber ($current-native-fiber)])
+          (if fiber
+              (with-fiber-cost-center fiber timed? cc th)
+              (let ([saved (make-saved 0 0 #f)])
           (dynamic-wind #t
             (lambda ()
               (let ([level (cc-level cc)])
@@ -97,9 +225,9 @@
                 (when (fx= level 1)
                   ; grab time first -- to use up as little as possible
                   (let* ([curr-time (and timed? (current-time 'time-thread))]
-                         [alloc-count (mod- ($object-ref 'unsigned-64 ($tc) (constant tc-alloc-counter-disp)) 
+                         [alloc-count (counter-mod- ($object-ref 'unsigned-64 ($tc) (constant tc-alloc-counter-disp))
                                         (saved-alloc saved))]
-                         [instr-count (mod- ($object-ref 'unsigned-64 ($tc) (constant tc-instr-counter-disp))
+                         [instr-count (counter-mod- ($object-ref 'unsigned-64 ($tc) (constant tc-instr-counter-disp))
                                         (saved-intr saved))])
                     (with-mutex-if-threaded ($cost-center-mutex cc)
                       ($cost-center-alloc-count-set! cc
@@ -119,7 +247,15 @@
                                                         (values (+ s 1) (- ns (expt 10 9)))
                                                         (values s ns)))])
                               ($cost-center-time-s-set! cc s)
-                              ($cost-center-time-ns-set! cc ns)))))))))))))))
+                              ($cost-center-time-ns-set! cc ns)))))))))))))))))
+
+  (set! $cost-center-fiber-switch-out!
+    (lambda (fiber)
+      (for-each fiber-frame-stop! (fiber-frames fiber))))
+
+  (set! $cost-center-fiber-switch-in!
+    (lambda (fiber)
+      (for-each fiber-frame-start! (fiber-frames fiber))))
 
   (set-who! cost-center-instruction-count
     (lambda (cc)

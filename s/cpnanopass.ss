@@ -8085,9 +8085,14 @@
                           (cons ir effect*))))))
               (with-output-language (L15a Effect)
                 (add-instr! block
-                  `(inline ,(make-live-info) ,null-info ,%inc-profile-counter
-                     (literal ,(make-info-literal #t 'object counter (constant record-data-disp)))
-                     (immediate 1))))))
+                  ;; Profile counters are shared by every Scheme thread that
+                  ;; executes this code object.  Use the existing pointer-sized
+                  ;; atomic increment rather than a load/add/store sequence so
+                  ;; parallel workers cannot lose observations.
+                  `(inline ,(make-live-info) ,null-info ,%locked-incr!
+                     (literal ,(make-info-literal #f 'object counter 0))
+                     ,%zero
+                     (immediate ,(constant record-data-disp)))))))
           (define maybe-add-counter
             (lambda (new* link)
               (cond

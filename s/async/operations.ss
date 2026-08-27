@@ -30,6 +30,7 @@
     (async-check-cancellation! task)
     (with-async-mutex (async-task-mutex task)
       (async-task-state-set! task 'waiting)
+      (async-task-wait-start-us-set! task (async-monotonic-us))
       (async-task-wait-scheduler-set! task sched)
       (async-task-suspension-state-set! task 'unwinding)
       (async-task-sync-state-set! task ss)

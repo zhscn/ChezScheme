@@ -123,6 +123,9 @@ Optional configuration settings may be supplied as alternating
   transition is active.  \scheme{run-async} cannot execute inside an active
   engine, an engine cannot be invoked from an async task, and an async task
   cannot invoke a nested \scheme{run-async}.
+\item[\scheme{trace?}] must be a boolean and defaults to \scheme{#f}.
+  A true value records scheduler events and stack samples at preemption
+  boundaries for retrieval through the trace procedures described below.
 \end{description}
 
 \scheme{run-async} returns the values returned by \var{thunk}.  If the root
@@ -374,6 +377,43 @@ The predicate \scheme{async-scheduler?} recognizes scheduler objects.
 The remaining procedures return, respectively, the total active task count
 for the scheduler group, the number of event-loop turns for \var{scheduler},
 the number of task suspensions, and the number of task resumptions.
+
+\entryheader
+\formdef{task-profile}{\categoryprocedure}{(task-profile \var{task})}
+\formdef{async-scheduler-profile}{\categoryprocedure}{(async-scheduler-profile \var{scheduler})}
+\returns an association list of counters
+\listlibraries
+\endentryheader
+
+\scheme{task-profile} reports run count, running time, waiting time, queue time,
+and migration count.  Durations are integer microsecond counts.  The scheduler
+profile reports active tasks, event-loop turns, task executions, preemptions,
+suspensions, and wakeups.
+
+\entryheader
+\formdef{async-scheduler-trace}{\categoryprocedure}{(async-scheduler-trace \var{scheduler})}
+\formdef{async-scheduler-trace-clear!}{\categoryprocedure}{(async-scheduler-trace-clear! \var{scheduler})}
+\returns see below
+\listlibraries
+\endentryheader
+
+\scheme{async-scheduler-trace} returns events in sequence order.  Each event
+is a vector containing its sequence number, monotonic timestamp in
+microseconds, kind, worker index, task id, native-fiber id, and detail value.
+Event kinds include \scheme{create}, \scheme{dispatch}, \scheme{ready},
+\scheme{yield}, \scheme{suspend}, \scheme{preempt}, and \scheme{finish}.
+Preemption event detail contains a non-destructive native-stack segment
+snapshot.  \scheme{async-scheduler-trace-clear!} discards accumulated events.
+
+\entryheader
+\formdef{task-stack-snapshot}{\categoryprocedure}{(task-stack-snapshot \var{task})}
+\returns a list of native-stack segment descriptors
+\listlibraries
+\endentryheader
+
+The task must be parked and claimable.  Each segment descriptor is a vector
+containing its return code object, return offset, stack length, and live stack
+length.  Taking a snapshot preserves the task's linear one-shot stack.
 
 The following example demonstrates spawning a migratable worker task across a
 two-thread scheduler group, joining the task, and receiving its return values:

@@ -3233,6 +3233,11 @@ A \scheme{profile} expression has one subform, a source object, and
 returns an unspecified value.
 Its only effect is to cause the number of times the expression is
 executed to be accounted to the source object.
+Profile counter updates are atomic across Scheme threads, including async
+workers that execute the same profiled code.  A point-in-time dump is obtained
+after the participating threads or tasks have reached a quiescent point;
+dumping or clearing while profiled code continues to run observes a live set
+of counters.
 
 In cases where source positions explicitly identified by \scheme{profile}
 forms are the only ones whose execution counts should be tracked,
@@ -5279,7 +5284,10 @@ Elapsed time is tracked only when the optional \scheme{timed?} argument to
 The \scheme{with-cost-center} procedure accurately tracks costs, subject
 to the caveats above, even when reentered with the same cost center, used
 simultaneously in multiple threads, and exited or reentered one or more
-times via continuation invocation.
+times via continuation invocation.  Native-fiber switches settle the active
+cost-center interval on the outgoing worker and establish a new interval on
+the incoming worker, so scheduler execution and fiber migration do not enter
+the fiber's recorded costs.
 
 %----------------------------------------------------------------------------
 \entryheader

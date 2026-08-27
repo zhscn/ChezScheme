@@ -203,6 +203,17 @@
     (unless (task? task) ($oops 'task-context "~s is not a task" task))
     (async-task-context task)))
 
+(set-who! task-stack-snapshot
+  (lambda (task)
+    (unless (task? task) ($oops who "~s is not a task" task))
+    (let ([fiber (async-task-native-fiber task)])
+      (unless (and fiber ($native-fiber-try-claim! fiber))
+        ($oops who "task ~s is not parked and claimable" (async-task-id task)))
+      (dynamic-wind
+        (lambda () (void))
+        (lambda () ($native-fiber-stack-snapshot fiber))
+        (lambda () ($native-fiber-release-claim! fiber))))))
+
 (set-who! make-task-group
   (lambda ()
     (make-async-group #f (async-make-context (async-current-context)))))
@@ -1249,7 +1260,7 @@
 (set-who! run-async
   (lambda (thunk . options)
     (unless (procedure? thunk) ($oops who "~s is not a procedure" thunk))
-    (let ([clock 'real] [parallelism 1] [preemption-ticks #f])
+    (let ([clock 'real] [parallelism 1] [preemption-ticks #f] [trace? #f])
       (let loop ([opts options])
         (unless (null? opts)
           (unless (and (pair? (cdr opts)))
@@ -1270,6 +1281,10 @@
                                 (fx>= v async-minimum-preemption-ticks)))
                  ($oops who "invalid preemption tick count ~s" v))
                (set! preemption-ticks v)]
+              [(eq? k 'trace?)
+               (unless (boolean? v)
+                 ($oops who "invalid trace flag ~s" v))
+               (set! trace? v)]
               [else ($oops who "unrecognized run-async option ~s" k)]))
           (loop (cddr opts))))
       (let ([fiber ($current-native-fiber)])
@@ -1290,6 +1305,7 @@
                       (make-async-queue)
                       (and async-debug-invariants? (make-eq-hashtable))
                       (box 0) '#() #f (box 0) #f (box 0) (box 0)
+                      (make-async-trace-state trace? (box '()) (box 0))
                       #f #f '())]
              [schedulers (make-vector parallelism)])
         (do ([i 0 (fx+ i 1)]) ((fx= i parallelism))
@@ -1383,6 +1399,45 @@
   (lambda (sched)
     (unless (async-scheduler? sched) ($oops who "~s is not a scheduler" sched))
     (async-atomic-box-ref (async-scheduler-wakeup-count-box sched))))
+
+(set-who! task-profile
+  (lambda (task)
+    (unless (task? task) ($oops who "~s is not a task" task))
+    (with-async-mutex (async-task-mutex task)
+      `((run-count . ,(async-task-run-count task))
+        (runtime-us . ,(async-task-runtime-us task))
+        (wait-time-us . ,(async-task-wait-time-us task))
+        (queue-time-us . ,(async-task-queue-time-us task))
+        (migration-count . ,(async-task-migration-count task))))))
+
+(set-who! async-scheduler-profile
+  (lambda (sched)
+    (unless (async-scheduler? sched) ($oops who "~s is not a scheduler" sched))
+    `((task-count . ,(async-scheduler-group-task-count
+                       ($async-scheduler-group sched)))
+      (turn-count . ,($async-scheduler-turn-count sched))
+      (execution-count . ,(async-scheduler-exec-count sched))
+      (preemption-count . ,(async-scheduler-preemption-count sched))
+      (suspension-count . ,($async-scheduler-suspension-count sched))
+      (wakeup-count . ,(async-atomic-box-ref
+                         (async-scheduler-wakeup-count-box sched))))))
+
+(set-who! async-scheduler-trace
+  (lambda (sched)
+    (unless (async-scheduler? sched) ($oops who "~s is not a scheduler" sched))
+    (let* ([group ($async-scheduler-group sched)]
+           [events (async-atomic-box-ref
+                     (async-trace-state-events-box
+                       (async-scheduler-group-trace-state group)))])
+      (sort (lambda (a b) (< (vector-ref a 0) (vector-ref b 0))) events))))
+
+(set-who! async-scheduler-trace-clear!
+  (lambda (sched)
+    (unless (async-scheduler? sched) ($oops who "~s is not a scheduler" sched))
+    (async-work-atomic-box-set!
+      (async-trace-state-events-box
+        (async-scheduler-group-trace-state ($async-scheduler-group sched)))
+      '())))
 
 ;;; ------------------------------------------------- io layer integration
 

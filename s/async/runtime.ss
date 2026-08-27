@@ -22,6 +22,7 @@
           #f                         ; sync state
           (box #f)                   ; cancellation shield
           termination-actions '()
+          0 0 0 0 0 #f #f (async-monotonic-us)
           (make-async-os-mutex)))
       (async-task-native-fiber-set! task
         ($native-fiber-create
@@ -57,6 +58,8 @@
             (if async-debug-invariants?
                 (constant native-fiber-flag-debug)
                 0))))
+      (async-trace-event! group sched task 'create
+        (if migratable? 'migratable 'pinned))
       task)))
 
 (define ensure-child-group
@@ -149,6 +152,8 @@
                (when (and (eq? state 'failed) (pair? waiters))
                  (async-task-observed?-set! task #t))
                waiters))])
+      (async-trace-event! ($async-scheduler-group sched) sched task
+        'finish state)
       (sched-registry-remove! sched task)
       (let ([join-payload
               (case state
@@ -447,33 +452,66 @@
           "scheduler selected a task missing from the registry" task)))
     (async-scheduler-exec-count-set! sched
       (fx+ 1 (async-scheduler-exec-count sched)))
-    (with-async-mutex (async-task-mutex task)
-      (async-task-current-wait-set! task #f)
-      (async-task-wait-scheduler-set! task #f)
-      (async-task-resume-pinned?-set! task #f)
-      (async-task-suspension-state-set! task #f)
-      (async-task-state-set! task 'running)
-      (async-task-scheduler-set! task sched))
+    (let ([now (async-monotonic-us)]
+          [worker-index (async-scheduler-group-index sched)])
+      (with-async-mutex (async-task-mutex task)
+        (let ([ready-start (async-task-ready-start-us task)]
+              [wait-start (async-task-wait-start-us task)]
+              [last-worker (async-task-last-worker-index task)])
+          (when ready-start
+            (async-task-queue-time-us-set! task
+              (+ (async-task-queue-time-us task) (- now ready-start))))
+          (when wait-start
+            (async-task-wait-time-us-set! task
+              (+ (async-task-wait-time-us task) (- now wait-start))))
+          (when (and last-worker (not (fx= last-worker worker-index)))
+            (async-task-migration-count-set! task
+              (+ 1 (async-task-migration-count task))))
+          (async-task-last-worker-index-set! task worker-index)
+          (async-task-ready-start-us-set! task #f)
+          (async-task-wait-start-us-set! task #f)
+          (async-task-run-count-set! task (+ 1 (async-task-run-count task))))
+        (async-task-current-wait-set! task #f)
+        (async-task-wait-scheduler-set! task #f)
+        (async-task-resume-pinned?-set! task #f)
+        (async-task-suspension-state-set! task #f)
+        (async-task-state-set! task 'running)
+        (async-task-scheduler-set! task sched)))
     (async-scheduler-current-task-set! sched task)
-    (let ([outcome
-           (if (async-scheduler-preemption-ticks sched)
-               (call-with-async-preemption sched
-                 (lambda () (async-switch-to-task sched task)))
-               (async-switch-to-task sched task))])
+    (async-trace-event! ($async-scheduler-group sched) sched task 'dispatch #f)
+    (let* ([started (async-monotonic-us)]
+           [outcome
+            (if (async-scheduler-preemption-ticks sched)
+                (call-with-async-preemption sched
+                  (lambda () (async-switch-to-task sched task)))
+                (async-switch-to-task sched task))]
+           [stopped (async-monotonic-us)])
+      (with-async-mutex (async-task-mutex task)
+        (async-task-runtime-us-set! task
+          (+ (async-task-runtime-us task) (- stopped started))))
       (async-scheduler-current-task-set! sched #f)
       (cond
         [(eq? outcome async-suspend-token)
+         (async-trace-event! ($async-scheduler-group sched) sched task
+           'suspend (async-task-current-wait task))
          (async-finish-suspension! task)
          task]
         [(eq? outcome async-yield-token)
          (async-task-state-set! task 'ready)
+         (async-task-ready-start-us-set! task stopped)
+         (async-trace-event! ($async-scheduler-group sched) sched task
+           'yield #f)
          (async-atomic-box-add! (async-scheduler-wakeup-count-box sched) 1)
          (async-publish-ready! task sched)
          #f]
         [(eq? outcome async-preemption-token)
          (async-task-state-set! task 'ready)
+         (async-task-ready-start-us-set! task stopped)
          (async-scheduler-preemption-count-set! sched
            (fx+ 1 (async-scheduler-preemption-count sched)))
+         (async-trace-event! ($async-scheduler-group sched) sched task
+           'preempt
+           (async-trace-stack-sample ($async-scheduler-group sched) task))
          (async-publish-ready! task sched)
          #f]
         [(and (pair? outcome) (eq? (car outcome) 'done))

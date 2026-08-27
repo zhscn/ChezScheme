@@ -2580,6 +2580,45 @@
 
   ;; ---- observability
 
+  (let ([saved-task #f] [saved-scheduler #f] [saved-cost-center #f]
+        [parked-stack #f])
+    (run-async
+      (lambda ()
+        (set! saved-task (current-async-task))
+        (set! saved-scheduler (current-async-scheduler))
+        (set! saved-cost-center (make-cost-center 'async-observer))
+        (with-cost-center #t saved-cost-center
+          (lambda ()
+            (let ([sleeper (spawn-task (lambda () (async-sleep 1)))])
+              (let wait ()
+                (unless (eq? (task-state sleeper) 'waiting)
+                  (task-yield)
+                  (wait)))
+              (set! parked-stack (task-stack-snapshot sleeper))
+              (task-cancel! sleeper 'observed)
+              (guard (c [else (void)]) (task-join sleeper))
+              (task-yield)))))
+      'parallelism 2
+      'trace? #t)
+    (let ([task-data (task-profile saved-task)]
+          [scheduler-data (async-scheduler-profile saved-scheduler)]
+          [events (async-scheduler-trace saved-scheduler)])
+      (and (pair? parked-stack)
+           (> (cdr (assq 'run-count task-data)) 0)
+           (>= (cdr (assq 'runtime-us task-data)) 0)
+           (>= (cdr (assq 'wait-time-us task-data)) 0)
+           (>= (cdr (assq 'queue-time-us task-data)) 0)
+           (>= (cdr (assq 'migration-count task-data)) 0)
+           (> (cdr (assq 'execution-count scheduler-data)) 0)
+           (>= (cdr (assq 'preemption-count scheduler-data)) 0)
+           (time>=? (cost-center-time saved-cost-center)
+             (make-time 'time-duration 0 0))
+           (pair? events)
+           (ormap (lambda (event) (eq? (vector-ref event 2) 'finish)) events)
+           (begin
+             (async-scheduler-trace-clear! saved-scheduler)
+             (null? (async-scheduler-trace saved-scheduler))))))
+
   (equal? (run-async
             (lambda ()
               (let ([sched (current-async-scheduler)]

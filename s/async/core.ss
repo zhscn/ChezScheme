@@ -791,8 +791,16 @@
     (mutable poll-proc)             ; io layer poll hook: scheduler x block? -> void
     (mutable io-state)))            ; io layer data
 
+(define-record-type (async-trace-state make-async-trace-state async-trace-state?)
+  (nongenerative async-trace-state-layer1)
+  (sealed #t)
+  (fields
+    (immutable enabled?)
+    (immutable events-box)
+    (immutable sequence-box)))
+
 (define-record-type (async-scheduler-group make-async-scheduler-group async-scheduler-group?)
-  (nongenerative async-scheduler-group-layer2)
+  (nongenerative async-scheduler-group-layer3)
   (sealed #t)
   (fields
     (immutable mutex)
@@ -806,6 +814,7 @@
     (mutable idle-schedulers)       ; intrusive list head
     (immutable idle-count-box)
     (immutable work-count-box)      ; published Chase--Lev entries
+    (immutable trace-state)
     (mutable shutdown?)
     (mutable failure)
     (mutable workers)))
@@ -846,7 +855,7 @@
     (mutable deadline-cancel)))
 
 (define-record-type (async-task make-async-task $async-task?)
-  (nongenerative async-task-layer14)
+  (nongenerative async-task-layer15)
   (sealed #t)
   (fields
     (immutable id)
@@ -877,7 +886,51 @@
     (immutable cancel-shield-box)   ; atomic box: cancellation temporarily masked
     (mutable termination-actions)   ; trusted hooks run exactly at termination
     (mutable owned-mutexes)         ; short list or eq-hashtable of owned locks
+    (mutable run-count)
+    (mutable runtime-us)
+    (mutable wait-time-us)
+    (mutable queue-time-us)
+    (mutable migration-count)
+    (mutable last-worker-index)
+    (mutable wait-start-us)
+    (mutable ready-start-us)
     (immutable mutex)))
+
+;;; Trace publication is optional.  Event vectors are append-only after
+;;; publication, so readers can take a lock-free snapshot while scheduler
+;;; workers continue running.
+;;; Vector layout: sequence, monotonic-us, kind, worker-index, task-id,
+;;; native-fiber-id, detail.
+(define async-trace-event!
+  (lambda (group sched task kind detail)
+    (let ([trace (async-scheduler-group-trace-state group)])
+      (when (async-trace-state-enabled? trace)
+        (let* ([seq-box (async-trace-state-sequence-box trace)]
+             [seq (async-atomic-box-add! seq-box 1)]
+             [event
+              (vector seq (async-monotonic-us) kind
+                (and sched (async-scheduler-group-index sched))
+                (and task (async-task-id task))
+                (and task
+                     (let ([fiber (async-task-native-fiber task)])
+                       (and fiber ($native-fiber-id fiber))))
+                detail)]
+             [events-box (async-trace-state-events-box trace)])
+          (let loop ([events (async-atomic-box-ref events-box)])
+            (unless (box-cas! events-box events (cons event events))
+              (loop (async-atomic-box-ref events-box)))))))))
+
+(define async-trace-stack-sample
+  (lambda (group task)
+    (and (async-trace-state-enabled?
+           (async-scheduler-group-trace-state group))
+         (let ([fiber (async-task-native-fiber task)])
+           (and fiber
+                ($native-fiber-try-claim! fiber)
+                (dynamic-wind
+                  (lambda () (void))
+                  (lambda () ($native-fiber-stack-snapshot fiber))
+                  (lambda () ($native-fiber-release-claim! fiber))))))))
 
 (define-record-type (async-task-group make-async-task-group% $async-task-group?)
   (nongenerative)
@@ -1577,6 +1630,10 @@
 
 (define async-publish-ready!
   (lambda (task completion-sched)
+    (unless (async-task-ready-start-us task)
+      (async-task-ready-start-us-set! task (async-monotonic-us)))
+    (async-trace-event! (async-task-scheduler-group task) completion-sched task
+      'ready #f)
     (if (and (async-task-group-runnable? task)
              (not (async-task-resume-pinned? task)))
         (async-work-submit! task completion-sched)

@@ -678,6 +678,37 @@
       ))
 )
 
+(mat parallel-profile-counter
+  (if (threaded?)
+    (let* ([src (make-source-object
+                  (source-file-descriptor "parallel-profile-counter" 0)
+                  0 1)]
+           [iterations 250000]
+           [thread-count 4]
+           [proc
+            (parameterize ([compile-profile 'source]
+                           [current-eval compile]
+                           [generate-profile-forms #f])
+              (eval
+                `(lambda (limit)
+                   (let loop ([i 0])
+                     (unless (fx= i limit)
+                       (profile ,src)
+                       (loop (fx+ i 1)))))
+                (interaction-environment)))])
+      (profile-clear)
+      (let ([threads
+             (map (lambda (ignore)
+                    (fork-thread (lambda () (proc iterations))))
+               (make-list thread-count))])
+        (for-each thread-join threads)
+        (= (fold-left + 0
+             (map cdr
+               (filter (lambda (entry) (equal? (car entry) src))
+                 (profile-dump))))
+           (* iterations thread-count))))
+    #t))
+
 (mat profile-form
   (error? ; invalid syntax
     (profile))
